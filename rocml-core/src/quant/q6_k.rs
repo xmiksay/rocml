@@ -39,10 +39,15 @@ pub(super) fn dequantize(bytes: &[u8]) -> Vec<f32> {
                 let q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i8 - 32;
                 let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 - 32;
                 let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 - 32;
-                y[l] = d * sc[is] as f32 * q1 as f32;
-                y[l + 32] = d * sc[is + 2] as f32 * q2 as f32;
-                y[l + 64] = d * sc[is + 4] as f32 * q3 as f32;
-                y[l + 96] = d * sc[is + 6] as f32 * q4 as f32;
+                // Scale bytes are signed (BlockQ6K.scales: [i8; 16], per
+                // ggml/candle) — `sc` here is a `&[u8]` slice of the raw
+                // block, so the `as i8` reinterpret is load-bearing, not a
+                // no-op; without it, bytes >= 0x80 dequantize to the wrong
+                // (positive) magnitude instead of a negative scale.
+                y[l] = d * (sc[is] as i8) as f32 * q1 as f32;
+                y[l + 32] = d * (sc[is + 2] as i8) as f32 * q2 as f32;
+                y[l + 64] = d * (sc[is + 4] as i8) as f32 * q3 as f32;
+                y[l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
             }
         }
         out.extend_from_slice(&y);
@@ -57,5 +62,30 @@ mod tests {
     #[test]
     fn size_is_210_bytes() {
         assert_eq!(std::mem::size_of::<BlockQ6K>(), 210);
+    }
+
+    /// Regression test for a bug where the sub-block scale bytes were read
+    /// as unsigned (`sc[is] as f32` on the raw `&[u8]` block) instead of
+    /// signed, silently flipping the sign of any scale >= 0x80. The
+    /// expectation below is computed from ggml's dequant formula by hand,
+    /// independently of `dequantize` itself, so it can't pass by sharing the
+    /// same mistake as the code under test.
+    #[test]
+    fn scale_byte_ge_0x80_is_read_as_negative() {
+        let mut block = vec![0u8; BLOCK_BYTES];
+        // l = 0, half_idx = 0 => is = l / 16 = 0, so this exercises sc[is].
+        // q1 decodes from ql[0] (low nibble) and qh[0] (top 2 bits, here 0):
+        // q1 = (ql[0] & 0xF) as i8 - 32 = 5 - 32 = -27.
+        block[0] = 0x05; // ql[0]
+        block[192] = 0xFF; // scales[0] = 0xFF = -1 as i8, +255 if misread unsigned
+        block[208..210].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes()); // d
+
+        let y = dequantize(&block);
+
+        // Hand-computed with a SIGNED scale byte, not by calling dequantize:
+        // y[0] = d * (scale as i8 as f32) * q1 = 1.0 * -1.0 * -27.0 = 27.0.
+        // The old unsigned-read bug would instead produce
+        // 1.0 * 255.0 * -27.0 = -6885.0.
+        assert_eq!(y[0], 27.0);
     }
 }

@@ -4,11 +4,10 @@
 // to f32 in VRAM. One workgroup per output row; each lane owns a strided
 // subset of the row's 256-element super-blocks. Must match rocml-core's
 // `quant::q6_k::dequantize` exactly, including its two-half / four-way
-// interleaved output ordering (see the half/l loop below) and — despite the
-// `BlockQ6K.scales` field being typed `[i8; 16]` — its actual behavior of
-// reading the sub-block scale bytes as *unsigned* (the dequant function
-// slices the raw `&[u8]` block directly and never reinterprets through that
-// struct, so `sc[is] as f32` there is an unsigned cast).
+// interleaved output ordering (see the half/l loop below). The 16
+// per-sub-block scale bytes are *signed* (`BlockQ6K.scales: [i8; 16]`, per
+// ggml/candle) — hence `signed char` below; a byte >= 0x80 is a negative
+// scale, not a large positive one.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -33,7 +32,7 @@ extern "C" __global__ void gemv_q6_k(
         const unsigned char* bptr = row_ptr + (size_t)blk * block_bytes;
         const unsigned char* ql_full = bptr;
         const unsigned char* qh_full = bptr + 128;
-        const unsigned char* sc_full = bptr + 192;
+        const signed char* sc_full = (const signed char*)(bptr + 192);
         __half d_h;
         std::memcpy(&d_h, bptr + 208, sizeof(__half));
         float d = __half2float(d_h);
@@ -48,7 +47,7 @@ extern "C" __global__ void gemv_q6_k(
         for (unsigned half_idx = 0; half_idx < 2; ++half_idx) {
             const unsigned char* ql = ql_full + 64 * half_idx;
             const unsigned char* qh = qh_full + 32 * half_idx;
-            const unsigned char* sc = sc_full + 8 * half_idx;
+            const signed char* sc = sc_full + 8 * half_idx;
             const float* xh = xs + 128 * half_idx;
 
 #pragma unroll

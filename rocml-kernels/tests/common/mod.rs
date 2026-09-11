@@ -107,10 +107,10 @@ pub fn random_row_q5_k(rng: &mut Rng, blocks_per_row: usize) -> Vec<u8> {
 }
 
 /// One random Q6_K row: 128 bytes of low nibbles, 64 bytes of 2-bit high
-/// codes, 16 per-sub-block scale bytes (rocml-core's dequant reads these as
-/// unsigned despite `BlockQ6K.scales` being typed `[i8; 16]` — see
-/// `gemv_q6_k.hip` — so any byte value is valid test data either way), then
-/// the f16 `d`.
+/// codes, 16 signed 8-bit per-sub-block scales (`next_u8` spans the full
+/// byte range, so this already exercises scales >= 0x80, i.e. negative
+/// values — important, since that sign bit was once dropped by a bug in
+/// rocml-core's dequant), then the f16 `d`.
 pub fn random_row_q6_k(rng: &mut Rng, blocks_per_row: usize) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(blocks_per_row * Q6_K_BLOCK_BYTES);
     for _ in 0..blocks_per_row {
