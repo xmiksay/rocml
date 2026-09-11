@@ -24,3 +24,25 @@ pub const GEMV_F16_KERNEL: &str = "gemv_f16";
 /// 16x16 shared-memory tile; must be launched with block = (16, 16, 1).
 pub const GEMM_XWT_F16_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_f16.hsaco"));
 pub const GEMM_XWT_F16_KERNEL: &str = "gemm_xwt_f16";
+
+/// `kernels/rmsnorm.hip`: per-row `out = x / rms(x) * weight`. One block per
+/// row; block size must be a power of two (shared-memory tree reduction).
+pub const RMSNORM_F32_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm.hsaco"));
+pub const RMSNORM_F32_KERNEL: &str = "rmsnorm_f32";
+
+/// `kernels/rope.hip`: in-place NEOX-style rotary embedding over a
+/// tokens x heads x head_dim buffer (element i pairs with i + head_dim/2).
+/// `head_dim` must be even. No shared-memory or block-size constraint.
+pub const ROPE_NEOX_F32_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope.hsaco"));
+pub const ROPE_NEOX_F32_KERNEL: &str = "rope_neox_f32";
+
+/// `kernels/silu_mul.hip`: `out = silu(gate) * up`, elementwise.
+pub const SILU_MUL_F32_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul.hsaco"));
+pub const SILU_MUL_F32_KERNEL: &str = "silu_mul_f32";
+
+/// `kernels/softmax.hip`: per-row scaled softmax over the first
+/// `valid_len[row]` columns, zeroing the rest. One block per row; block size
+/// must be a power of two (shared-memory tree reduction).
+pub const SOFTMAX_VARLEN_F32_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/softmax.hsaco"));
+pub const SOFTMAX_VARLEN_F32_KERNEL: &str = "softmax_varlen_f32";
