@@ -1,5 +1,6 @@
 //! Byte-level BPE tokenizer built from GGUF metadata (gpt2 vocab/merges +
-//! the qwen2/qwen3.5-family pre-tokenization regex used by llama.cpp).
+//! the qwen3.5-family pre-tokenization regex, verified against the real HF
+//! `tokenizer.json` for this model family).
 //!
 //! Pipeline for `encode`: split off special/control tokens first (they must
 //! never be touched by BPE) -> regex pre-tokenize each remaining text run
@@ -19,14 +20,24 @@ use fancy_regex::Regex;
 
 use crate::gguf::GgufFile;
 
-/// The pre-tokenization regex llama.cpp uses for the qwen2/qwen3.5 tokenizer
-/// family (a cl100k-style pattern; the negative lookahead in `\s+(?!\S)` is
-/// why this needs `fancy_regex` rather than the plain `regex` crate).
+/// The pre-tokenization regex the real qwen3.5 tokenizer uses (verified
+/// against the `Split` pretokenizer pattern embedded in
+/// `Qwen3.5-2B-tokenizer/tokenizer.json`, the actual HF tokenizer for the
+/// same 248k-vocab family as both GGUF files this crate targets).
+///
+/// This MUST stay byte-identical to that `tokenizer.json` Split pattern —
+/// do not "clean up" or approximate it. In particular: `[\p{L}\p{M}]+`
+/// (letters plus combining marks, not just `\p{L}+`) so that e.g. "é" typed
+/// as e + combining acute stays fused to its base letter, the leading
+/// ` ?` before the punctuation-run alternative, and `\p{M}` excluded from
+/// that same punctuation class. An earlier revision of this pattern was
+/// wrong on all three points. The negative lookahead in `\s+(?!\S)` is why
+/// this needs `fancy_regex` rather than the plain `regex` crate.
 ///
 /// Public so `tests/tokenizer_cross_validation.rs` can configure an
 /// independent reference tokenizer (built with the `tokenizers` crate) with
 /// this exact same pattern for an apples-to-apples comparison.
-pub const PRETOKENIZE_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+pub const PRETOKENIZE_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 /// Control/special token type id in `tokenizer.ggml.token_type`.
 const TOKEN_TYPE_CONTROL: i32 = 3;
