@@ -19,7 +19,7 @@ fn build(merges: &[&str], extra_tokens: &[(&str, i32)]) -> BpeTokenizer {
         token_type.push(*ty);
     }
     let merges: Vec<String> = merges.iter().map(|s| s.to_string()).collect();
-    BpeTokenizer::from_parts(tokens, merges, token_type, None, None).unwrap()
+    BpeTokenizer::from_parts(tokens, merges, token_type, None, None, "").unwrap()
 }
 
 #[test]

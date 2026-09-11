@@ -24,7 +24,7 @@
 //! well-tested reference implementation.
 
 use rocml_core::gguf::GgufFile;
-use rocml_core::tokenizer::{BpeTokenizer, PRETOKENIZE_PATTERN};
+use rocml_core::tokenizer::{BpeTokenizer, PRETOKENIZE_PATTERN_QWEN35};
 use tokenizers::models::bpe::{Merges, Vocab, BPE};
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::pre_tokenizers::sequence::Sequence;
@@ -36,6 +36,8 @@ const QWEN35_HF_TOKENIZER_PATH: &str =
     "/mnt/nvme/miksa/checkpoints/Qwen3.5-2B-tokenizer/tokenizer.json";
 const HF_QWEN3_0_6B_TOKENIZER_GLOB: &str =
     "/home/miksa/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/*/tokenizer.json";
+const QWEN3_0_6B_GGUF_PATH: &str =
+    "/mnt/nvme/miksa/checkpoints/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const TOKEN_TYPE_CONTROL: i32 = 3;
 
 fn skip_if_missing(path: &str) -> bool {
@@ -228,7 +230,7 @@ fn build_reference_from_gguf(gguf: &GgufFile) -> Tokenizer {
     tok.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
         PreTokenizerWrapper::Split(
             Split::new(
-                SplitPattern::Regex(PRETOKENIZE_PATTERN.to_string()),
+                SplitPattern::Regex(PRETOKENIZE_PATTERN_QWEN35.to_string()),
                 SplitDelimiterBehavior::Isolated,
                 false,
             )
@@ -300,5 +302,43 @@ fn vocab_size_confirms_qwen3_0_6b_is_unrelated() {
                 "no cached tokenizer.json found at {HF_QWEN3_0_6B_TOKENIZER_GLOB}, skipping the size check"
             );
         }
+    }
+}
+
+/// The dense Qwen3-0.6B GGUF reports `tokenizer.ggml.pre = "qwen2"`, a
+/// distinct pre-tokenizer family from qwen35 (see `pretokenize_pattern_for`
+/// in `rocml-core/src/tokenizer/mod.rs`). This is the id-for-id ground-truth
+/// check for that family, mirroring
+/// `matches_real_qwen35_tokenizer_json_on_tricky_inputs` above but against
+/// the real cached `Qwen/Qwen3-0.6B` `tokenizer.json`.
+#[test]
+fn matches_real_qwen2_tokenizer_json_on_tricky_inputs() {
+    if skip_if_missing(QWEN3_0_6B_GGUF_PATH) {
+        return;
+    }
+    let Some(hf_tokenizer_path) = glob_one(HF_QWEN3_0_6B_TOKENIZER_GLOB) else {
+        eprintln!("no cached tokenizer.json found at {HF_QWEN3_0_6B_TOKENIZER_GLOB}, skipping");
+        return;
+    };
+
+    let gguf = GgufFile::open(QWEN3_0_6B_GGUF_PATH).expect("open GGUF");
+    assert_eq!(
+        gguf.get_str("tokenizer.ggml.pre").ok(),
+        Some("qwen2"),
+        "this test's premise is that the dense Qwen3-0.6B GGUF is qwen2-family"
+    );
+    let ours = BpeTokenizer::from_gguf(&gguf).expect("build BpeTokenizer");
+    let reference =
+        Tokenizer::from_file(&hf_tokenizer_path).expect("load real qwen2-family tokenizer.json");
+
+    for &text in TRICKY_INPUTS {
+        let got = ours.encode(text);
+        let want = reference
+            .encode(text, false)
+            .unwrap_or_else(|e| panic!("reference encode failed for {text:?}: {e}"))
+            .get_ids()
+            .to_vec();
+        assert_eq!(got, want, "token id mismatch for input {text:?}");
+        assert_eq!(ours.decode(&got), text, "decode roundtrip for {text:?}");
     }
 }

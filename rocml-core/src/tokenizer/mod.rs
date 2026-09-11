@@ -25,7 +25,7 @@ use crate::gguf::GgufFile;
 /// The pre-tokenization regex the real qwen3.5 tokenizer uses (verified
 /// against the `Split` pretokenizer pattern embedded in
 /// `Qwen3.5-2B-tokenizer/tokenizer.json`, the actual HF tokenizer for the
-/// same 248k-vocab family as both GGUF files this crate targets).
+/// 248k-vocab family whose GGUF reports `tokenizer.ggml.pre = "qwen35"`).
 ///
 /// This MUST stay byte-identical to that `tokenizer.json` Split pattern —
 /// do not "clean up" or approximate it. In particular: `[\p{L}\p{M}]+`
@@ -39,7 +39,31 @@ use crate::gguf::GgufFile;
 /// Public so `tests/tokenizer_cross_validation.rs` can configure an
 /// independent reference tokenizer (built with the `tokenizers` crate) with
 /// this exact same pattern for an apples-to-apples comparison.
-pub const PRETOKENIZE_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+pub const PRETOKENIZE_PATTERN_QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// The pre-tokenization regex the dense Qwen2/Qwen3 family uses, whose GGUF
+/// reports `tokenizer.ggml.pre = "qwen2"` — verified byte-identical against
+/// the `Split` pretokenizer pattern embedded in the real
+/// `Qwen/Qwen3-0.6B` `tokenizer.json` (see
+/// `tests/tokenizer_cross_validation.rs`). Same shape as
+/// [`PRETOKENIZE_PATTERN_QWEN35`] but without combining-mark handling:
+/// plain `\p{L}+` (not `[\p{L}\p{M}]+`) and no `\p{M}` exclusion in the
+/// punctuation-run alternative, matching how this family's vocab was
+/// actually trained.
+pub const PRETOKENIZE_PATTERN_QWEN2: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// Selects the pre-tokenization regex for a GGUF's `tokenizer.ggml.pre`
+/// value. Unknown/missing values fall back to the qwen2 pattern: it's the
+/// plainer of the two (no combining-mark special-casing) and matches
+/// llama.cpp's own "BPE pre-tokenizer type not recognized, using default"
+/// fallback for GPT-2-style byte-level BPE vocabs, which is the only model
+/// family this tokenizer supports (see `TokenizerError::UnsupportedModel`).
+pub fn pretokenize_pattern_for(pre: &str) -> &'static str {
+    match pre {
+        "qwen35" => PRETOKENIZE_PATTERN_QWEN35,
+        _ => PRETOKENIZE_PATTERN_QWEN2,
+    }
+}
 
 /// Control/special token type id in `tokenizer.ggml.token_type`.
 const TOKEN_TYPE_CONTROL: i32 = 3;
@@ -80,8 +104,11 @@ impl BpeTokenizer {
             .unwrap_or_else(|_| vec![1; tokens.len()]);
         let bos_token_id = gguf.get_u32("tokenizer.ggml.bos_token_id").ok();
         let eos_token_id = gguf.get_u32("tokenizer.ggml.eos_token_id").ok();
+        // Missing `tokenizer.ggml.pre` selects the fallback pattern the same
+        // way an unrecognized value would (see `pretokenize_pattern_for`).
+        let pre = gguf.get_str("tokenizer.ggml.pre").unwrap_or("");
 
-        Self::from_parts(tokens, merges, token_type, bos_token_id, eos_token_id)
+        Self::from_parts(tokens, merges, token_type, bos_token_id, eos_token_id, pre)
     }
 
     fn from_parts(
@@ -90,6 +117,7 @@ impl BpeTokenizer {
         token_type: Vec<i32>,
         bos_token_id: Option<u32>,
         eos_token_id: Option<u32>,
+        pre: &str,
     ) -> Result<Self, TokenizerError> {
         let (byte_to_char, char_to_byte) = byte_level::tables();
         let merge_ranks = bpe::build_ranks(&merges)?;
@@ -106,11 +134,11 @@ impl BpeTokenizer {
         }
         specials.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
 
-        // The pattern is a fixed constant validated by this crate's own
-        // tests, so a compile failure here would be a bug in rocml, not
-        // something a GGUF file's content could trigger.
-        let pretokenize = Regex::new(PRETOKENIZE_PATTERN)
-            .expect("PRETOKENIZE_PATTERN is a valid static regex, checked by tests");
+        // Both candidate patterns are fixed constants validated by this
+        // crate's own tests, so a compile failure here would be a bug in
+        // rocml, not something a GGUF file's content could trigger.
+        let pretokenize = Regex::new(pretokenize_pattern_for(pre))
+            .expect("pretokenize_pattern_for returns a valid static regex, checked by tests");
 
         Ok(Self {
             vocab,
