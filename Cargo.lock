@@ -44,6 +44,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rocml-core"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "thiserror",
+]
+
+[[package]]
 name = "rocml-hip"
 version = "0.1.0"
 dependencies = [

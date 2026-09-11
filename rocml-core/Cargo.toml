@@ -1,0 +1,10 @@
+[package]
+name = "rocml-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GGUF loading, ggml quant dequantization, and BPE tokenization for rocml"
+
+[dependencies]
+thiserror = "1"
+half = "2"
