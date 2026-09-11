@@ -1,0 +1,22 @@
+{
+  "_meta": {
+    "model": "Qwen3-0.6B-Q8_0.gguf",
+    "generator": "candle quantized-qwen3 example, CPU, temperature=0 (argmax), repeat_penalty=1.0, n=48",
+    "template": "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
+    "note": "Continuations are the first ~47 greedy tokens decoded to text. Reference implementation: candle 0.11.0 CPU f32 path from the same GGUF."
+  },
+  "cases": [
+    {
+      "prompt": "Write a haiku about the moon.",
+      "continuation": "<think>\nOkay, the user wants a haiku about the moon. Let me start by recalling the structure of a haiku. It's three lines with a 5-7-5 syllable structure. So I need to make sure"
+    },
+    {
+      "prompt": "What is the capital of France? Answer in one word.",
+      "continuation": "<think>\nOkay, the user is asking for the capital of France. I know that France's capital is Paris. But wait, the user wants the answer in one word. So I need to make sure I'm not mixing up any other"
+    },
+    {
+      "prompt": "List three prime numbers.",
+      "continuation": "<think>\nOkay, the user is asking me to list three prime numbers. Let me start by recalling what a prime number is. A prime number is a number greater than 1 that has no positive divisors other than 1 and itself"
+    }
+  ]
+}

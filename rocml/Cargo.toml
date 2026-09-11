@@ -1,0 +1,17 @@
+[package]
+name = "rocml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dense Qwen3 GPU inference engine on top of rocml-core/rocml-hip/rocml-kernels"
+
+[dependencies]
+rocml-core = { path = "../rocml-core" }
+rocml-hip = { path = "../rocml-hip" }
+rocml-kernels = { path = "../rocml-kernels" }
+half = "2"
+thiserror = "1"
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
