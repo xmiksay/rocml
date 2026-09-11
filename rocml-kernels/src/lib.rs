@@ -59,3 +59,9 @@ pub const ELEMENTWISE_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/e
 pub const ADD_INPLACE_F32_KERNEL: &str = "add_inplace_f32";
 pub const CAST_F16_F32_KERNEL: &str = "cast_f16_f32";
 pub const CAST_F32_F16_KERNEL: &str = "cast_f32_f16";
+
+/// `kernels/gemv_t.hip`: decode-attention building block `y = A^T * x`, A is
+/// row-major rows x n (e.g. a cached-V plane, one row per time step). One
+/// thread per output column, looping over rows; no block-size constraint.
+pub const GEMV_T_F32_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_t.hsaco"));
+pub const GEMV_T_F32_KERNEL: &str = "gemv_t_f32";
