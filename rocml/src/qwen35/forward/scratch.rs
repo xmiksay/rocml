@@ -7,6 +7,7 @@ use rocml_hip::DeviceBuffer;
 
 use super::super::config::Qwen35Config;
 use crate::error::RocmlError;
+use crate::forward::kernels::ATTN_DECODE_MAX_SPLITS;
 
 pub struct Scratch {
     pub x: DeviceBuffer<f32>,
@@ -50,9 +51,11 @@ pub struct Scratch {
     pub attn_gate: DeviceBuffer<f32>,
     pub attn_k: DeviceBuffer<f32>,
     pub attn_v: DeviceBuffer<f32>,
-    /// `[n_heads, max_seq]` raw/softmaxed attention scores.
-    pub attn_scores: DeviceBuffer<f32>,
-    pub attn_valid_len: DeviceBuffer<u32>,
+    /// `attn_decode`'s split-K scratch — see `crate::forward::scratch::Scratch`
+    /// for the field-by-field meaning (shared kernel, same layout).
+    pub attn_partial_out: DeviceBuffer<f32>,
+    pub attn_partial_m: DeviceBuffer<f32>,
+    pub attn_partial_l: DeviceBuffer<f32>,
     /// Concatenated per-head attention output, `[q_dim]`.
     pub attn_concat: DeviceBuffer<f32>,
     /// `attn_output` projection result, `[hidden]`.
@@ -65,7 +68,7 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    pub fn new(config: &Qwen35Config, max_seq: u32) -> Result<Self, RocmlError> {
+    pub fn new(config: &Qwen35Config) -> Result<Self, RocmlError> {
         let hidden = config.embedding_length as usize;
         let vocab = config.vocab_size as usize;
         let gdn = &config.gdn;
@@ -76,6 +79,8 @@ impl Scratch {
         let q_dim = config.q_dim() as usize;
         let kv_dim = config.kv_dim() as usize;
         let n_heads = config.head_count as usize;
+        let head_dim = config.head_dim as usize;
+        let max_splits = ATTN_DECODE_MAX_SPLITS as usize;
         let ffn = config.feed_forward_length as usize;
 
         let mut l2_alpha_k = DeviceBuffer::new(head_k_dim)?;
@@ -107,8 +112,9 @@ impl Scratch {
             attn_gate: DeviceBuffer::new(q_dim)?,
             attn_k: DeviceBuffer::new(kv_dim)?,
             attn_v: DeviceBuffer::new(kv_dim)?,
-            attn_scores: DeviceBuffer::new(n_heads * max_seq as usize)?,
-            attn_valid_len: DeviceBuffer::new(n_heads)?,
+            attn_partial_out: DeviceBuffer::new(n_heads * max_splits * head_dim)?,
+            attn_partial_m: DeviceBuffer::new(n_heads * max_splits)?,
+            attn_partial_l: DeviceBuffer::new(n_heads * max_splits)?,
             attn_concat: DeviceBuffer::new(q_dim)?,
             attn_out: DeviceBuffer::new(hidden)?,
 

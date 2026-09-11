@@ -68,7 +68,13 @@ pub enum OpKind {
     Embed,
     Norm,
     Qkv,
-    AttnScore,
+    /// The fused `attn_decode` kernel (KV-cache append + flash-decoding
+    /// online-softmax attention) — replaces the old separate `AttnScore`
+    /// pass now that scores are never materialized. See
+    /// `crate::forward::kernels::Kernels::attn_decode`.
+    AttnDecode,
+    /// Attention output projection (+ residual add) only — the weighted-V
+    /// pass this used to include moved into `AttnDecode`.
     AttnOut,
     GdnConv,
     GdnRecur,
@@ -87,7 +93,7 @@ impl OpKind {
             OpKind::Embed => "embed",
             OpKind::Norm => "norm",
             OpKind::Qkv => "qkv",
-            OpKind::AttnScore => "attn-score",
+            OpKind::AttnDecode => "attn-decode",
             OpKind::AttnOut => "attn-out",
             OpKind::GdnConv => "gdn-conv",
             OpKind::GdnRecur => "gdn-recur",

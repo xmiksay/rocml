@@ -46,7 +46,7 @@ impl Model {
         let weights = ModelWeights::load(&gguf, &config)?;
         let cache = KvCache::new(&config)?;
         let kernels = Kernels::load_all()?;
-        let scratch = Scratch::new(&config, cache.max_seq())?;
+        let scratch = Scratch::new(&config)?;
 
         Ok(Self {
             _device: device,

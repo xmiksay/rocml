@@ -48,6 +48,48 @@ pub(super) const REDUCE_BLOCK: u32 = 128;
 /// power-of-two constraint.
 const LINEAR_BLOCK: u32 = 256;
 
+/// Rows of K/V staged into LDS at a time by `attn_decode_partial_f32` — must
+/// match `TILE_T` in `kernels/attn_decode.hip` exactly, since this constant
+/// is what sizes the dynamic shared memory the launch requests.
+const ATTN_DECODE_TILE_T: u32 = 8;
+/// Below this many cached positions, decode attention runs as a single
+/// split (`n_splits == 1`): the whole point of splitting the sequence axis
+/// is to manufacture enough independent workgroups to fill gfx1101's 60 CUs
+/// when `n_kv_heads` alone (as few as 2-8) isn't enough, and a shallow
+/// decode doesn't have that occupancy problem in the first place — splitting
+/// it anyway would only add the reduce kernel's (tiny but nonzero) overhead
+/// for no benefit.
+const ATTN_DECODE_MIN_SPLIT_LEN: u32 = 128;
+/// Target total workgroups (`n_kv_heads * n_splits`) for the partial kernel
+/// at large `cur_len` — comfortably above gfx1101's 60 CUs so there's enough
+/// independent work to hide each workgroup's K/V global-memory latency
+/// behind other resident waves, without over-splitting into workgroups so
+/// small their own launch/reduce overhead starts to dominate again (the
+/// exact failure mode this kernel replaces).
+const ATTN_DECODE_TARGET_WORKGROUPS: u32 = 240;
+/// Hard cap on split count: bounds the `partial_out`/`partial_m`/`partial_l`
+/// scratch buffers' size (`Scratch` allocates for this many splits up
+/// front) and the reduce kernel's per-head serial merge loop.
+pub const ATTN_DECODE_MAX_SPLITS: u32 = 32;
+
+/// Chooses `(n_splits, split_len)` for one `attn_decode` call — see the
+/// constants above for the reasoning. `n_splits` never exceeds
+/// `cur_len.div_ceil(ATTN_DECODE_MIN_SPLIT_LEN)`, which is always `<=
+/// cur_len` for `cur_len >= 1`, so every split before the last is
+/// non-empty (`split_len >= 1`) and no workgroup gets a `start >= cur_len`
+/// range from this heuristic alone (`attn_decode_partial_f32` also handles
+/// that case correctly regardless, for callers — e.g. kernel tests — that
+/// pick `n_splits` directly).
+pub(crate) fn attn_decode_splits(n_kv_heads: u32, cur_len: u32) -> (u32, u32) {
+    let by_occupancy = ATTN_DECODE_TARGET_WORKGROUPS.div_ceil(n_kv_heads.max(1));
+    let by_min_len = cur_len.div_ceil(ATTN_DECODE_MIN_SPLIT_LEN);
+    let n_splits = by_occupancy
+        .min(by_min_len)
+        .clamp(1, ATTN_DECODE_MAX_SPLITS);
+    let split_len = cur_len.div_ceil(n_splits);
+    (n_splits, split_len)
+}
+
 pub struct Kernels {
     _mod_embedding: Module,
     embedding_fn: rocml_hip::Function,
@@ -67,6 +109,10 @@ pub struct Kernels {
     silu_mul_fn: rocml_hip::Function,
     _mod_elementwise: Module,
     add_inplace_fn: rocml_hip::Function,
+    _mod_attn_decode_partial: Module,
+    attn_decode_partial_fn: rocml_hip::Function,
+    _mod_attn_decode_reduce: Module,
+    attn_decode_reduce_fn: rocml_hip::Function,
     quant: QuantKernels,
 }
 
@@ -114,6 +160,14 @@ impl Kernels {
             rocml_kernels::ELEMENTWISE_HSACO,
             rocml_kernels::ADD_INPLACE_F32_KERNEL,
         )?;
+        let (_mod_attn_decode_partial, attn_decode_partial_fn) = load(
+            rocml_kernels::ATTN_DECODE_PARTIAL_F32_HSACO,
+            rocml_kernels::ATTN_DECODE_PARTIAL_F32_KERNEL,
+        )?;
+        let (_mod_attn_decode_reduce, attn_decode_reduce_fn) = load(
+            rocml_kernels::ATTN_DECODE_REDUCE_F32_HSACO,
+            rocml_kernels::ATTN_DECODE_REDUCE_F32_KERNEL,
+        )?;
         let quant = QuantKernels::load_all()?;
 
         Ok(Self {
@@ -135,6 +189,10 @@ impl Kernels {
             silu_mul_fn,
             _mod_elementwise,
             add_inplace_fn,
+            _mod_attn_decode_partial,
+            attn_decode_partial_fn,
+            _mod_attn_decode_reduce,
+            attn_decode_reduce_fn,
             quant,
         })
     }
@@ -257,6 +315,84 @@ impl Kernels {
         // SAFETY: params matches gemv_t_f32's signature (const float*, const
         // float*, float*, unsigned, unsigned); no block-size constraint.
         unsafe { self.gemv_t_f32_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
+    }
+
+    /// Fused single-token causal attention (`kernels/attn_decode.hip`):
+    /// replaces the old per-head `gemv_f32`+`softmax_varlen`+`gemv_t_f32`
+    /// composition with two launches. `q` is `[n_heads, head_dim]`;
+    /// `k_layer`/`v_layer` are one layer's whole KV-cache buffer, `[n_kv_heads,
+    /// max_seq, head_dim]` (the layout `crate::cache::KvCache`/
+    /// `qwen35::cache::AttnPlane` already use — a kv head's plane is
+    /// `kvh * max_seq * head_dim` into the buffer, computed inside the
+    /// kernel from `max_seq`, not passed per-head). `out` is `[n_heads,
+    /// head_dim]`. `partial_out`/`partial_m`/`partial_l` are caller-owned
+    /// scratch sized for `n_heads * ATTN_DECODE_MAX_SPLITS` (see
+    /// `Scratch`) — reused across calls, never read back by the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode(
+        &self,
+        q: DevPtr,
+        k_layer: DevPtr,
+        v_layer: DevPtr,
+        out: DevPtr,
+        partial_out: DevPtr,
+        partial_m: DevPtr,
+        partial_l: DevPtr,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_seq: u32,
+        cur_len: u32,
+        scale: f32,
+    ) -> Result<(), RocmlError> {
+        let group = n_heads / n_kv_heads;
+        let (n_splits, split_len) = attn_decode_splits(n_kv_heads, cur_len);
+
+        let partial_cfg = LaunchConfig {
+            grid: (n_kv_heads, n_splits, 1),
+            block: (32, group, 1),
+            shared_mem_bytes: 2 * ATTN_DECODE_TILE_T * head_dim * size_of::<f32>() as u32,
+        };
+        let mut partial_params = kernel_params!(
+            q,
+            k_layer,
+            v_layer,
+            partial_out,
+            partial_m,
+            partial_l,
+            n_kv_heads,
+            group,
+            head_dim,
+            max_seq,
+            cur_len,
+            split_len,
+            n_splits,
+            scale
+        );
+        // SAFETY: params matches attn_decode_partial_f32's signature (three
+        // const float*, three float*, seven unsigned, float); block =
+        // (32, group, 1) matches the kernel's warp-per-q-head design.
+        unsafe {
+            self.attn_decode_partial_fn
+                .launch(&partial_cfg, &mut partial_params, None)
+        }?;
+
+        let reduce_cfg = LaunchConfig {
+            grid: (n_heads, 1, 1),
+            block: (head_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut reduce_params =
+            kernel_params!(partial_out, partial_m, partial_l, out, head_dim, n_splits);
+        // SAFETY: params matches attn_decode_reduce_f32's signature (three
+        // const float*, float*, two unsigned); block = head_dim, one thread
+        // per output element (head_dim <= 256 for every model this codebase
+        // loads).
+        unsafe {
+            self.attn_decode_reduce_fn
+                .launch(&reduce_cfg, &mut reduce_params, None)
+        }
+        .map_err(Into::into)
     }
 
     /// In-place NEOX rope over `x` viewed as `[tokens, heads, head_dim]`.

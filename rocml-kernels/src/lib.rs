@@ -120,3 +120,15 @@ pub const GEMV_Q5_K_KERNEL: &str = "gemv_q5_k";
 /// of 256.
 pub const GEMV_Q6_K_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_q6_k.hsaco"));
 pub const GEMV_Q6_K_KERNEL: &str = "gemv_q6_k";
+
+/// `kernels/attn_decode.hip`: fused flash-decoding-style single-token causal
+/// attention, split-K over the sequence axis. `attn_decode_partial_f32`
+/// (grid = `[n_kv_heads, n_splits]`, block = `[32, group]`) produces one
+/// per-(q head, split) partial online-softmax triple; `attn_decode_reduce_f32`
+/// (grid = `[n_heads]`, block = `[head_dim]`) merges them. See the kernel
+/// source's module doc for the full design and occupancy math.
+pub const ATTN_DECODE_PARTIAL_F32_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_decode.hsaco"));
+pub const ATTN_DECODE_PARTIAL_F32_KERNEL: &str = "attn_decode_partial_f32";
+pub const ATTN_DECODE_REDUCE_F32_HSACO: &[u8] = ATTN_DECODE_PARTIAL_F32_HSACO;
+pub const ATTN_DECODE_REDUCE_F32_KERNEL: &str = "attn_decode_reduce_f32";

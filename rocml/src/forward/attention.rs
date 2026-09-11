@@ -1,9 +1,12 @@
 //! One layer's GQA decode attention: q/k/v projection, per-head RMS norm,
-//! rope, KV-cache append, then per-head `scores -> softmax -> weighted V`
-//! composed from the plain gemv/softmax kernels (no fused attention kernel
-//! yet — batched prefill/fused attention is a later perf milestone).
+//! rope, KV-cache append, then the fused `attn_decode` kernel (flash-decoding
+//! style online-softmax causal attention — see `Kernels::attn_decode`'s doc
+//! comment) in place of the old per-head gemv/softmax/gemv_t composition.
+//! Batched (multi-token) prefill is a separate, later perf milestone —
+//! today's token-serial prefill reuses this same decode-shaped step, so it
+//! gets this kernel's win for free.
 
-use super::kernels::{offset, Kernels};
+use super::kernels::{attn_decode_splits, offset, Kernels};
 use crate::cache::KvCache;
 use crate::config::ModelConfig;
 use crate::error::RocmlError;
@@ -27,7 +30,6 @@ pub(crate) fn attention_step(
     let head_dim = config.head_dim;
     let n_heads = config.head_count;
     let n_kv_heads = config.head_count_kv;
-    let group = config.kv_group_size();
     let cur_len = pos + 1;
     let layer_idx = layer_idx as u32;
 
@@ -126,45 +128,41 @@ pub(crate) fn attention_step(
         },
     )?;
 
-    let score_bytes =
-        profile::attn_score_bytes(n_heads, cur_len, head_dim) + config.kv_dim() as u64 * 2 * 4;
-    let score_flops = profile::attn_score_flops(n_heads, cur_len, head_dim);
+    let (n_splits, _) = attn_decode_splits(n_kv_heads, cur_len);
+    let attn_bytes = profile::attn_decode_bytes(n_heads, n_kv_heads, cur_len, head_dim, n_splits)
+        + config.kv_dim() as u64 * 2 * 4;
+    let attn_flops = profile::attn_decode_flops(n_heads, cur_len, head_dim);
     Profiler::scope(
         prof,
         Some(layer_idx),
-        OpKind::AttnScore,
-        score_bytes,
-        score_flops,
+        OpKind::AttnDecode,
+        attn_bytes,
+        attn_flops,
         || {
             cache.append(layer_idx as usize, pos, &scratch.k, &scratch.v)?;
 
             let max_seq = cache.max_seq();
-            let k_buf = cache.k_buffer(layer_idx as usize)?;
-            for h in 0..n_heads {
-                let kvh = h / group;
-                let k_plane = offset(k_buf, cache.head_plane_offset(kvh));
-                let q_head = offset(&scratch.q, (h * head_dim) as usize);
-                let score_row = offset(&scratch.scores, (h * max_seq) as usize);
-                kernels.gemv_f32(k_plane, q_head, score_row, cur_len, head_dim)?;
-            }
-
-            let valid_len_host = vec![cur_len; n_heads as usize];
-            scratch.valid_len.copy_from_host(&valid_len_host)?;
             let scale = 1.0f32 / (head_dim as f32).sqrt();
-            kernels.softmax_varlen(
-                offset(&scratch.scores, 0),
-                offset(&scratch.valid_len, 0),
+            kernels.attn_decode(
+                offset(&scratch.q, 0),
+                offset(cache.k_buffer(layer_idx as usize)?, 0),
+                offset(cache.v_buffer(layer_idx as usize)?, 0),
+                offset(&scratch.attn_concat, 0),
+                offset(&scratch.attn_partial_out, 0),
+                offset(&scratch.attn_partial_m, 0),
+                offset(&scratch.attn_partial_l, 0),
                 n_heads,
+                n_kv_heads,
+                head_dim,
                 max_seq,
+                cur_len,
                 scale,
             )
         },
     )?;
 
-    let out_bytes = profile::attn_out_bytes(n_heads, cur_len, head_dim)
-        + profile::matvec_bytes(layer.attn_output.byte_size(), hidden, config.q_dim());
-    let out_flops = profile::attn_out_flops(n_heads, cur_len, head_dim)
-        + profile::matvec_flops(hidden, config.q_dim());
+    let out_bytes = profile::matvec_bytes(layer.attn_output.byte_size(), hidden, config.q_dim());
+    let out_flops = profile::matvec_flops(hidden, config.q_dim());
     Profiler::scope(
         prof,
         Some(layer_idx),
@@ -172,16 +170,6 @@ pub(crate) fn attention_step(
         out_bytes,
         out_flops,
         || {
-            let max_seq = cache.max_seq();
-            let v_buf = cache.v_buffer(layer_idx as usize)?;
-            for h in 0..n_heads {
-                let kvh = h / group;
-                let v_plane = offset(v_buf, cache.head_plane_offset(kvh));
-                let probs = offset(&scratch.scores, (h * max_seq) as usize);
-                let out_head = offset(&scratch.attn_concat, (h * head_dim) as usize);
-                kernels.gemv_t_f32(v_plane, probs, out_head, cur_len, head_dim)?;
-            }
-
             layer.attn_output.matvec(
                 kernels,
                 offset(&scratch.attn_concat, 0),
@@ -210,22 +198,22 @@ pub(crate) fn attention_step_cost(
     let n_heads = config.head_count;
     let n_kv_heads = config.head_count_kv;
 
+    // n_splits=1: see the module doc for why this coarse prefill-only
+    // estimate doesn't need the split-K occupancy heuristic.
     let bytes = profile::norm_bytes(1, hidden)
         + profile::matvec_bytes(layer.attn_q.byte_size(), config.q_dim(), hidden)
         + profile::matvec_bytes(layer.attn_k.byte_size(), config.kv_dim(), hidden)
         + profile::matvec_bytes(layer.attn_v.byte_size(), config.kv_dim(), hidden)
         + profile::norm_bytes(n_heads, head_dim)
         + profile::norm_bytes(n_kv_heads, head_dim)
-        + profile::attn_score_bytes(n_heads, cur_len, head_dim)
-        + profile::attn_out_bytes(n_heads, cur_len, head_dim)
+        + profile::attn_decode_bytes(n_heads, n_kv_heads, cur_len, head_dim, 1)
         + profile::matvec_bytes(layer.attn_output.byte_size(), hidden, config.q_dim());
     let flops = profile::norm_flops(1, hidden)
         + profile::matvec_flops(config.q_dim(), hidden)
         + profile::matvec_flops(config.kv_dim(), hidden) * 2
         + profile::norm_flops(n_heads, head_dim)
         + profile::norm_flops(n_kv_heads, head_dim)
-        + profile::attn_score_flops(n_heads, cur_len, head_dim)
-        + profile::attn_out_flops(n_heads, cur_len, head_dim)
+        + profile::attn_decode_flops(n_heads, cur_len, head_dim)
         + profile::matvec_flops(hidden, config.q_dim());
     (bytes, flops)
 }

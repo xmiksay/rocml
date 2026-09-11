@@ -43,7 +43,7 @@ impl Model {
         let cache = HybridCache::new(&config)?;
         let kernels = Kernels::load_all()?;
         let hybrid = HybridKernels::load_all()?;
-        let scratch = Scratch::new(&config, cache.max_seq())?;
+        let scratch = Scratch::new(&config)?;
 
         Ok(Self {
             _device: device,

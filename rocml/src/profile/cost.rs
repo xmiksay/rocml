@@ -45,31 +45,35 @@ pub fn embed_bytes(hidden: u32) -> u64 {
     hidden as u64 * 2 + hidden as u64 * F32
 }
 
-/// The causal-decode score pass (`gemv_f32` once per head against that
-/// head's slice of the KV cache, then `softmax_varlen`): each of `n_heads`
-/// heads reads `cur_len * head_dim` cached K values and writes `cur_len`
-/// scores, softmax re-reads/writes those same scores once more.
-pub fn attn_score_bytes(n_heads: u32, cur_len: u32, head_dim: u32) -> u64 {
-    let k_read = n_heads as u64 * cur_len as u64 * head_dim as u64 * F32;
-    let scores_rw = n_heads as u64 * cur_len as u64 * F32 * 3; // gemv write + softmax read + softmax write
-    k_read + scores_rw
-}
-
-/// One multiply-add per (head, cached position, head_dim element) score dot.
-pub fn attn_score_flops(n_heads: u32, cur_len: u32, head_dim: u32) -> u64 {
-    2 * n_heads as u64 * cur_len as u64 * head_dim as u64
-}
-
-/// The weighted-V pass (`gemv_t_f32` once per head against that head's V
-/// plane): same shape as the score pass, reading V instead of K.
-pub fn attn_out_bytes(n_heads: u32, cur_len: u32, head_dim: u32) -> u64 {
-    let v_read = n_heads as u64 * cur_len as u64 * head_dim as u64 * F32;
+/// The fused `attn_decode` kernel (see `Kernels::attn_decode`): K/V are read
+/// once per `(kv head, split)` workgroup and reused in LDS across the whole
+/// GQA group sharing that kv head, so the dominant traffic scales with
+/// `n_kv_heads`, not `n_heads` — the actual saving the LDS-tiling design
+/// buys over a naive per-q-head read. The split-K reduce pass adds a
+/// `partial_out` write + re-read (`[n_heads, n_splits, head_dim]`, unlike
+/// K/V this genuinely is `n_heads`-wide, since each q head has its own
+/// unnormalized accumulator) plus the final `[n_heads, head_dim]` output
+/// write.
+pub fn attn_decode_bytes(
+    n_heads: u32,
+    n_kv_heads: u32,
+    cur_len: u32,
+    head_dim: u32,
+    n_splits: u32,
+) -> u64 {
+    let kv_read = 2 * n_kv_heads as u64 * cur_len as u64 * head_dim as u64 * F32; // K + V, shared across the GQA group
+    let partial_rw = 2 * n_heads as u64 * n_splits as u64 * head_dim as u64 * F32; // partial write + reduce's read-back
     let out_write = n_heads as u64 * head_dim as u64 * F32;
-    v_read + out_write
+    kv_read + partial_rw + out_write
 }
 
-pub fn attn_out_flops(n_heads: u32, cur_len: u32, head_dim: u32) -> u64 {
-    2 * n_heads as u64 * cur_len as u64 * head_dim as u64
+/// One multiply-add per (head, cached position, head_dim element), for both
+/// the score dot product and the weighted-V accumulation — unlike bytes,
+/// this doesn't shrink with GQA sharing: every q head still does its own
+/// full dot product against every cached position, only the K/V *read* is
+/// shared.
+pub fn attn_decode_flops(n_heads: u32, cur_len: u32, head_dim: u32) -> u64 {
+    4 * n_heads as u64 * cur_len as u64 * head_dim as u64
 }
 
 /// GDN's causal depthwise conv1d over the fused `[Q|K|V]` projection: each of
@@ -128,15 +132,28 @@ mod tests {
     }
 
     #[test]
-    fn attn_score_scales_with_kv_cache_depth() {
-        let shallow = attn_score_bytes(8, 16, 128);
-        let deep = attn_score_bytes(8, 4096, 128);
+    fn attn_decode_scales_with_kv_cache_depth() {
+        let shallow = attn_decode_bytes(8, 8, 16, 128, 1);
+        let deep = attn_decode_bytes(8, 8, 4096, 128, 1);
         assert!(deep > shallow, "deeper KV cache must read more bytes");
-        // K-read term should scale linearly with cur_len.
+        // K/V-read term should scale linearly with cur_len.
         let ratio = deep as f64 / shallow as f64;
         assert!(
             (ratio - 256.0).abs() < 5.0,
             "expected ~256x (4096/16) scaling, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn attn_decode_bytes_shrinks_with_gqa_sharing() {
+        // Same n_heads/cur_len/head_dim, fewer kv heads (more sharing)
+        // should read fewer bytes thanks to the LDS-tiled K/V reuse across
+        // a kv head's whole q-head group.
+        let shared = attn_decode_bytes(32, 8, 2048, 256, 1);
+        let unshared = attn_decode_bytes(32, 32, 2048, 256, 1);
+        assert!(
+            shared < unshared,
+            "GQA sharing (fewer kv heads) must read fewer bytes"
         );
     }
 
