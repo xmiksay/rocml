@@ -53,12 +53,37 @@ pub const EMBEDDING_F16_F32_HSACO: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/embedding.hsaco"));
 pub const EMBEDDING_F16_F32_KERNEL: &str = "embedding_f16_f32";
 
-/// `kernels/elementwise.hip`: in-place residual add and f16<->f32 casts.
-/// All three kernels share one code object.
+/// `kernels/elementwise.hip`: in-place residual add, f16<->f32 casts, and the
+/// sigmoid output gate. All four kernels share one code object.
 pub const ELEMENTWISE_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/elementwise.hsaco"));
 pub const ADD_INPLACE_F32_KERNEL: &str = "add_inplace_f32";
 pub const CAST_F16_F32_KERNEL: &str = "cast_f16_f32";
 pub const CAST_F32_F16_KERNEL: &str = "cast_f32_f16";
+pub const SIGMOID_MUL_F32_KERNEL: &str = "sigmoid_mul_f32";
+
+/// `kernels/rope_partial.hip`: NEOX rope over only the first `rot_dim` of
+/// each head, used by qwen35's partial-rotary full-attention layers.
+pub const ROPE_NEOX_PARTIAL_F32_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/rope_partial.hsaco"));
+pub const ROPE_NEOX_PARTIAL_F32_KERNEL: &str = "rope_neox_partial_f32";
+
+/// `kernels/gdn_conv.hip`: Gated Delta Net causal depthwise conv1d + SiLU,
+/// one decode step.
+pub const GDN_CONV1D_DECODE_F32_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gdn_conv.hsaco"));
+pub const GDN_CONV1D_DECODE_F32_KERNEL: &str = "causal_conv1d_decode_f32";
+
+/// `kernels/gdn_gate.hip`: Gated Delta Net per-head beta/decay gate scalars,
+/// one decode step.
+pub const GDN_GATE_F32_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gdn_gate.hsaco"));
+pub const GDN_GATE_F32_KERNEL: &str = "gdn_gate_f32";
+
+/// `kernels/gdn_recurrence.hip`: Gated Delta Net fused state update +
+/// readout, one decode step. Launch block size must be
+/// `max(head_k_dim, head_v_dim)`.
+pub const GDN_RECURRENCE_DECODE_F32_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gdn_recurrence.hsaco"));
+pub const GDN_RECURRENCE_DECODE_F32_KERNEL: &str = "gdn_recurrence_decode_f32";
 
 /// `kernels/gemv_t.hip`: decode-attention building block `y = A^T * x`, A is
 /// row-major rows x n (e.g. a cached-V plane, one row per time step). One

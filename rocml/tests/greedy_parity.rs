@@ -129,7 +129,7 @@ fn dense_qwen3_0_6b_greedy_matches_candle_cpu_reference() {
     let mut model = Model::load(GGUF_PATH).expect("load model");
 
     for case in &fixtures.cases {
-        model.reset();
+        model.reset().expect("reset failed");
         let prompt_text = fixtures.meta.template.replace("{prompt}", &case.prompt);
         let prompt_ids = tokenizer.encode(&prompt_text);
 

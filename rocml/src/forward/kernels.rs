@@ -67,7 +67,7 @@ pub struct Kernels {
     add_inplace_fn: rocml_hip::Function,
 }
 
-fn load(hsaco: &[u8], name: &str) -> Result<(Module, rocml_hip::Function), RocmlError> {
+pub(crate) fn load(hsaco: &[u8], name: &str) -> Result<(Module, rocml_hip::Function), RocmlError> {
     let module = Module::load_from_bytes(hsaco)?;
     let function = module.get_function(name)?;
     Ok((module, function))

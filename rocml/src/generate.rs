@@ -8,7 +8,7 @@ use std::time::Instant;
 use rocml_core::tokenizer::BpeTokenizer;
 
 use crate::error::RocmlError;
-use crate::forward::Model;
+use crate::model::Model;
 
 #[derive(Debug, Clone, Copy)]
 pub struct GenerateStats {

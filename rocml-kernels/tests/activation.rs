@@ -141,3 +141,55 @@ fn softmax_non_multiple_of_blocksize_with_mixed_valid_len() {
 fn softmax_degenerate_single_row() {
     run_softmax(1, 5, &[3], 1.0);
 }
+
+fn run_sigmoid_mul(n: u32) {
+    let _device = Device::new(0).expect("failed to select device 0");
+    let module =
+        Module::load_from_bytes(rocml_kernels::ELEMENTWISE_HSACO).expect("module load failed");
+    let function = module
+        .get_function(rocml_kernels::SIGMOID_MUL_F32_KERNEL)
+        .expect("kernel lookup failed");
+
+    let x: Vec<f32> = (0..n).map(|i| ((i % 19) as f32) * 0.1 - 0.9).collect();
+    let gate: Vec<f32> = (0..n).map(|i| ((i % 23) as f32) * 0.15 - 1.6).collect();
+    let expected: Vec<f32> = x
+        .iter()
+        .zip(&gate)
+        .map(|(xi, g)| xi / (1.0 + (-g).exp()))
+        .collect();
+
+    let mut buf_x = DeviceBuffer::<f32>::new(x.len()).expect("hipMalloc x failed");
+    let mut buf_gate = DeviceBuffer::<f32>::new(gate.len()).expect("hipMalloc gate failed");
+    let buf_out = DeviceBuffer::<f32>::new(n as usize).expect("hipMalloc out failed");
+    buf_x.copy_from_host(&x).expect("copy x failed");
+    buf_gate.copy_from_host(&gate).expect("copy gate failed");
+
+    let x_ptr: *mut c_void = buf_x.device_ptr();
+    let gate_ptr: *mut c_void = buf_gate.device_ptr();
+    let out_ptr: *mut c_void = buf_out.device_ptr();
+    let mut params = kernel_params!(x_ptr, gate_ptr, out_ptr, n);
+
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid: (n.div_ceil(block), 1, 1),
+        block: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    // SAFETY: params matches sigmoid_mul_f32's parameter list (const float*,
+    // const float*, float*, unsigned) in order; buffers outlive this launch.
+    unsafe { function.launch(&cfg, &mut params, None) }.expect("kernel launch failed");
+
+    let mut actual = vec![0.0f32; n as usize];
+    buf_out.copy_to_host(&mut actual).expect("copy out failed");
+    assert_close(&actual, &expected, "sigmoid_mul out");
+}
+
+#[test]
+fn sigmoid_mul_non_multiple_of_blocksize() {
+    run_sigmoid_mul(1000);
+}
+
+#[test]
+fn sigmoid_mul_degenerate_single_element() {
+    run_sigmoid_mul(1);
+}

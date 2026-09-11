@@ -18,12 +18,18 @@ struct Args {
     model: String,
     prompt: String,
     n: usize,
+    /// Skips the chat template and feeds the prompt text as-is — matches
+    /// how the qwen3.5 parity fixtures were captured (raw continuation, no
+    /// special tokens), and useful for probing raw completion behavior on
+    /// any model.
+    raw: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut model = None;
     let mut prompt = None;
     let mut n = 64usize;
+    let mut raw = false;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -36,6 +42,7 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| format!("-n: invalid integer {v:?}"))?;
             }
+            "--raw" => raw = true,
             other => return Err(format!("unrecognized argument {other:?}")),
         }
     }
@@ -44,6 +51,7 @@ fn parse_args() -> Result<Args, String> {
         model: model.ok_or("--model <path> is required")?,
         prompt: prompt.ok_or("--prompt <text> is required")?,
         n,
+        raw,
     })
 }
 
@@ -58,7 +66,7 @@ fn main() -> ExitCode {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}");
-            eprintln!("usage: generate --model <path.gguf> --prompt <text> [-n <count>]");
+            eprintln!("usage: generate --model <path.gguf> --prompt <text> [-n <count>] [--raw]");
             return ExitCode::FAILURE;
         }
     };
@@ -82,14 +90,18 @@ fn run(args: &Args) -> Result<(), rocml::RocmlError> {
     let mem = model.memory_info()?;
     eprintln!(
         "loaded: {} layers, hidden={}, vocab={}; VRAM free {:.0} MiB / total {:.0} MiB",
-        model.config().block_count,
-        model.config().embedding_length,
-        model.config().vocab_size,
+        model.block_count(),
+        model.embedding_length(),
+        model.vocab_size(),
         mem.free as f64 / (1024.0 * 1024.0),
         mem.total as f64 / (1024.0 * 1024.0),
     );
 
-    let prompt_text = apply_chat_template(&args.prompt);
+    let prompt_text = if args.raw {
+        args.prompt.clone()
+    } else {
+        apply_chat_template(&args.prompt)
+    };
     let prompt_ids = tokenizer.encode(&prompt_text);
 
     let stdout = std::io::stdout();

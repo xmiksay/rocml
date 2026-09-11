@@ -5,7 +5,7 @@
 
 mod attention;
 mod ffn;
-mod kernels;
+pub(crate) mod kernels;
 mod scratch;
 
 use std::path::Path;

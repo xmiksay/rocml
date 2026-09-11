@@ -146,3 +146,73 @@ fn rope_non_multiple_of_blocksize() {
 fn rope_degenerate_single_token() {
     run_rope(1, 2, 4, 0);
 }
+
+fn run_rope_partial(tokens: u32, heads: u32, head_dim: u32, rot_dim: u32, pos_base: u32) {
+    let _device = Device::new(0).expect("failed to select device 0");
+    let module = Module::load_from_bytes(rocml_kernels::ROPE_NEOX_PARTIAL_F32_HSACO)
+        .expect("module load failed");
+    let function = module
+        .get_function(rocml_kernels::ROPE_NEOX_PARTIAL_F32_KERNEL)
+        .expect("kernel lookup failed");
+
+    let theta_base = 1.0e7f32;
+    let half_rot = rot_dim / 2;
+    let total_elems = (tokens * heads * head_dim) as usize;
+    let x: Vec<f32> = (0..total_elems)
+        .map(|i| ((i % 31) as f32) * 0.05 - 0.7)
+        .collect();
+
+    // CPU reference: only the first `rot_dim` components of each head
+    // rotate (paired i <-> i + rot_dim/2); the rest pass through unchanged.
+    let mut expected = x.clone();
+    for t in 0..tokens {
+        let pos = pos_base + t;
+        for h in 0..heads {
+            let base = ((t * heads + h) * head_dim) as usize;
+            for i in 0..half_rot {
+                let inv_freq = theta_base.powf(-2.0 * i as f32 / rot_dim as f32);
+                let angle = pos as f32 * inv_freq;
+                let (sin_a, cos_a) = angle.sin_cos();
+                let x0 = x[base + i as usize];
+                let x1 = x[base + (i + half_rot) as usize];
+                expected[base + i as usize] = x0 * cos_a - x1 * sin_a;
+                expected[base + (i + half_rot) as usize] = x0 * sin_a + x1 * cos_a;
+            }
+        }
+    }
+
+    let mut buf_x = DeviceBuffer::<f32>::new(total_elems).expect("hipMalloc x failed");
+    buf_x.copy_from_host(&x).expect("copy x failed");
+
+    let x_ptr: *mut c_void = buf_x.device_ptr();
+    let mut params = kernel_params!(x_ptr, tokens, heads, head_dim, rot_dim, pos_base, theta_base);
+
+    let total_threads = tokens * heads * half_rot;
+    let block = 64u32;
+    let cfg = LaunchConfig {
+        grid: (total_threads.div_ceil(block), 1, 1),
+        block: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    // SAFETY: params matches rope_neox_partial_f32's parameter list (float*,
+    // unsigned x4, unsigned, float) in order; buf_x outlives this launch.
+    unsafe { function.launch(&cfg, &mut params, None) }.expect("kernel launch failed");
+
+    let mut actual = vec![0.0f32; total_elems];
+    buf_x.copy_to_host(&mut actual).expect("copy x back failed");
+    assert_close(&actual, &expected, "rope_partial x");
+}
+
+#[test]
+fn rope_partial_non_multiple_of_blocksize() {
+    // total = tokens*heads*half_rot = 10*3*8 = 240, not a multiple of the
+    // 64-thread block; head_dim (32) is wider than rot_dim (16), so the
+    // untouched tail must survive unchanged.
+    run_rope_partial(10, 3, 32, 16, 5);
+}
+
+#[test]
+fn rope_partial_degenerate_single_token_full_rotary() {
+    // rot_dim == head_dim: reduces to the plain rope_neox_f32 case.
+    run_rope_partial(1, 2, 4, 4, 0);
+}

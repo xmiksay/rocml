@@ -9,9 +9,11 @@ pub mod config;
 pub mod error;
 pub mod forward;
 pub mod generate;
+mod model;
+pub mod qwen35;
 pub mod weights;
 
 pub use config::ModelConfig;
 pub use error::RocmlError;
-pub use forward::Model;
 pub use generate::{generate, GenerateStats};
+pub use model::Model;

@@ -14,7 +14,7 @@ rocml is a standalone Rust inference engine for Qwen3.5-hybrid/Ornith and dense 
 - `make test` — run all tests (unit + integration, requires a working GPU) plus `make test-model`
 - `make test-unit` — run library unit tests only
 - `make test-integration` — run integration tests only
-- `make test-model` — release-mode greedy-decode parity test for dense Qwen3-0.6B against an independent candle CPU reference (skips itself if the GGUF checkpoint isn't present)
+- `make test-model` — release-mode greedy-decode parity tests against independent references (each skips itself if its GGUF checkpoint isn't present): dense Qwen3-0.6B vs. candle's CPU implementation, and the qwen3.5 hybrid Gated Delta Net architecture vs. Crane's candle-based implementation (a from-scratch CPU reference first, then the real GPU forward pass)
 - `make lint` — `cargo clippy --all-targets -- -D warnings` plus `cargo fmt --check`
 - `make fmt` — apply `cargo fmt`
 - `make clean` — `cargo clean`

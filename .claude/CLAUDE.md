@@ -9,7 +9,7 @@ This brief wins over `../CLAUDE.md` for anything specific to this project.
 - `rocml-hip` — minimal safe wrapper over the HIP runtime C API (hand-written FFI, no bindgen), linked against `amdhip64`. Device/stream/buffer/module/kernel-launch primitives only — no ML logic here.
 - `rocml-kernels` — HIP C++ kernel sources under `kernels/`, compiled to code objects (`.hsaco`) by `hipcc` in `build.rs` and embedded into the binary via `include_bytes!`. Exposes kernel bytes + entry point names for `rocml-hip` to load and launch.
 - `rocml-core` — hardware-agnostic CPU-side building blocks: mmap'd GGUF v2/v3 parsing, ggml quant (Q2_K..Q6_K, Q8_0) CPU dequantize, and a byte-level BPE tokenizer built from GGUF `tokenizer.ggml.*` metadata (pre-tokenizer regex selected per `tokenizer.ggml.pre` — qwen35 vs qwen2 families).
-- `rocml` — the engine: GGUF config/weight loading onto the GPU, a per-layer-per-kv-head-plane KV cache, the single-token decode-style forward pass (`src/forward/`), and greedy generation (`src/generate.rs`). Dense Qwen3 only for now (`general.architecture = "qwen3"`); `examples/generate.rs` is the CLI smoke-test binary.
+- `rocml` — the engine: GGUF config/weight loading onto the GPU, a per-layer-per-kv-head-plane KV cache, the single-token decode-style forward pass, and greedy generation (`src/generate.rs`). `src/model.rs` dispatches on `general.architecture`: `"qwen3"` runs the dense forward pass (`src/forward/`); `"qwen35"` runs the hybrid Gated Delta Net + full-attention forward pass (`src/qwen35/`) — every `qwen35.full_attention_interval`-th layer is full (softmax) attention, the rest are linear-attention GDN layers with persistent per-layer conv/recurrence state (`src/qwen35/cache.rs`). `examples/generate.rs` is the CLI smoke-test binary (`--raw` skips the chat template, for raw-continuation prompts).
 
 Later milestones add `rocml-cli`, `rocml-serve` — not present yet, do not add them speculatively.
 
@@ -25,7 +25,10 @@ Always use the Makefile, never ad-hoc `cargo` invocations:
 
 Tests in `rocml-hip`, the `rocml-kernels` integration tests, and `rocml`'s forward pass require a real ROCm GPU (device init, actual kernel launches) — they are not mocked. Run on the machine with the GPU attached.
 
-`make test-model` runs `rocml`'s `greedy_parity` integration test in `--release` (dequantizing the real ~600MB Qwen3-0.6B GGUF and running a 28-layer x 48-token decode loop is unbearably slow unoptimized): greedy-decodes fixed prompts and checks the decoded text matches candle's independent CPU f32 implementation token-for-token, from `/mnt/nvme/miksa/checkpoints/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (skips itself if that file is absent). `make test` excludes it from the plain `cargo test --workspace` pass (it would still build fine in debug, just run unbearably slowly) and runs it separately via `make test-model`.
+`make test-model` runs three real-GGUF `--release` integration tests, each skipping itself if its checkpoint is absent (`make test` excludes all three from the plain `cargo test --workspace` pass — they'd still build in debug, just run unbearably slowly — and runs them separately here):
+- `greedy_parity`: dense Qwen3-0.6B (`/mnt/nvme/miksa/checkpoints/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf`) greedy-decoded and checked against candle's independent CPU f32 implementation token-for-token.
+- `qwen35_cpu_reference`: the qwen3.5 hybrid architecture's from-scratch pure-Rust f32 CPU reference (`tests/support/qwen35_cpu/`, no GPU) checked against Crane's fixture for a handful of tokens — isolates "did we understand the architecture" from "is the GPU kernel right".
+- `qwen35_greedy_parity`: Qwen3.5-2B (`/mnt/nvme/miksa/checkpoints/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf`) greedy-decoded on the GPU hybrid forward pass and checked against Crane's independent candle GPU implementation token-for-token, from fixtures in `rocml/tests/data/qwen35_greedy_fixtures.json`.
 
 ## Kernel build pipeline
 

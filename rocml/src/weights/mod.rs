@@ -111,6 +111,30 @@ pub(crate) fn load_matrix_f16(
     Ok(buf)
 }
 
+/// Dequantizes tensor `name` to f32 and uploads it as-is (no f16 cast),
+/// validating its shape is exactly `(expected_m, expected_n)` in `gemv_f32`
+/// terms. For small, numerically sensitive matrices that skip the f16
+/// round-trip the big matmul weights take (e.g. a GDN layer's depthwise
+/// conv1d kernel).
+pub(crate) fn load_matrix_f32(
+    gguf: &GgufFile,
+    name: &str,
+    expected_m: u32,
+    expected_n: u32,
+) -> Result<DeviceBuffer<f32>, RocmlError> {
+    let view = gguf.tensor(name)?;
+    let (m, n) = matrix_dims(view.shape(), name)?;
+    if (m, n) != (expected_m, expected_n) {
+        return Err(RocmlError::Config(format!(
+            "tensor {name:?}: shape ({m} x {n}) doesn't match expected ({expected_m} x {expected_n})"
+        )));
+    }
+    let data = dequantize(view.dtype(), view.data())?;
+    let mut buf = DeviceBuffer::<f32>::new(data.len())?;
+    buf.copy_from_host(&data)?;
+    Ok(buf)
+}
+
 /// Dequantizes and uploads a 1D norm-weight tensor as f32, validating its
 /// length is exactly `expected_len`.
 pub(crate) fn load_vector_f32(
