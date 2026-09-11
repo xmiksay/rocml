@@ -65,3 +65,11 @@ pub const CAST_F32_F16_KERNEL: &str = "cast_f32_f16";
 /// thread per output column, looping over rows; no block-size constraint.
 pub const GEMV_T_F32_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_t.hsaco"));
 pub const GEMV_T_F32_KERNEL: &str = "gemv_t_f32";
+
+/// `kernels/gemv_q8_0.hip`: fused dequant-GEMV `y = W * x` where W's rows are
+/// raw GGUF Q8_0 blocks (34 bytes: f16 `d` + 32 signed 8-bit codes) — weights
+/// stay in ggml block format in VRAM, dequantized in-register. One workgroup
+/// per output row; block size must be a power of two (shared-mem tree
+/// reduction). `n` must be a multiple of 32.
+pub const GEMV_Q8_0_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_q8_0.hsaco"));
+pub const GEMV_Q8_0_KERNEL: &str = "gemv_q8_0";

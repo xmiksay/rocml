@@ -1,0 +1,185 @@
+//! Shared support for the fused dequant-GEMV integration tests
+//! (`gemv_q8_0`/`gemv_q4_k`/`gemv_q5_k`/`gemv_q6_k`): a small deterministic
+//! PRNG for synthetic block bytes, one row-builder per quant format (byte
+//! layouts ported from `rocml-core/src/quant/*.rs`), and the shared GPU
+//! launch/compare plumbing.
+#![allow(dead_code)] // each test binary only exercises a subset of this module
+
+use std::ffi::c_void;
+
+use rocml_core::quant::{dequantize, GgmlDType};
+use rocml_hip::{kernel_params, Device, DeviceBuffer, LaunchConfig, Module};
+
+/// Compares GPU output against the CPU reference with a relative tolerance
+/// floored at 1.0 (i.e. `2e-3` absolute for near-zero elements) — long f32
+/// accumulations over many strided blocks reorder additions relative to the
+/// CPU reference, so a pure relative check on near-zero values is too tight.
+pub fn assert_close(actual: &[f32], expected: &[f32], label: &str) {
+    const REL_TOL: f32 = 2e-3;
+    assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
+    for (i, (got, want)) in actual.iter().zip(expected).enumerate() {
+        let diff = (got - want).abs();
+        let tol = REL_TOL * want.abs().max(1.0);
+        assert!(
+            diff <= tol,
+            "{label}[{i}]: got {got}, want {want} (diff {diff}, tol {tol})"
+        );
+    }
+}
+
+/// xorshift32: small, seedable, dependency-free PRNG for synthetic test
+/// data (the workspace only permits adding `rocml-core` as a dev-dependency
+/// here, so no `rand` crate).
+pub struct Rng(u32);
+
+impl Rng {
+    pub fn new(seed: u32) -> Self {
+        Self(seed | 1)
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.0 = x;
+        x
+    }
+
+    pub fn next_u8(&mut self) -> u8 {
+        (self.next_u32() >> 24) as u8
+    }
+
+    /// f16 scale field in `[lo, hi]`, little-endian bytes as stored on disk.
+    /// Kept small and strictly positive so `d`/`dmin` never blow up the
+    /// dequantized magnitude or (for `dmin`) go negative.
+    pub fn next_f16_le(&mut self, lo: f32, hi: f32) -> [u8; 2] {
+        let u = self.next_u32() as f32 / u32::MAX as f32;
+        half::f16::from_f32(lo + u * (hi - lo)).to_le_bytes()
+    }
+}
+
+const SCALE_LO: f32 = 0.001;
+const SCALE_HI: f32 = 1.0;
+
+pub const Q8_0_BLOCK_BYTES: usize = 34;
+pub const Q8_0_BLOCK_ELEMS: usize = 32;
+pub const K_BLOCK_ELEMS: usize = 256;
+pub const Q4_K_BLOCK_BYTES: usize = 144;
+pub const Q5_K_BLOCK_BYTES: usize = 176;
+pub const Q6_K_BLOCK_BYTES: usize = 210;
+
+/// One random Q8_0 row: `blocks_per_row` blocks of (f16 `d`, 32 arbitrary
+/// i8 codes). Any code byte is finite by construction (it's just an integer).
+pub fn random_row_q8_0(rng: &mut Rng, blocks_per_row: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(blocks_per_row * Q8_0_BLOCK_BYTES);
+    for _ in 0..blocks_per_row {
+        bytes.extend_from_slice(&rng.next_f16_le(SCALE_LO, SCALE_HI));
+        bytes.extend((0..32).map(|_| rng.next_u8()));
+    }
+    bytes
+}
+
+/// One random Q4_K row: `d`, `dmin`, a 12-byte packed 6-bit scale/min table,
+/// then 128 bytes of 4-bit codes — all arbitrary except the two f16 fields.
+pub fn random_row_q4_k(rng: &mut Rng, blocks_per_row: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(blocks_per_row * Q4_K_BLOCK_BYTES);
+    for _ in 0..blocks_per_row {
+        bytes.extend_from_slice(&rng.next_f16_le(SCALE_LO, SCALE_HI)); // d
+        bytes.extend_from_slice(&rng.next_f16_le(SCALE_LO, SCALE_HI)); // dmin
+        bytes.extend((0..12).map(|_| rng.next_u8())); // packed scale/min table
+        bytes.extend((0..128).map(|_| rng.next_u8())); // qs
+    }
+    bytes
+}
+
+/// Like [`random_row_q4_k`] plus the 32-byte high-bit plane (`qh`).
+pub fn random_row_q5_k(rng: &mut Rng, blocks_per_row: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(blocks_per_row * Q5_K_BLOCK_BYTES);
+    for _ in 0..blocks_per_row {
+        bytes.extend_from_slice(&rng.next_f16_le(SCALE_LO, SCALE_HI)); // d
+        bytes.extend_from_slice(&rng.next_f16_le(SCALE_LO, SCALE_HI)); // dmin
+        bytes.extend((0..12).map(|_| rng.next_u8())); // packed scale/min table
+        bytes.extend((0..32).map(|_| rng.next_u8())); // qh
+        bytes.extend((0..128).map(|_| rng.next_u8())); // qs
+    }
+    bytes
+}
+
+/// One random Q6_K row: 128 bytes of low nibbles, 64 bytes of 2-bit high
+/// codes, 16 per-sub-block scale bytes (rocml-core's dequant reads these as
+/// unsigned despite `BlockQ6K.scales` being typed `[i8; 16]` — see
+/// `gemv_q6_k.hip` — so any byte value is valid test data either way), then
+/// the f16 `d`.
+pub fn random_row_q6_k(rng: &mut Rng, blocks_per_row: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(blocks_per_row * Q6_K_BLOCK_BYTES);
+    for _ in 0..blocks_per_row {
+        bytes.extend((0..128).map(|_| rng.next_u8())); // ql
+        bytes.extend((0..64).map(|_| rng.next_u8())); // qh
+        bytes.extend((0..16).map(|_| rng.next_u8())); // scales
+        bytes.extend_from_slice(&rng.next_f16_le(SCALE_LO, SCALE_HI)); // d
+    }
+    bytes
+}
+
+/// CPU reference: dequantize each row with rocml-core's proven-correct
+/// dequant and dot it against `x`.
+pub fn expected_gemv(
+    dtype: GgmlDType,
+    w_bytes: &[u8],
+    x: &[f32],
+    m: usize,
+    row_bytes: usize,
+) -> Vec<f32> {
+    (0..m)
+        .map(|row| {
+            let row_slice = &w_bytes[row * row_bytes..(row + 1) * row_bytes];
+            let deq = dequantize(dtype, row_slice).expect("cpu dequantize failed");
+            deq.iter().zip(x).map(|(a, b)| a * b).sum()
+        })
+        .collect()
+}
+
+/// Uploads `w_bytes`/`x`, launches `kernel_name` from `hsaco` as
+/// `gemv_<type>(const void* w, const float* x, float* y, unsigned m, unsigned n)`
+/// with one 128-thread workgroup per output row, and downloads `y`.
+pub fn run_gemv_kernel(
+    hsaco: &[u8],
+    kernel_name: &str,
+    w_bytes: &[u8],
+    x: &[f32],
+    m: u32,
+    n: u32,
+) -> Vec<f32> {
+    let _device = Device::new(0).expect("failed to select device 0");
+    let module = Module::load_from_bytes(hsaco).expect("module load failed");
+    let function = module
+        .get_function(kernel_name)
+        .expect("kernel lookup failed");
+
+    let mut buf_w = DeviceBuffer::<u8>::new(w_bytes.len()).expect("hipMalloc w failed");
+    let mut buf_x = DeviceBuffer::<f32>::new(x.len()).expect("hipMalloc x failed");
+    let buf_y = DeviceBuffer::<f32>::new(m as usize).expect("hipMalloc y failed");
+    buf_w.copy_from_host(w_bytes).expect("copy w failed");
+    buf_x.copy_from_host(x).expect("copy x failed");
+
+    let w_ptr: *mut c_void = buf_w.device_ptr();
+    let x_ptr: *mut c_void = buf_x.device_ptr();
+    let y_ptr: *mut c_void = buf_y.device_ptr();
+    let mut params = kernel_params!(w_ptr, x_ptr, y_ptr, m, n);
+
+    let block = 128u32;
+    let cfg = LaunchConfig {
+        grid: (m, 1, 1),
+        block: (block, 1, 1),
+        shared_mem_bytes: block * std::mem::size_of::<f32>() as u32,
+    };
+    // SAFETY: params matches every gemv_<type> kernel's parameter list
+    // (const void*, const float*, float*, unsigned, unsigned) in order, and
+    // all device buffers outlive this launch.
+    unsafe { function.launch(&cfg, &mut params, None) }.expect("kernel launch failed");
+
+    let mut actual = vec![0.0f32; m as usize];
+    buf_y.copy_to_host(&mut actual).expect("copy y failed");
+    actual
+}
