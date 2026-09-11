@@ -15,6 +15,7 @@ pub const hipSuccess: hipError_t = 0;
 pub type hipStream_t = *mut c_void;
 pub type hipModule_t = *mut c_void;
 pub type hipFunction_t = *mut c_void;
+pub type hipEvent_t = *mut c_void;
 
 pub type hipMemcpyKind = c_int;
 pub const hip_memcpy_host_to_host: hipMemcpyKind = 0;
@@ -58,6 +59,13 @@ extern "C" {
     pub fn hipStreamCreate(stream: *mut hipStream_t) -> hipError_t;
     pub fn hipStreamDestroy(stream: hipStream_t) -> hipError_t;
     pub fn hipStreamSynchronize(stream: hipStream_t) -> hipError_t;
+
+    // -- events (profiling) --
+    pub fn hipEventCreate(event: *mut hipEvent_t) -> hipError_t;
+    pub fn hipEventDestroy(event: hipEvent_t) -> hipError_t;
+    pub fn hipEventRecord(event: hipEvent_t, stream: hipStream_t) -> hipError_t;
+    pub fn hipEventSynchronize(event: hipEvent_t) -> hipError_t;
+    pub fn hipEventElapsedTime(ms: *mut f32, start: hipEvent_t, stop: hipEvent_t) -> hipError_t;
 
     // -- modules / kernels --
     pub fn hipModuleLoadData(module: *mut hipModule_t, image: *const c_void) -> hipError_t;
