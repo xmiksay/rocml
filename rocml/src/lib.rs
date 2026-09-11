@@ -17,6 +17,6 @@ pub mod weights;
 
 pub use config::ModelConfig;
 pub use error::RocmlError;
-pub use generate::{generate, generate_sampled, GenerateStats};
+pub use generate::{generate, generate_sampled, generate_sampled_with_stop, GenerateStats};
 pub use model::Model;
 pub use sample::{Rng, SamplingParams};

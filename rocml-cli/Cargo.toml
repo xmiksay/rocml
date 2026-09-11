@@ -1,0 +1,16 @@
+[package]
+name = "rocml-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Interactive chat REPL and benchmark harness for rocml"
+
+[[bin]]
+name = "rocml-cli"
+path = "src/main.rs"
+
+[dependencies]
+rocml = { path = "../rocml" }
+rocml-core = { path = "../rocml-core" }
+clap = { version = "4", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }

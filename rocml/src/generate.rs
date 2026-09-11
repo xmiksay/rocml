@@ -82,11 +82,60 @@ pub fn generate_sampled(
     params: &SamplingParams,
     mut on_text: impl FnMut(&str),
 ) -> Result<GenerateStats, RocmlError> {
+    generate_core(
+        model,
+        tokenizer,
+        prompt_ids,
+        max_new_tokens,
+        stop_on_eos,
+        params,
+        |s| {
+            on_text(s);
+            false
+        },
+    )
+}
+
+/// Like [`generate_sampled`], but `on_text` returns `true` to request
+/// generation stop immediately after the chunk it was just given (the
+/// server uses this to enforce OpenAI-style `stop` strings, checked against
+/// the growing decoded text one chunk at a time — this function has no
+/// opinion on what "should stop" means, it just reacts to the answer).
+pub fn generate_sampled_with_stop(
+    model: &mut Model,
+    tokenizer: &BpeTokenizer,
+    prompt_ids: &[u32],
+    max_new_tokens: usize,
+    stop_on_eos: bool,
+    params: &SamplingParams,
+    on_text: impl FnMut(&str) -> bool,
+) -> Result<GenerateStats, RocmlError> {
+    generate_core(
+        model,
+        tokenizer,
+        prompt_ids,
+        max_new_tokens,
+        stop_on_eos,
+        params,
+        on_text,
+    )
+}
+
+fn generate_core(
+    model: &mut Model,
+    tokenizer: &BpeTokenizer,
+    prompt_ids: &[u32],
+    max_new_tokens: usize,
+    stop_on_eos: bool,
+    params: &SamplingParams,
+    mut on_text: impl FnMut(&str) -> bool,
+) -> Result<GenerateStats, RocmlError> {
     let eos = tokenizer.eos_token_id;
     let mut pending = Vec::new();
     let mut generated_tokens = 0usize;
     let mut history: Vec<u32> = prompt_ids.to_vec();
     let mut rng = Rng::new(params.seed);
+    let mut stop_requested = false;
 
     let prompt_start = Instant::now();
     let mut logits = Vec::new();
@@ -96,17 +145,26 @@ pub fn generate_sampled(
     let prompt_seconds = prompt_start.elapsed().as_secs_f64();
 
     let decode_start = Instant::now();
-    while generated_tokens < max_new_tokens && !logits.is_empty() {
+    while !stop_requested && generated_tokens < max_new_tokens && !logits.is_empty() {
         let next_id = sample::sample(&logits, &history, params, &mut rng);
         if stop_on_eos && Some(next_id) == eos {
             break;
         }
-        push_token_text(tokenizer, next_id, &mut pending, &mut on_text);
+        push_token_text(tokenizer, next_id, &mut pending, &mut |s| {
+            if on_text(s) {
+                stop_requested = true;
+            }
+        });
         history.push(next_id);
         generated_tokens += 1;
+        if stop_requested {
+            break;
+        }
         logits = model.forward_token(next_id)?;
     }
-    flush_pending(&mut pending, &mut on_text);
+    flush_pending(&mut pending, &mut |s| {
+        on_text(s);
+    });
     let decode_seconds = decode_start.elapsed().as_secs_f64();
 
     Ok(GenerateStats {
