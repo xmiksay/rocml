@@ -46,3 +46,16 @@ pub const SILU_MUL_F32_KERNEL: &str = "silu_mul_f32";
 pub const SOFTMAX_VARLEN_F32_HSACO: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/softmax.hsaco"));
 pub const SOFTMAX_VARLEN_F32_KERNEL: &str = "softmax_varlen_f32";
+
+/// `kernels/embedding.hip`: `out[i] = f32(table[ids[i]])` row lookup (table
+/// is row-major vocab x dim f16). One block per token row.
+pub const EMBEDDING_F16_F32_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/embedding.hsaco"));
+pub const EMBEDDING_F16_F32_KERNEL: &str = "embedding_f16_f32";
+
+/// `kernels/elementwise.hip`: in-place residual add and f16<->f32 casts.
+/// All three kernels share one code object.
+pub const ELEMENTWISE_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/elementwise.hsaco"));
+pub const ADD_INPLACE_F32_KERNEL: &str = "add_inplace_f32";
+pub const CAST_F16_F32_KERNEL: &str = "cast_f16_f32";
+pub const CAST_F32_F16_KERNEL: &str = "cast_f32_f16";
