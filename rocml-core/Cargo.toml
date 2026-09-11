@@ -9,3 +9,8 @@ description = "GGUF loading, ggml quant dequantization, and BPE tokenization for
 memmap2 = "0.9"
 thiserror = "1"
 half = "2"
+fancy-regex = "0.19"
+
+[dev-dependencies]
+tokenizers = "0.23"
+serde_json = "1"

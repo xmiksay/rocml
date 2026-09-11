@@ -4,3 +4,4 @@
 
 pub mod gguf;
 pub mod quant;
+pub mod tokenizer;
