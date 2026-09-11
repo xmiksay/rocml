@@ -182,13 +182,15 @@ async fn chat_completions_end_to_end() {
     server.shutdown().await;
 }
 
-/// Manual-run companion to the tools scenario above: Ornith-1.0-9B is the
-/// agentic flagship model, so this asserts the tool call actually happens
-/// rather than merely tolerating either outcome. `#[ignore]`d because it
-/// needs the ~7.4GB Ornith checkpoint and shouldn't run alongside the 2B
-/// test in the same process (two model loads competing for one GPU's VRAM).
-/// Run explicitly: `cargo test --release -p rocml-serve --test server_e2e
-/// -- --ignored ornith_tool_call`.
+/// Companion to the tools scenario above: Ornith-1.0-9B is the agentic
+/// flagship model, so this asserts the tool call actually happens rather
+/// than merely tolerating either outcome. `#[ignore]`d (not because it's
+/// skipped — `make test-model` runs it explicitly as its own `cargo test`
+/// invocation, see the Makefile) but because it needs the ~7.4GB Ornith
+/// checkpoint and shouldn't load alongside the 2B test's model in the same
+/// test binary (two model loads competing for one GPU's VRAM). Run
+/// directly: `cargo test --release -p rocml-serve --test server_e2e --
+/// --ignored ornith_tool_call_is_emitted`.
 #[tokio::test]
 #[ignore]
 async fn ornith_tool_call_is_emitted() {

@@ -38,7 +38,11 @@ const HF_QWEN3_0_6B_TOKENIZER_GLOB: &str =
     "/home/miksa/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/*/tokenizer.json";
 const QWEN3_0_6B_GGUF_PATH: &str =
     "/mnt/nvme/miksa/checkpoints/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
-const TOKEN_TYPE_CONTROL: i32 = 3;
+/// Mirrors `BpeTokenizer`'s own `SPECIAL_TOKEN_TYPES` (ggml's CONTROL and
+/// USER_DEFINED token-type ids) so this file's independent reference
+/// tokenizer special-cases exactly the same tokens `ours` does — see that
+/// constant's doc comment for why both types matter (issue #11).
+const SPECIAL_TOKEN_TYPES: [i32; 2] = [3, 4];
 
 fn skip_if_missing(path: &str) -> bool {
     if !std::path::Path::new(path).exists() {
@@ -201,6 +205,36 @@ fn rocml_special_token_is_a_single_id() {
     assert_eq!(ours.decode(&[im_start_id]), "<|im_start|>");
 }
 
+/// Regression test for issue #11: `<tool_call>` is ggml token_type 4
+/// (USER_DEFINED), not 3 (CONTROL), in this vocab — a real GGUF check that
+/// `SPECIAL_TOKEN_TYPES` actually covers both, not just a synthetic-vocab
+/// unit test. An earlier revision only special-cased type 3, so this
+/// string BPE-split into 4 ordinary sub-word tokens instead of the single
+/// id the Ornith-1.0-9B checkpoint (which shares this vocab) was trained
+/// on, feeding it out-of-distribution input in the tools system block.
+#[test]
+fn tool_call_marker_is_a_single_id() {
+    if skip_if_missing(QWEN35_GGUF_PATH) {
+        return;
+    }
+    let gguf = GgufFile::open(QWEN35_GGUF_PATH).unwrap();
+    let ours = BpeTokenizer::from_gguf(&gguf).unwrap();
+
+    let tokens = gguf.get_str_arr("tokenizer.ggml.tokens").unwrap();
+    let token_type = gguf.get_i32_arr("tokenizer.ggml.token_type").unwrap();
+    let tool_call_id = tokens
+        .iter()
+        .position(|t| t == "<tool_call>")
+        .expect("<tool_call> present in vocab") as u32;
+    assert_eq!(
+        token_type[tool_call_id as usize], 4,
+        "test assumption broken: <tool_call> is no longer USER_DEFINED in this GGUF"
+    );
+
+    assert_eq!(ours.encode("<tool_call>"), vec![tool_call_id]);
+    assert_eq!(ours.decode(&[tool_call_id]), "<tool_call>");
+}
+
 /// Builds an independent HF `tokenizers::Tokenizer` from the exact same
 /// vocab/merges/specials this crate's `BpeTokenizer::from_gguf` reads,
 /// configured with the same pre-tokenization regex.
@@ -242,7 +276,7 @@ fn build_reference_from_gguf(gguf: &GgufFile) -> Tokenizer {
     let specials: Vec<AddedToken> = tokens
         .iter()
         .zip(token_type.iter())
-        .filter(|(_, &ty)| ty == TOKEN_TYPE_CONTROL)
+        .filter(|(_, &ty)| SPECIAL_TOKEN_TYPES.contains(&ty))
         .map(|(t, _)| AddedToken::from(t.clone(), true))
         .collect();
     tok.add_special_tokens(specials)

@@ -42,8 +42,9 @@ pub fn step(cfg: &Qwen35Config, w: &GdnLayerWeights, state: &mut GdnState, x: &m
         gdn.key_dim as usize,
         gdn.value_dim as usize,
     );
-    let (num_heads, hk, hv) = (
+    let (num_heads, num_k_heads, hk, hv) = (
         gdn.num_v_heads as usize,
+        gdn.num_k_heads as usize,
         gdn.head_k_dim as usize,
         gdn.head_v_dim as usize,
     );
@@ -84,23 +85,37 @@ pub fn step(cfg: &Qwen35Config, w: &GdnLayerWeights, state: &mut GdnState, x: &m
         .collect();
 
     // L2-norm Q/K per head; Q additionally carries the recurrence's
-    // `1/sqrt(head_k_dim)` query scale.
+    // `1/sqrt(head_k_dim)` query scale. Q/K only have `num_k_heads` distinct
+    // rows (grouped GDN, e.g. Ornith's 16 key heads for 32 value heads) —
+    // normalizing over `num_heads` rows here would read past the end of `q`/
+    // `k` whenever `num_k_heads < num_heads`.
     let mut q = qkv[0..key_dim].to_vec();
     let mut k = qkv[key_dim..2 * key_dim].to_vec();
     let v = &qkv[2 * key_dim..2 * key_dim + value_dim];
-    l2norm_rows(&mut q, num_heads, hk, L2_NORM_EPS, 1.0 / (hk as f32).sqrt());
-    l2norm_rows(&mut k, num_heads, hk, L2_NORM_EPS, 1.0);
+    l2norm_rows(
+        &mut q,
+        num_k_heads,
+        hk,
+        L2_NORM_EPS,
+        1.0 / (hk as f32).sqrt(),
+    );
+    l2norm_rows(&mut k, num_k_heads, hk, L2_NORM_EPS, 1.0);
 
-    // Gated delta rule recurrence, per head.
+    // Gated delta rule recurrence, per value head `h`; its query/key come
+    // from key head `h % num_k_heads` — a tiled broadcast, matching
+    // `gdn_recurrence_decode_f32`'s own doc comment (llama.cpp's GGUF
+    // converter already reorders every value-head-indexed GDN tensor into
+    // that tiled order, so `%` is what lines Q/K back up with V/beta/g here).
     let mut y = vec![0.0f32; value_dim];
     for h in 0..num_heads {
+        let key_head = h % num_k_heads;
         let s = &mut state.recurrent[h * hk * hv..(h + 1) * hk * hv];
         let decay = g[h].exp();
         for e in s.iter_mut() {
             *e *= decay;
         }
-        let q_h = &q[h * hk..(h + 1) * hk];
-        let k_h = &k[h * hk..(h + 1) * hk];
+        let q_h = &q[key_head * hk..(key_head + 1) * hk];
+        let k_h = &k[key_head * hk..(key_head + 1) * hk];
         let v_h = &v[h * hv..(h + 1) * hv];
         let mut delta = vec![0.0f32; hv];
         for (vi, d) in delta.iter_mut().enumerate() {

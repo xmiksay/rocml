@@ -65,8 +65,19 @@ pub fn pretokenize_pattern_for(pre: &str) -> &'static str {
     }
 }
 
-/// Control/special token type id in `tokenizer.ggml.token_type`.
-const TOKEN_TYPE_CONTROL: i32 = 3;
+/// Control/special token type ids in `tokenizer.ggml.token_type` (ggml's
+/// `llama_token_type` enum: 1=NORMAL, 2=UNKNOWN, 3=CONTROL, 4=USER_DEFINED,
+/// 5=UNUSED, 6=BYTE). Both CONTROL (`<|im_start|>`, `<|endoftext|>`, ...)
+/// and USER_DEFINED (`<tool_call>`, `</tool_call>`, `<think>`, `</think>`
+/// in this vocab) must be split off literally before BPE, matching
+/// llama.cpp's own tokenizer: it treats both types as "added"/special
+/// tokens for this purpose. Missing USER_DEFINED here silently BPE-splits
+/// e.g. `<tool_call>` into 4 ordinary sub-word tokens the model never saw
+/// during training in that shape — well-formed-looking but out-of-
+/// distribution input that produces confident-looking garbage once the
+/// tools system block (the only place these literal strings appear
+/// verbatim) enters the context (issue #11).
+const SPECIAL_TOKEN_TYPES: [i32; 2] = [3, 4];
 
 pub struct BpeTokenizer {
     vocab: HashMap<String, u32>,
@@ -128,7 +139,10 @@ impl BpeTokenizer {
         for (id, token) in tokens.iter().enumerate() {
             vocab.insert(token.clone(), id as u32);
             id_to_bytes.push(decode_token_bytes(token, &char_to_byte));
-            if token_type.get(id) == Some(&TOKEN_TYPE_CONTROL) {
+            if token_type
+                .get(id)
+                .is_some_and(|t| SPECIAL_TOKEN_TYPES.contains(t))
+            {
                 specials.push((token.clone(), id as u32));
             }
         }

@@ -52,6 +52,24 @@ fn special_token_is_never_split_by_a_matching_merge() {
 }
 
 #[test]
+fn user_defined_token_type_is_also_treated_as_special() {
+    // ggml's token_type 4 (USER_DEFINED) marks tokens like Ornith-1.0-9B's
+    // `<tool_call>`/`</tool_call>`/`<think>`/`</think>` -- llama.cpp treats
+    // these identically to type 3 (CONTROL) when tokenizing (confirmed
+    // against the real GGUF with `llama-eval-callback`: it produces a
+    // single id for `<tool_call>` where an earlier revision of this
+    // tokenizer BPE-split it into 4 ordinary sub-word tokens). That silent
+    // split fed the model an input shape it never saw in training wherever
+    // a tools system block appeared, and was issue #11's root cause
+    // (well-formed-looking but out-of-distribution input, not a
+    // forward-pass bug).
+    let tok = build(&["< |"], &[("<|s|>", 4)]);
+    let ids = tok.encode("x<|s|>y");
+    assert_eq!(ids, vec![b'x' as u32, 256, b'y' as u32]);
+    assert_eq!(tok.decode(&ids), "x<|s|>y");
+}
+
+#[test]
 fn decode_skips_out_of_range_ids_instead_of_panicking() {
     let tok = build(&[], &[]);
     assert_eq!(tok.decode(&[u32::MAX]), "");

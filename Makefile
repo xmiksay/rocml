@@ -30,15 +30,17 @@ test-integration:
 # references, the Ornith-1.0-9B end-to-end smoke test, and the rocml-serve
 # HTTP end-to-end test; needs --release for the forward-pass decode loops to
 # run in reasonable time. Each skips itself if its checkpoint isn't present.
-# `ornith_tool_call_is_emitted` in server_e2e is a separate #[ignore]d manual
-# check against the Ornith GGUF (see the test's own doc comment) — not run
-# here, since it and the plain server_e2e test would compete for VRAM.
+# `ornith_tool_call_is_emitted` in server_e2e is `#[ignore]`d and run as its
+# own `cargo test` invocation (see the test's own doc comment) — it and the
+# plain server_e2e test both load a model onto the same GPU and would
+# compete for VRAM if run concurrently in the same test binary.
 test-model:
 	cargo test --release -p rocml --test greedy_parity
 	cargo test --release -p rocml --test qwen35_cpu_reference
 	cargo test --release -p rocml --test qwen35_greedy_parity
 	cargo test --release -p rocml --test ornith_e2e
 	cargo test --release -p rocml-serve --test server_e2e
+	cargo test --release -p rocml-serve --test server_e2e -- --ignored ornith_tool_call_is_emitted
 
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
