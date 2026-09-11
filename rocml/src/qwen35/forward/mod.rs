@@ -156,8 +156,8 @@ impl Model {
             hidden,
             self.config.rms_eps,
         )?;
-        self.kernels.gemv_f16(
-            offset(&self.weights.output, 0),
+        self.weights.output.matvec(
+            &self.kernels,
             offset(&self.scratch.xn, 0),
             offset(&self.scratch.logits, 0),
             self.config.vocab_size,

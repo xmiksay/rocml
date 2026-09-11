@@ -6,6 +6,7 @@
 mod attention;
 mod ffn;
 pub(crate) mod kernels;
+pub(crate) mod kernels_quant;
 mod scratch;
 
 use std::path::Path;
@@ -124,8 +125,8 @@ impl Model {
             hidden,
             self.config.rms_eps,
         )?;
-        self.kernels.gemv_f16(
-            offset(&self.weights.output, 0),
+        self.weights.output.matvec(
+            &self.kernels,
             offset(&self.scratch.xn, 0),
             offset(&self.scratch.logits, 0),
             self.config.vocab_size,

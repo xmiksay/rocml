@@ -1,30 +1,29 @@
 //! One full-attention layer's weights (every `full_attention_interval`-th
 //! qwen35 block).
 
-use half::f16;
 use rocml_core::gguf::GgufFile;
 use rocml_hip::DeviceBuffer;
 
 use super::ffn::FfnWeights;
 use crate::error::RocmlError;
 use crate::qwen35::config::Qwen35Config;
-use crate::weights::{load_matrix_f16, load_vector_f32};
+use crate::weights::{load_vector_f32, LinearWeight};
 
 pub struct AttnLayerWeights {
     pub attn_norm: DeviceBuffer<f32>,
-    /// gemv_f16 shape (m=q_out, n=hidden). `q_out` is `2 * q_dim` when
-    /// `has_output_gate` (Qwen3.5 always sets this): each head's row is
-    /// `[query(head_dim) | gate(head_dim)]`, not a flat `[Q | gate]` split —
-    /// see `attention.rs`'s per-head extraction.
-    pub attn_q: DeviceBuffer<f16>,
+    /// (m=q_out, n=hidden). `q_out` is `2 * q_dim` when `has_output_gate`
+    /// (Qwen3.5 always sets this): each head's row is `[query(head_dim) |
+    /// gate(head_dim)]`, not a flat `[Q | gate]` split — see `attention.rs`'s
+    /// per-head extraction.
+    pub attn_q: LinearWeight,
     pub attn_q_norm: DeviceBuffer<f32>,
-    /// gemv_f16 shape (m=kv_dim, n=hidden).
-    pub attn_k: DeviceBuffer<f16>,
+    /// (m=kv_dim, n=hidden).
+    pub attn_k: LinearWeight,
     pub attn_k_norm: DeviceBuffer<f32>,
-    /// gemv_f16 shape (m=kv_dim, n=hidden).
-    pub attn_v: DeviceBuffer<f16>,
-    /// gemv_f16 shape (m=hidden, n=q_dim).
-    pub attn_output: DeviceBuffer<f16>,
+    /// (m=kv_dim, n=hidden).
+    pub attn_v: LinearWeight,
+    /// (m=hidden, n=q_dim).
+    pub attn_output: LinearWeight,
     pub post_attention_norm: DeviceBuffer<f32>,
     pub ffn: FfnWeights,
     pub has_output_gate: bool,
@@ -75,12 +74,17 @@ impl AttnLayerWeights {
 
         Ok(Self {
             attn_norm: load_vector_f32(gguf, &format!("{p}.attn_norm.weight"), hidden)?,
-            attn_q: load_matrix_f16(gguf, &q_name, q_out, hidden)?,
+            attn_q: LinearWeight::load(gguf, &q_name, q_out, hidden)?,
             attn_q_norm: load_vector_f32(gguf, &format!("{p}.attn_q_norm.weight"), cfg.head_dim)?,
-            attn_k: load_matrix_f16(gguf, &format!("{p}.attn_k.weight"), kv_dim, hidden)?,
+            attn_k: LinearWeight::load(gguf, &format!("{p}.attn_k.weight"), kv_dim, hidden)?,
             attn_k_norm: load_vector_f32(gguf, &format!("{p}.attn_k_norm.weight"), cfg.head_dim)?,
-            attn_v: load_matrix_f16(gguf, &format!("{p}.attn_v.weight"), kv_dim, hidden)?,
-            attn_output: load_matrix_f16(gguf, &format!("{p}.attn_output.weight"), hidden, q_dim)?,
+            attn_v: LinearWeight::load(gguf, &format!("{p}.attn_v.weight"), kv_dim, hidden)?,
+            attn_output: LinearWeight::load(
+                gguf,
+                &format!("{p}.attn_output.weight"),
+                hidden,
+                q_dim,
+            )?,
             post_attention_norm: load_vector_f32(
                 gguf,
                 &format!("{p}.post_attention_norm.weight"),

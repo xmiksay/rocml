@@ -50,29 +50,29 @@ pub(crate) fn gdn_layer_step(
         config.rms_eps,
     )?;
 
-    kernels.gemv_f16(
-        offset(&layer.attn_qkv, 0),
+    layer.attn_qkv.matvec(
+        kernels,
         offset(&scratch.xn, 0),
         offset(&scratch.gdn_qkv, 0),
         gdn.conv_dim,
         hidden,
     )?;
-    kernels.gemv_f16(
-        offset(&layer.attn_gate, 0),
+    layer.attn_gate.matvec(
+        kernels,
         offset(&scratch.xn, 0),
         offset(&scratch.gdn_z, 0),
         gdn.value_dim,
         hidden,
     )?;
-    kernels.gemv_f16(
-        offset(&layer.ssm_alpha, 0),
+    layer.ssm_alpha.matvec(
+        kernels,
         offset(&scratch.xn, 0),
         offset(&scratch.gdn_a_raw, 0),
         gdn.num_v_heads,
         hidden,
     )?;
-    kernels.gemv_f16(
-        offset(&layer.ssm_beta, 0),
+    layer.ssm_beta.matvec(
+        kernels,
         offset(&scratch.xn, 0),
         offset(&scratch.gdn_b_raw, 0),
         gdn.num_v_heads,
@@ -128,6 +128,7 @@ pub(crate) fn gdn_layer_step(
         offset(&scratch.gdn_g, 0),
         offset(&scratch.gdn_y, 0),
         gdn.num_v_heads,
+        gdn.num_k_heads,
         gdn.head_k_dim,
         gdn.head_v_dim,
     )?;
@@ -143,8 +144,8 @@ pub(crate) fn gdn_layer_step(
     )?;
     kernels.silu_mul(offset(&scratch.gdn_z, 0), y_off, y_off, gdn.value_dim)?;
 
-    kernels.gemv_f16(
-        offset(&layer.ssm_out, 0),
+    layer.ssm_out.matvec(
+        kernels,
         offset(&scratch.gdn_y, 0),
         offset(&scratch.gdn_out, 0),
         hidden,

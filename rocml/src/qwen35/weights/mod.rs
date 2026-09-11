@@ -19,12 +19,12 @@ use rocml_hip::DeviceBuffer;
 
 use super::config::Qwen35Config;
 use crate::error::RocmlError;
-use crate::weights::{load_matrix_f16, load_vector_f32};
+use crate::weights::{load_matrix_f16, load_vector_f32, LinearWeight};
 
 pub struct ModelWeights {
     pub token_embd: DeviceBuffer<f16>,
     pub output_norm: DeviceBuffer<f32>,
-    pub output: DeviceBuffer<f16>,
+    pub output: LinearWeight,
     pub layers: Vec<LayerWeights>,
 }
 
@@ -38,14 +38,14 @@ impl ModelWeights {
         )?;
         let output_norm = load_vector_f32(gguf, "output_norm.weight", config.embedding_length)?;
         let output = if gguf.tensor("output.weight").is_ok() {
-            load_matrix_f16(
+            LinearWeight::load(
                 gguf,
                 "output.weight",
                 config.vocab_size,
                 config.embedding_length,
             )?
         } else {
-            load_matrix_f16(
+            LinearWeight::load(
                 gguf,
                 "token_embd.weight",
                 config.vocab_size,

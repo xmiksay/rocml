@@ -135,8 +135,11 @@ impl HybridKernels {
         unsafe { self.gate_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 
-    /// `gdn_recurrence_decode_f32`: fused state update + readout, one head
-    /// per block, block size `max(head_k_dim, head_v_dim)`.
+    /// `gdn_recurrence_decode_f32`: fused state update + readout, one value
+    /// head per block, block size `max(head_k_dim, head_v_dim)`. `num_heads`
+    /// must be a multiple of `num_k_heads` — value head `h`'s query/key come
+    /// from key head `h % num_k_heads` (tiled, matching llama.cpp's GGUF
+    /// V-head reorder — see the kernel's own doc comment).
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_recurrence_decode(
         &self,
@@ -148,6 +151,7 @@ impl HybridKernels {
         g: DevPtr,
         y: DevPtr,
         num_heads: u32,
+        num_k_heads: u32,
         head_k_dim: u32,
         head_v_dim: u32,
     ) -> Result<(), RocmlError> {
@@ -157,11 +161,22 @@ impl HybridKernels {
             block: (block, 1, 1),
             shared_mem_bytes: 2 * (head_k_dim + head_v_dim) * size_of::<f32>() as u32,
         };
-        let mut params =
-            kernel_params!(state, q, k, v, beta, g, y, num_heads, head_k_dim, head_v_dim);
+        let mut params = kernel_params!(
+            state,
+            q,
+            k,
+            v,
+            beta,
+            g,
+            y,
+            num_heads,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim
+        );
         // SAFETY: params matches gdn_recurrence_decode_f32's signature
-        // (float*, four const float*, const float*, float*, three
-        // unsigned); block size is max(head_k_dim, head_v_dim) as required.
+        // (float*, four const float*, const float*, float*, four unsigned);
+        // block size is max(head_k_dim, head_v_dim) as required.
         unsafe { self.recurrence_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 

@@ -45,22 +45,22 @@ pub(crate) fn attention_step(
     } else {
         q_dim
     };
-    kernels.gemv_f16(
-        offset(&layer.attn_q, 0),
+    layer.attn_q.matvec(
+        kernels,
         offset(&scratch.xn, 0),
         offset(&scratch.attn_q_raw, 0),
         q_out,
         hidden,
     )?;
-    kernels.gemv_f16(
-        offset(&layer.attn_k, 0),
+    layer.attn_k.matvec(
+        kernels,
         offset(&scratch.xn, 0),
         offset(&scratch.attn_k, 0),
         kv_dim,
         hidden,
     )?;
-    kernels.gemv_f16(
-        offset(&layer.attn_v, 0),
+    layer.attn_v.matvec(
+        kernels,
         offset(&scratch.xn, 0),
         offset(&scratch.attn_v, 0),
         kv_dim,
@@ -185,8 +185,8 @@ pub(crate) fn attention_step(
         )?;
     }
 
-    kernels.gemv_f16(
-        offset(&layer.attn_output, 0),
+    layer.attn_output.matvec(
+        kernels,
         offset(&scratch.attn_concat, 0),
         offset(&scratch.attn_out, 0),
         hidden,

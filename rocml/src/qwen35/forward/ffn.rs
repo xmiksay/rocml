@@ -27,15 +27,15 @@ pub(crate) fn ffn_step(
         hidden,
         rms_eps,
     )?;
-    kernels.gemv_f16(
-        offset(&ffn.gate, 0),
+    ffn.gate.matvec(
+        kernels,
         offset(&scratch.xn, 0),
         offset(&scratch.ffn_gate, 0),
         ffn_dim,
         hidden,
     )?;
-    kernels.gemv_f16(
-        offset(&ffn.up, 0),
+    ffn.up.matvec(
+        kernels,
         offset(&scratch.xn, 0),
         offset(&scratch.ffn_up, 0),
         ffn_dim,
@@ -49,8 +49,8 @@ pub(crate) fn ffn_step(
         offset(&scratch.ffn_gate, 0),
         ffn_dim,
     )?;
-    kernels.gemv_f16(
-        offset(&ffn.down, 0),
+    ffn.down.matvec(
+        kernels,
         offset(&scratch.ffn_gate, 0),
         offset(&scratch.ffn_out, 0),
         hidden,

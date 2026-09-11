@@ -4,8 +4,10 @@
 //! stay f32 through the whole forward pass for numerical stability).
 
 mod layer;
+mod linear;
 
 pub use layer::LayerWeights;
+pub use linear::LinearWeight;
 
 use half::f16;
 use rocml_core::gguf::GgufFile;
@@ -16,15 +18,18 @@ use crate::config::ModelConfig;
 use crate::error::RocmlError;
 
 pub struct ModelWeights {
-    /// Row-major [vocab, hidden]: row `id` is token `id`'s embedding.
+    /// Row-major [vocab, hidden]: row `id` is token `id`'s embedding. Always
+    /// dequantized to f16 — the embedding lookup kernel only reads f16.
     pub token_embd: DeviceBuffer<f16>,
     pub output_norm: DeviceBuffer<f32>,
-    /// gemv_f16 shape (m=vocab, n=hidden). Qwen3-0.6B ties this to
-    /// `token_embd.weight` (no separate `output.weight` tensor) — handled by
-    /// re-loading the same tensor rather than sharing a buffer, since
-    /// `DeviceBuffer` has no cheap aliasing story and this only costs a
-    /// one-time extra dequant at startup.
-    pub output: DeviceBuffer<f16>,
+    /// (m=vocab, n=hidden). Qwen3-0.6B ties this to `token_embd.weight` (no
+    /// separate `output.weight` tensor) — handled by re-loading the same
+    /// tensor rather than sharing a buffer, since `DeviceBuffer` has no
+    /// cheap aliasing story and this only costs a one-time extra load at
+    /// startup. This is the single biggest matvec in the model, so it's
+    /// loaded through `LinearWeight` like every other linear layer — it
+    /// stays quantized whenever the loader policy allows it.
+    pub output: LinearWeight,
     pub layers: Vec<LayerWeights>,
 }
 
@@ -38,14 +43,14 @@ impl ModelWeights {
         )?;
         let output_norm = load_vector_f32(gguf, "output_norm.weight", config.embedding_length)?;
         let output = if gguf.tensor("output.weight").is_ok() {
-            load_matrix_f16(
+            LinearWeight::load(
                 gguf,
                 "output.weight",
                 config.vocab_size,
                 config.embedding_length,
             )?
         } else {
-            load_matrix_f16(
+            LinearWeight::load(
                 gguf,
                 "token_embd.weight",
                 config.vocab_size,

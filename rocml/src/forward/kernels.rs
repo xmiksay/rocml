@@ -8,8 +8,10 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 
+use rocml_core::quant::GgmlDType;
 use rocml_hip::{kernel_params, DeviceBuffer, LaunchConfig, Module};
 
+use super::kernels_quant::QuantKernels;
 use crate::error::RocmlError;
 
 /// A raw device pointer, valid only as a kernel launch argument for as long
@@ -41,7 +43,7 @@ pub fn offset<T: Copy>(buf: &DeviceBuffer<T>, elem_offset: usize) -> DevPtr {
 /// stay efficient for the largest `n` this model uses (hidden=1024,
 /// q_dim=2048, max_seq up to 4096) while still being a fine grid-stride
 /// block for the smallest (head_dim=128).
-const REDUCE_BLOCK: u32 = 128;
+pub(super) const REDUCE_BLOCK: u32 = 128;
 /// Block size for plain elementwise/grid-stride kernels with no
 /// power-of-two constraint.
 const LINEAR_BLOCK: u32 = 256;
@@ -65,6 +67,7 @@ pub struct Kernels {
     silu_mul_fn: rocml_hip::Function,
     _mod_elementwise: Module,
     add_inplace_fn: rocml_hip::Function,
+    quant: QuantKernels,
 }
 
 pub(crate) fn load(hsaco: &[u8], name: &str) -> Result<(Module, rocml_hip::Function), RocmlError> {
@@ -111,6 +114,7 @@ impl Kernels {
             rocml_kernels::ELEMENTWISE_HSACO,
             rocml_kernels::ADD_INPLACE_F32_KERNEL,
         )?;
+        let quant = QuantKernels::load_all()?;
 
         Ok(Self {
             _mod_embedding,
@@ -131,6 +135,7 @@ impl Kernels {
             silu_mul_fn,
             _mod_elementwise,
             add_inplace_fn,
+            quant,
         })
     }
 
@@ -217,6 +222,21 @@ impl Kernels {
         // float*, float*, unsigned, unsigned); block size is the required
         // power of two.
         unsafe { self.gemv_f16_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
+    }
+
+    /// `y = W * x` where `W`'s rows are raw GGUF `dtype` blocks (Q8_0/Q4_K/
+    /// Q5_K/Q6_K) — see [`LinearWeight`](crate::weights::LinearWeight),
+    /// which is the only caller expected to hit this.
+    pub fn gemv_quant(
+        &self,
+        dtype: GgmlDType,
+        w: DevPtr,
+        x: DevPtr,
+        y: DevPtr,
+        m: u32,
+        n: u32,
+    ) -> Result<(), RocmlError> {
+        self.quant.gemv(dtype, w, x, y, m, n)
     }
 
     /// `gemv_t_f32(a, x, y, rows, n)`: y = A^T * x, A row-major rows x n f32.

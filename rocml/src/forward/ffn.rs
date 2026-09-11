@@ -24,15 +24,15 @@ pub(crate) fn ffn_step(
         hidden,
         config.rms_eps,
     )?;
-    kernels.gemv_f16(
-        offset(&layer.ffn_gate, 0),
+    layer.ffn_gate.matvec(
+        kernels,
         offset(&scratch.xn, 0),
         offset(&scratch.gate, 0),
         ffn,
         hidden,
     )?;
-    kernels.gemv_f16(
-        offset(&layer.ffn_up, 0),
+    layer.ffn_up.matvec(
+        kernels,
         offset(&scratch.xn, 0),
         offset(&scratch.up, 0),
         ffn,
@@ -46,8 +46,8 @@ pub(crate) fn ffn_step(
         offset(&scratch.gate, 0),
         ffn,
     )?;
-    kernels.gemv_f16(
-        offset(&layer.ffn_down, 0),
+    layer.ffn_down.matvec(
+        kernels,
         offset(&scratch.gate, 0),
         offset(&scratch.ffn_out, 0),
         hidden,
