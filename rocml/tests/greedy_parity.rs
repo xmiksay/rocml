@@ -10,14 +10,13 @@
 //! unoptimized. Skips itself if the checkpoint isn't present on this
 //! machine.
 
-use std::path::Path;
-
 use rocml::Model;
 use rocml_core::gguf::GgufFile;
+use rocml_core::testpaths::checkpoint;
 use rocml_core::tokenizer::BpeTokenizer;
 use serde::Deserialize;
 
-const GGUF_PATH: &str = "/mnt/nvme/miksa/checkpoints/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
+const GGUF_REL: &str = "Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const FIXTURES_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/data/qwen3_greedy_fixtures.json"
@@ -50,14 +49,6 @@ struct Meta {
 struct Case {
     prompt: String,
     continuation: String,
-}
-
-fn skip_if_missing(path: &str) -> bool {
-    if !Path::new(path).exists() {
-        eprintln!("skipping: {path} not present on this machine");
-        return true;
-    }
-    false
 }
 
 /// Greedily decodes `n` tokens after `prompt_ids`, returning the generated
@@ -115,18 +106,18 @@ fn token_bytes_with_boundaries(tokenizer: &BpeTokenizer, ids: &[u32]) -> (Vec<u8
 
 #[test]
 fn dense_qwen3_0_6b_greedy_matches_candle_cpu_reference() {
-    if skip_if_missing(GGUF_PATH) {
+    let Some(gguf_path) = checkpoint(GGUF_REL) else {
         return;
-    }
+    };
     let fixtures: Fixtures =
         serde_json::from_str(&std::fs::read_to_string(FIXTURES_PATH).expect("read fixtures json"))
             .expect("parse fixtures json");
 
-    let gguf = GgufFile::open(GGUF_PATH).expect("open GGUF");
+    let gguf = GgufFile::open(&gguf_path).expect("open GGUF");
     let tokenizer = BpeTokenizer::from_gguf(&gguf).expect("build tokenizer");
     drop(gguf); // Model::load mmaps its own handle; no need to hold two.
 
-    let mut model = Model::load(GGUF_PATH).expect("load model");
+    let mut model = Model::load(&gguf_path).expect("load model");
 
     for case in &fixtures.cases {
         model.reset().expect("reset failed");

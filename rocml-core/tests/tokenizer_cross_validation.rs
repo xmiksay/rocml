@@ -2,12 +2,12 @@
 //! battle-tested BPE implementation).
 //!
 //! The primary check (`matches_real_qwen35_tokenizer_json_on_tricky_inputs`)
-//! loads the *real* HF tokenizer for this model family directly —
-//! `/mnt/nvme/miksa/checkpoints/Qwen3.5-2B-tokenizer/tokenizer.json` — and
-//! compares token ids one-for-one against `BpeTokenizer` built from
-//! `Qwen3.5-2B-Q8_0.gguf`'s own metadata. Both share the same 248320-entry
-//! `qwen35`-family vocab, so this is a genuine ground-truth comparison, not
-//! an approximation.
+//! loads the *real* HF tokenizer for this model family directly — under
+//! `<checkpoint dir>/Qwen3.5-2B-tokenizer/tokenizer.json` (see
+//! `rocml_core::testpaths`) — and compares token ids one-for-one against
+//! `BpeTokenizer` built from `Qwen3.5-2B-Q8_0.gguf`'s own metadata. Both
+//! share the same 248320-entry `qwen35`-family vocab, so this is a genuine
+//! ground-truth comparison, not an approximation.
 //!
 //! (Earlier this test could only cross-check against `Qwen/Qwen3-0.6B`'s
 //! cached tokenizer, an unrelated ~151.6k-vocab, differently-trained
@@ -24,6 +24,7 @@
 //! well-tested reference implementation.
 
 use rocml_core::gguf::GgufFile;
+use rocml_core::testpaths::{checkpoint, hf_hub_file};
 use rocml_core::tokenizer::{BpeTokenizer, PRETOKENIZE_PATTERN_QWEN35};
 use tokenizers::models::bpe::{Merges, Vocab, BPE};
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
@@ -31,44 +32,16 @@ use tokenizers::pre_tokenizers::sequence::Sequence;
 use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
 use tokenizers::{AddedToken, PreTokenizerWrapper, SplitDelimiterBehavior, Tokenizer};
 
-const QWEN35_GGUF_PATH: &str = "/mnt/nvme/miksa/checkpoints/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
-const QWEN35_HF_TOKENIZER_PATH: &str =
-    "/mnt/nvme/miksa/checkpoints/Qwen3.5-2B-tokenizer/tokenizer.json";
-const HF_QWEN3_0_6B_TOKENIZER_GLOB: &str =
-    "/home/miksa/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/*/tokenizer.json";
-const QWEN3_0_6B_GGUF_PATH: &str =
-    "/mnt/nvme/miksa/checkpoints/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
+const QWEN35_GGUF_REL: &str = "Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
+const QWEN35_HF_TOKENIZER_REL: &str = "Qwen3.5-2B-tokenizer/tokenizer.json";
+const QWEN3_0_6B_HF_REPO: &str = "models--Qwen--Qwen3-0.6B";
+const QWEN3_0_6B_HF_TOKENIZER_REL: &str = "tokenizer.json";
+const QWEN3_0_6B_GGUF_REL: &str = "Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 /// Mirrors `BpeTokenizer`'s own `SPECIAL_TOKEN_TYPES` (ggml's CONTROL and
 /// USER_DEFINED token-type ids) so this file's independent reference
 /// tokenizer special-cases exactly the same tokens `ours` does — see that
 /// constant's doc comment for why both types matter (issue #11).
 const SPECIAL_TOKEN_TYPES: [i32; 2] = [3, 4];
-
-fn skip_if_missing(path: &str) -> bool {
-    if !std::path::Path::new(path).exists() {
-        eprintln!("skipping: {path} not present on this machine");
-        return true;
-    }
-    false
-}
-
-/// Resolves a path containing exactly one `*` path component (e.g. the HF
-/// hub's `snapshots/<commit-hash>/...` layout) by listing that directory.
-/// No `glob` crate in the allowed dependency list; a single wildcard
-/// component is all this needs.
-fn glob_one(pattern: &str) -> Option<std::path::PathBuf> {
-    let parts: Vec<&str> = pattern.split('/').collect();
-    let star_idx = parts.iter().position(|&p| p == "*")?;
-    let base_dir: std::path::PathBuf = parts[..star_idx].join("/").into();
-    let rest = &parts[star_idx + 1..];
-    for entry in std::fs::read_dir(&base_dir).ok()?.flatten() {
-        let candidate = rest.iter().fold(entry.path(), |acc, seg| acc.join(seg));
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
-}
 
 /// Battery for the id-for-id comparisons. Deliberately excludes any control
 /// token substring (e.g. `<|im_start|>`): the `tokenizers` crate's
@@ -103,13 +76,16 @@ const TRICKY_INPUTS: &[&str] = &[
 
 #[test]
 fn matches_real_qwen35_tokenizer_json_on_tricky_inputs() {
-    if skip_if_missing(QWEN35_GGUF_PATH) || skip_if_missing(QWEN35_HF_TOKENIZER_PATH) {
+    let Some(qwen35_gguf_path) = checkpoint(QWEN35_GGUF_REL) else {
         return;
-    }
-    let gguf = GgufFile::open(QWEN35_GGUF_PATH).expect("open GGUF");
+    };
+    let Some(qwen35_tokenizer_path) = checkpoint(QWEN35_HF_TOKENIZER_REL) else {
+        return;
+    };
+    let gguf = GgufFile::open(&qwen35_gguf_path).expect("open GGUF");
     let ours = BpeTokenizer::from_gguf(&gguf).expect("build BpeTokenizer");
     let reference =
-        Tokenizer::from_file(QWEN35_HF_TOKENIZER_PATH).expect("load real qwen3.5 tokenizer.json");
+        Tokenizer::from_file(&qwen35_tokenizer_path).expect("load real qwen3.5 tokenizer.json");
 
     for &text in TRICKY_INPUTS {
         let got = ours.encode(text);
@@ -146,12 +122,15 @@ const NFD_DECOMPOSED_INPUTS: &[(&str, &str)] = &[
 /// pre-token, but grouping alone isn't composing; both are required.
 #[test]
 fn matches_reference_on_nfd_decomposed_combining_marks() {
-    if skip_if_missing(QWEN35_GGUF_PATH) || skip_if_missing(QWEN35_HF_TOKENIZER_PATH) {
+    let Some(qwen35_gguf_path) = checkpoint(QWEN35_GGUF_REL) else {
         return;
-    }
-    let gguf = GgufFile::open(QWEN35_GGUF_PATH).unwrap();
+    };
+    let Some(qwen35_tokenizer_path) = checkpoint(QWEN35_HF_TOKENIZER_REL) else {
+        return;
+    };
+    let gguf = GgufFile::open(&qwen35_gguf_path).unwrap();
     let ours = BpeTokenizer::from_gguf(&gguf).unwrap();
-    let reference = Tokenizer::from_file(QWEN35_HF_TOKENIZER_PATH).unwrap();
+    let reference = Tokenizer::from_file(&qwen35_tokenizer_path).unwrap();
 
     for &(decomposed, composed) in NFD_DECOMPOSED_INPUTS {
         let got = ours.encode(decomposed);
@@ -184,10 +163,10 @@ fn rocml_special_token_is_a_single_id() {
     // doesn't skip added-vocabulary matching (see the doc comment on
     // TRICKY_INPUTS), so this is checked against rocml alone rather than
     // folded into the id-for-id battery above.
-    if skip_if_missing(QWEN35_GGUF_PATH) {
+    let Some(qwen35_gguf_path) = checkpoint(QWEN35_GGUF_REL) else {
         return;
-    }
-    let gguf = GgufFile::open(QWEN35_GGUF_PATH).unwrap();
+    };
+    let gguf = GgufFile::open(&qwen35_gguf_path).unwrap();
     let ours = BpeTokenizer::from_gguf(&gguf).unwrap();
 
     let tokens = gguf.get_str_arr("tokenizer.ggml.tokens").unwrap();
@@ -214,10 +193,10 @@ fn rocml_special_token_is_a_single_id() {
 /// on, feeding it out-of-distribution input in the tools system block.
 #[test]
 fn tool_call_marker_is_a_single_id() {
-    if skip_if_missing(QWEN35_GGUF_PATH) {
+    let Some(qwen35_gguf_path) = checkpoint(QWEN35_GGUF_REL) else {
         return;
-    }
-    let gguf = GgufFile::open(QWEN35_GGUF_PATH).unwrap();
+    };
+    let gguf = GgufFile::open(&qwen35_gguf_path).unwrap();
     let ours = BpeTokenizer::from_gguf(&gguf).unwrap();
 
     let tokens = gguf.get_str_arr("tokenizer.ggml.tokens").unwrap();
@@ -286,10 +265,10 @@ fn build_reference_from_gguf(gguf: &GgufFile) -> Tokenizer {
 
 #[test]
 fn matches_independently_built_reference_from_same_gguf_vocab() {
-    if skip_if_missing(QWEN35_GGUF_PATH) {
+    let Some(qwen35_gguf_path) = checkpoint(QWEN35_GGUF_REL) else {
         return;
-    }
-    let gguf = GgufFile::open(QWEN35_GGUF_PATH).expect("open GGUF");
+    };
+    let gguf = GgufFile::open(&qwen35_gguf_path).expect("open GGUF");
     let ours = BpeTokenizer::from_gguf(&gguf).expect("build BpeTokenizer");
     let reference = build_reference_from_gguf(&gguf);
 
@@ -313,14 +292,14 @@ fn matches_independently_built_reference_from_same_gguf_vocab() {
 
 #[test]
 fn vocab_size_confirms_qwen3_0_6b_is_unrelated() {
-    if skip_if_missing(QWEN35_GGUF_PATH) {
+    let Some(qwen35_gguf_path) = checkpoint(QWEN35_GGUF_REL) else {
         return;
-    }
-    let gguf = GgufFile::open(QWEN35_GGUF_PATH).unwrap();
+    };
+    let gguf = GgufFile::open(&qwen35_gguf_path).unwrap();
     let gguf_vocab_len = gguf.get_str_arr("tokenizer.ggml.tokens").unwrap().len();
     assert_eq!(gguf_vocab_len, 248_320);
 
-    match glob_one(HF_QWEN3_0_6B_TOKENIZER_GLOB) {
+    match hf_hub_file(QWEN3_0_6B_HF_REPO, QWEN3_0_6B_HF_TOKENIZER_REL) {
         Some(path) => {
             let hf_tok = Tokenizer::from_file(&path).expect("load cached Qwen3-0.6B tokenizer");
             let hf_vocab_len = hf_tok.get_vocab_size(true);
@@ -333,7 +312,8 @@ fn vocab_size_confirms_qwen3_0_6b_is_unrelated() {
         }
         None => {
             eprintln!(
-                "no cached tokenizer.json found at {HF_QWEN3_0_6B_TOKENIZER_GLOB}, skipping the size check"
+                "no cached tokenizer.json found for {QWEN3_0_6B_HF_REPO} (HF_HOME/hub or \
+                 ~/.cache/huggingface/hub), skipping the size check"
             );
         }
     }
@@ -347,15 +327,19 @@ fn vocab_size_confirms_qwen3_0_6b_is_unrelated() {
 /// the real cached `Qwen/Qwen3-0.6B` `tokenizer.json`.
 #[test]
 fn matches_real_qwen2_tokenizer_json_on_tricky_inputs() {
-    if skip_if_missing(QWEN3_0_6B_GGUF_PATH) {
+    let Some(qwen3_0_6b_gguf_path) = checkpoint(QWEN3_0_6B_GGUF_REL) else {
         return;
-    }
-    let Some(hf_tokenizer_path) = glob_one(HF_QWEN3_0_6B_TOKENIZER_GLOB) else {
-        eprintln!("no cached tokenizer.json found at {HF_QWEN3_0_6B_TOKENIZER_GLOB}, skipping");
+    };
+    let Some(hf_tokenizer_path) = hf_hub_file(QWEN3_0_6B_HF_REPO, QWEN3_0_6B_HF_TOKENIZER_REL)
+    else {
+        eprintln!(
+            "no cached tokenizer.json found for {QWEN3_0_6B_HF_REPO} (HF_HOME/hub or \
+             ~/.cache/huggingface/hub), skipping"
+        );
         return;
     };
 
-    let gguf = GgufFile::open(QWEN3_0_6B_GGUF_PATH).expect("open GGUF");
+    let gguf = GgufFile::open(&qwen3_0_6b_gguf_path).expect("open GGUF");
     assert_eq!(
         gguf.get_str("tokenizer.ggml.pre").ok(),
         Some("qwen2"),

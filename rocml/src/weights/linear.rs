@@ -111,14 +111,15 @@ impl LinearWeight {
 mod tests {
     use std::path::Path;
 
+    use rocml_core::testpaths::checkpoint;
     use rocml_hip::{Device, DeviceBuffer};
 
     use super::*;
     use crate::forward::kernels::{offset, Kernels};
     use crate::qwen35::config::{LayerKind, Qwen35Config};
 
-    const QWEN3_GGUF: &str = "/mnt/nvme/miksa/checkpoints/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
-    const QWEN35_GGUF: &str = "/mnt/nvme/miksa/checkpoints/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
+    const QWEN3_GGUF_REL: &str = "Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
+    const QWEN35_GGUF_REL: &str = "Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
     const REL_TOL: f32 = 2e-3;
 
     fn assert_close(actual: &[f32], expected: &[f32], label: &str) {
@@ -150,11 +151,7 @@ mod tests {
     /// own shape, so the shape check is a no-op — this test is about the
     /// matvec dispatch, not that validation) and asserts its `matvec` output
     /// matches the CPU dequant+dot reference.
-    fn spot_check(gguf_path: &str, tensor_name: &str) {
-        if !Path::new(gguf_path).exists() {
-            eprintln!("skipping: {gguf_path} not present on this machine");
-            return;
-        }
+    fn spot_check(gguf_path: &Path, tensor_name: &str) {
         let _device = Device::new(0).expect("failed to select device 0");
         let gguf = GgufFile::open(gguf_path).expect("open GGUF");
         let view = gguf.tensor(tensor_name).expect("tensor not found");
@@ -196,28 +193,29 @@ mod tests {
 
     #[test]
     fn dense_layer_matvec_matches_cpu_reference() {
-        spot_check(QWEN3_GGUF, "blk.0.attn_q.weight");
+        let Some(path) = checkpoint(QWEN3_GGUF_REL) else {
+            return;
+        };
+        spot_check(&path, "blk.0.attn_q.weight");
     }
 
     #[test]
     fn qwen35_gdn_layer_matvec_matches_cpu_reference() {
-        if !Path::new(QWEN35_GGUF).exists() {
-            eprintln!("skipping: {QWEN35_GGUF} not present on this machine");
+        let Some(path) = checkpoint(QWEN35_GGUF_REL) else {
             return;
-        }
-        let gguf = GgufFile::open(QWEN35_GGUF).expect("open GGUF");
+        };
+        let gguf = GgufFile::open(&path).expect("open GGUF");
         let idx = qwen35_layer_index(&gguf, LayerKind::LinearAttention);
-        spot_check(QWEN35_GGUF, &format!("blk.{idx}.attn_gate.weight"));
+        spot_check(&path, &format!("blk.{idx}.attn_gate.weight"));
     }
 
     #[test]
     fn qwen35_attention_layer_matvec_matches_cpu_reference() {
-        if !Path::new(QWEN35_GGUF).exists() {
-            eprintln!("skipping: {QWEN35_GGUF} not present on this machine");
+        let Some(path) = checkpoint(QWEN35_GGUF_REL) else {
             return;
-        }
-        let gguf = GgufFile::open(QWEN35_GGUF).expect("open GGUF");
+        };
+        let gguf = GgufFile::open(&path).expect("open GGUF");
         let idx = qwen35_layer_index(&gguf, LayerKind::FullAttention);
-        spot_check(QWEN35_GGUF, &format!("blk.{idx}.attn_output.weight"));
+        spot_check(&path, &format!("blk.{idx}.attn_output.weight"));
     }
 }

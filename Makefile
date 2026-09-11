@@ -1,7 +1,11 @@
 export CARGO_BUILD_JOBS := 4
 
+# Root directory for model checkpoints (see rocml_core::testpaths). Override
+# if your checkpoints live elsewhere.
+ROCML_CHECKPOINT_DIR ?= $(HOME)/checkpoints
+
 # Dev/test model (fast); override to point at a different checkpoint.
-QWEN_MODEL ?= /mnt/nvme/miksa/checkpoints/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf
+QWEN_MODEL ?= $(ROCML_CHECKPOINT_DIR)/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf
 
 .PHONY: build test test-unit test-integration test-model lint fmt clean serve bench
 

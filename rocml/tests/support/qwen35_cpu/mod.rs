@@ -8,6 +8,8 @@ mod gdn;
 mod math;
 mod weights;
 
+use std::path::Path;
+
 use math::{add_inplace, matvec, rmsnorm_rows};
 use rocml::qwen35::config::{LayerKind, Qwen35Config};
 use rocml_core::gguf::GgufFile;
@@ -26,7 +28,7 @@ pub struct CpuModel {
 }
 
 impl CpuModel {
-    pub fn load(gguf_path: &str) -> Self {
+    pub fn load(gguf_path: impl AsRef<Path>) -> Self {
         let gguf = GgufFile::open(gguf_path).expect("open GGUF");
         let cfg = Qwen35Config::from_gguf(&gguf).expect("parse qwen35 config");
         let weights = ModelWeights::load(&gguf, &cfg);

@@ -15,12 +15,11 @@
 
 mod support;
 
-use std::path::Path;
-
+use rocml_core::testpaths::checkpoint;
 use serde::Deserialize;
 use support::qwen35_cpu::CpuModel;
 
-const GGUF_PATH: &str = "/mnt/nvme/miksa/checkpoints/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
+const GGUF_REL: &str = "Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
 const FIXTURES_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/data/qwen35_greedy_fixtures.json"
@@ -53,10 +52,9 @@ fn argmax(logits: &[f32]) -> u32 {
 
 #[test]
 fn qwen35_cpu_reference_matches_crane_for_a_handful_of_tokens() {
-    if !Path::new(GGUF_PATH).exists() {
-        eprintln!("skipping: {GGUF_PATH} not present on this machine");
+    let Some(gguf_path) = checkpoint(GGUF_REL) else {
         return;
-    }
+    };
     let fixtures: Fixtures =
         serde_json::from_str(&std::fs::read_to_string(FIXTURES_PATH).expect("read fixtures json"))
             .expect("parse fixtures json");
@@ -66,7 +64,7 @@ fn qwen35_cpu_reference_matches_crane_for_a_handful_of_tokens() {
     let case = &fixtures.cases[0];
     eprintln!("qwen35 CPU reference: prompt {:?}", case.prompt);
 
-    let mut model = CpuModel::load(GGUF_PATH);
+    let mut model = CpuModel::load(&gguf_path);
     let mut logits = Vec::new();
     for &id in &case.prompt_ids {
         logits = model.forward_token(id);

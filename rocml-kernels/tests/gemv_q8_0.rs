@@ -9,6 +9,7 @@ use common::{
 };
 use rocml_core::gguf::GgufFile;
 use rocml_core::quant::GgmlDType;
+use rocml_core::testpaths::checkpoint;
 
 fn run_synthetic(m: u32, n: u32, seed: u32) {
     assert_eq!(
@@ -59,12 +60,10 @@ fn gemv_q8_0_large_shape() {
 
 #[test]
 fn gemv_q8_0_real_tensor() {
-    let path = "/mnt/nvme/miksa/checkpoints/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
-    if !std::path::Path::new(path).exists() {
-        eprintln!("skipping gemv_q8_0_real_tensor: checkpoint not found at {path}");
+    let Some(path) = checkpoint("Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf") else {
         return;
-    }
-    let gguf = GgufFile::open(path).expect("failed to open gguf");
+    };
+    let gguf = GgufFile::open(&path).expect("failed to open gguf");
     // A modest attention projection, not the ~500M-element embedding table.
     let view = gguf
         .tensor("blk.0.attn_gate.weight")

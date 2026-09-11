@@ -4,4 +4,5 @@
 
 pub mod gguf;
 pub mod quant;
+pub mod testpaths;
 pub mod tokenizer;

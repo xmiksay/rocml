@@ -13,25 +13,17 @@
 //! streaming assertions independent of how many tokens the 2B model would
 //! otherwise spend thinking before any visible content appears.
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
+use rocml_core::testpaths::checkpoint;
 use rocml_serve::{build, ServerConfig};
 use serde_json::{json, Value};
 
 mod support;
 
-const GGUF_PATH: &str = "/mnt/nvme/miksa/checkpoints/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
-const ORNITH_GGUF_PATH: &str =
-    "/mnt/nvme/miksa/checkpoints/Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf";
-
-fn skip_if_missing(path: &str) -> bool {
-    if !Path::new(path).exists() {
-        eprintln!("skipping: {path} not present on this machine");
-        return true;
-    }
-    false
-}
+const GGUF_REL: &str = "Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
+const ORNITH_GGUF_REL: &str = "Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf";
 
 struct TestServer {
     addr: std::net::SocketAddr,
@@ -54,9 +46,9 @@ impl TestServer {
     }
 }
 
-async fn spawn_test_server(model_path: &str) -> TestServer {
+async fn spawn_test_server(model_path: PathBuf) -> TestServer {
     let (app, worker_thread) = build(ServerConfig {
-        model_path: model_path.into(),
+        model_path,
         ctx: 4096,
         max_tokens_default: 128,
         no_think: true,
@@ -91,10 +83,10 @@ const WEATHER_TOOL: &str = r#"{
 
 #[tokio::test]
 async fn chat_completions_end_to_end() {
-    if skip_if_missing(GGUF_PATH) {
+    let Some(gguf_path) = checkpoint(GGUF_REL) else {
         return;
-    }
-    let server = spawn_test_server(GGUF_PATH).await;
+    };
+    let server = spawn_test_server(gguf_path).await;
     let addr = server.addr;
 
     // (1) Non-streamed completion: 200, non-empty content, sane usage.
@@ -194,10 +186,10 @@ async fn chat_completions_end_to_end() {
 #[tokio::test]
 #[ignore]
 async fn ornith_tool_call_is_emitted() {
-    if skip_if_missing(ORNITH_GGUF_PATH) {
+    let Some(ornith_gguf_path) = checkpoint(ORNITH_GGUF_REL) else {
         return;
-    }
-    let server = spawn_test_server(ORNITH_GGUF_PATH).await;
+    };
+    let server = spawn_test_server(ornith_gguf_path).await;
     let addr = server.addr;
     // Ornith's own template defaults reasoning on; give it more headroom
     // than the 2B scenario so a thinking preamble doesn't eat the whole

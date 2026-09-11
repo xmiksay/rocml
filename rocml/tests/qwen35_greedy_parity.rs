@@ -27,14 +27,13 @@
 //! isolates "does the hybrid GPU forward pass match Crane" — the thing this
 //! test exists to check — from the unrelated tokenizer question.
 
-use std::path::Path;
-
 use rocml::Model;
 use rocml_core::gguf::GgufFile;
+use rocml_core::testpaths::checkpoint;
 use rocml_core::tokenizer::BpeTokenizer;
 use serde::Deserialize;
 
-const GGUF_PATH: &str = "/mnt/nvme/miksa/checkpoints/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
+const GGUF_REL: &str = "Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
 const FIXTURES_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/data/qwen35_greedy_fixtures.json"
@@ -53,14 +52,6 @@ struct Case {
     prompt: String,
     prompt_ids: Vec<u32>,
     generated_ids: Vec<u32>,
-}
-
-fn skip_if_missing(path: &str) -> bool {
-    if !Path::new(path).exists() {
-        eprintln!("skipping: {path} not present on this machine");
-        return true;
-    }
-    false
 }
 
 fn top2(logits: &[f32]) -> (u32, f32, f32) {
@@ -99,18 +90,18 @@ fn generate_with_logit_gaps(
 
 #[test]
 fn qwen35_2b_hybrid_greedy_matches_crane_gpu_reference() {
-    if skip_if_missing(GGUF_PATH) {
+    let Some(gguf_path) = checkpoint(GGUF_REL) else {
         return;
-    }
+    };
     let fixtures: Fixtures =
         serde_json::from_str(&std::fs::read_to_string(FIXTURES_PATH).expect("read fixtures json"))
             .expect("parse fixtures json");
 
-    let gguf = GgufFile::open(GGUF_PATH).expect("open GGUF");
+    let gguf = GgufFile::open(&gguf_path).expect("open GGUF");
     let tokenizer = BpeTokenizer::from_gguf(&gguf).expect("build tokenizer");
     drop(gguf);
 
-    let mut model = Model::load(GGUF_PATH).expect("load model");
+    let mut model = Model::load(&gguf_path).expect("load model");
 
     for case in &fixtures.cases {
         let own_ids = tokenizer.encode(&case.prompt);

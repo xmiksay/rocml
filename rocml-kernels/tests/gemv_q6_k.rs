@@ -10,6 +10,7 @@ use common::{
 };
 use rocml_core::gguf::GgufFile;
 use rocml_core::quant::GgmlDType;
+use rocml_core::testpaths::checkpoint;
 
 fn run_synthetic(m: u32, n: u32, seed: u32) {
     assert_eq!(n as usize % K_BLOCK_ELEMS, 0, "n must be a multiple of 256");
@@ -56,12 +57,10 @@ fn gemv_q6_k_large_shape() {
 
 #[test]
 fn gemv_q6_k_real_tensor() {
-    let path = "/mnt/nvme/miksa/checkpoints/Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf";
-    if !std::path::Path::new(path).exists() {
-        eprintln!("skipping gemv_q6_k_real_tensor: checkpoint not found at {path}");
+    let Some(path) = checkpoint("Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf") else {
         return;
-    }
-    let gguf = GgufFile::open(path).expect("failed to open gguf");
+    };
+    let gguf = GgufFile::open(&path).expect("failed to open gguf");
     // A modest attention projection, not the ~1B-element embedding/output table.
     let view = gguf
         .tensor("blk.3.attn_output.weight")
