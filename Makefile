@@ -1,6 +1,9 @@
 export CARGO_BUILD_JOBS := 4
 
-.PHONY: build test test-unit test-integration test-model lint fmt clean
+# Dev/test model (fast); override to point at a different checkpoint.
+QWEN_MODEL ?= /mnt/nvme/miksa/checkpoints/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf
+
+.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench
 
 build:
 	cargo build --workspace
@@ -13,7 +16,8 @@ test:
 		--skip dense_qwen3_0_6b_greedy_matches_candle_cpu_reference \
 		--skip qwen35_cpu_reference_matches_crane_for_a_handful_of_tokens \
 		--skip qwen35_2b_hybrid_greedy_matches_crane_gpu_reference \
-		--skip ornith_9b_greedy_decode_is_well_formed_and_deterministic
+		--skip ornith_9b_greedy_decode_is_well_formed_and_deterministic \
+		--skip chat_completions_end_to_end
 	$(MAKE) test-model
 
 test-unit:
@@ -23,14 +27,18 @@ test-integration:
 	cargo test --workspace --test '*'
 
 # Real-hardware, real-GGUF tests: parity against independent candle/Crane
-# references plus the Ornith-1.0-9B end-to-end smoke test; needs --release
-# for the forward-pass decode loops to run in reasonable time. Each skips
-# itself if its checkpoint isn't present.
+# references, the Ornith-1.0-9B end-to-end smoke test, and the rocml-serve
+# HTTP end-to-end test; needs --release for the forward-pass decode loops to
+# run in reasonable time. Each skips itself if its checkpoint isn't present.
+# `ornith_tool_call_is_emitted` in server_e2e is a separate #[ignore]d manual
+# check against the Ornith GGUF (see the test's own doc comment) — not run
+# here, since it and the plain server_e2e test would compete for VRAM.
 test-model:
 	cargo test --release -p rocml --test greedy_parity
 	cargo test --release -p rocml --test qwen35_cpu_reference
 	cargo test --release -p rocml --test qwen35_greedy_parity
 	cargo test --release -p rocml --test ornith_e2e
+	cargo test --release -p rocml-serve --test server_e2e
 
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
@@ -41,3 +49,11 @@ fmt:
 
 clean:
 	cargo clean
+
+# Run the OpenAI-compatible server against the dev/test model.
+serve:
+	cargo run --release -p rocml-serve -- --model $(QWEN_MODEL)
+
+# Synthetic prompt/decode throughput benchmark against the dev/test model.
+bench:
+	cargo run --release -p rocml-cli -- bench --model $(QWEN_MODEL) --json

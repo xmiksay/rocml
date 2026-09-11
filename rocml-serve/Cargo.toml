@@ -1,0 +1,32 @@
+[package]
+name = "rocml-serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenAI-compatible HTTP server for rocml"
+
+[lib]
+name = "rocml_serve"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rocml-serve"
+path = "src/main.rs"
+
+[dependencies]
+rocml = { path = "../rocml" }
+rocml-core = { path = "../rocml-core" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+axum = { version = "0.7", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Not in the workspace's stated allow-list, but unavoidable: axum's own SSE
+# example (response/sse.rs's doc comment) bridges a channel into its `Sse<S>`
+# response the same way, via `tokio_stream::wrappers::UnboundedReceiverStream`
+# — axum already resolves `futures-core`/`futures-util` transitively for its
+# own `Stream` bound, so this adds no new dependency *tree*, just the thin
+# tokio-maintained adapter naming that already-present `Stream` impl.
+tokio-stream = "0.1"

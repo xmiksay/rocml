@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["rocml-hip", "rocml-kernels", "rocml-core", "rocml", "rocml-cli"]
+members = ["rocml-hip", "rocml-kernels", "rocml-core", "rocml", "rocml-cli", "rocml-serve"]
 
 [workspace.package]
 version = "0.1.0"
