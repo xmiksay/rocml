@@ -6,5 +6,6 @@ license.workspace = true
 description = "GGUF loading, ggml quant dequantization, and BPE tokenization for rocml"
 
 [dependencies]
+memmap2 = "0.9"
 thiserror = "1"
 half = "2"
