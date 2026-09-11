@@ -1,0 +1,9 @@
+[package]
+name = "rocml-hip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Minimal safe wrapper over the HIP runtime C API for rocml"
+
+[dependencies]
+thiserror = "1"
