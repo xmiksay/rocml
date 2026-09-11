@@ -1,0 +1,341 @@
+[
+  {
+    "case_name": "system_user_no_tools",
+    "input_messages": [
+      {
+        "role": "system",
+        "content": "You are a terse assistant."
+      },
+      {
+        "role": "user",
+        "content": "What is the capital of France?"
+      }
+    ],
+    "input_tools": null,
+    "add_generation_prompt": true,
+    "enable_thinking": null,
+    "rendered": "<|im_start|>system\nYou are a terse assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "case_name": "user_only_default_system",
+    "input_messages": [
+      {
+        "role": "user",
+        "content": "Hello there."
+      }
+    ],
+    "input_tools": null,
+    "add_generation_prompt": true,
+    "enable_thinking": null,
+    "rendered": "<|im_start|>user\nHello there.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "case_name": "three_turn_conversation",
+    "input_messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant."
+      },
+      {
+        "role": "user",
+        "content": "Hi, who are you?"
+      },
+      {
+        "role": "assistant",
+        "content": "I'm Ornith, an assistant."
+      },
+      {
+        "role": "user",
+        "content": "Great, what's 2+2?"
+      }
+    ],
+    "input_tools": null,
+    "add_generation_prompt": true,
+    "enable_thinking": null,
+    "rendered": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nHi, who are you?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nI'm Ornith, an assistant.<|im_end|>\n<|im_start|>user\nGreat, what's 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "case_name": "tools_declared_gen_prompt",
+    "input_messages": [
+      {
+        "role": "user",
+        "content": "What's the weather in Prague?"
+      }
+    ],
+    "input_tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather for a location.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "location": {
+                "type": "string",
+                "description": "City name"
+              },
+              "unit": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ]
+              }
+            },
+            "required": [
+              "location"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "run_command",
+          "description": "Run a shell command.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "cmd": {
+                "type": "string",
+                "description": "Command to run"
+              }
+            },
+            "required": [
+              "cmd"
+            ]
+          }
+        }
+      }
+    ],
+    "add_generation_prompt": true,
+    "enable_thinking": null,
+    "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a location.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"run_command\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\", \"description\": \"Command to run\"}}, \"required\": [\"cmd\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat's the weather in Prague?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "case_name": "tool_call_then_response",
+    "input_messages": [
+      {
+        "role": "user",
+        "content": "What's the weather in Prague, and list files in /tmp?"
+      },
+      {
+        "role": "assistant",
+        "content": "<think>\nI should call get_weather then run_command.\n</think>\n\nOn it.",
+        "tool_calls": [
+          {
+            "function": {
+              "name": "get_weather",
+              "arguments": {
+                "location": "Prague",
+                "unit": "celsius"
+              }
+            }
+          },
+          {
+            "function": {
+              "name": "run_command",
+              "arguments": {
+                "cmd": "ls /tmp"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "{\"temperature_c\": 18, \"conditions\": \"cloudy\"}"
+      },
+      {
+        "role": "tool",
+        "content": "{\"entries\": [\"a.txt\", \"b.txt\"]}"
+      }
+    ],
+    "input_tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather for a location.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "location": {
+                "type": "string",
+                "description": "City name"
+              },
+              "unit": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ]
+              }
+            },
+            "required": [
+              "location"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "run_command",
+          "description": "Run a shell command.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "cmd": {
+                "type": "string",
+                "description": "Command to run"
+              }
+            },
+            "required": [
+              "cmd"
+            ]
+          }
+        }
+      }
+    ],
+    "add_generation_prompt": true,
+    "enable_thinking": null,
+    "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a location.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"run_command\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\", \"description\": \"Command to run\"}}, \"required\": [\"cmd\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat's the weather in Prague, and list files in /tmp?<|im_end|>\n<|im_start|>assistant\n<think>\nI should call get_weather then run_command.\n</think>\n\nOn it.\n\n<tool_call>\n<function=get_weather>\n<parameter=location>\nPrague\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=run_command>\n<parameter=cmd>\nls /tmp\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temperature_c\": 18, \"conditions\": \"cloudy\"}\n</tool_response>\n<tool_response>\n{\"entries\": [\"a.txt\", \"b.txt\"]}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "case_name": "tools_declared_thinking_enabled",
+    "input_messages": [
+      {
+        "role": "user",
+        "content": "What's the weather in Prague?"
+      }
+    ],
+    "input_tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather for a location.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "location": {
+                "type": "string",
+                "description": "City name"
+              },
+              "unit": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ]
+              }
+            },
+            "required": [
+              "location"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "run_command",
+          "description": "Run a shell command.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "cmd": {
+                "type": "string",
+                "description": "Command to run"
+              }
+            },
+            "required": [
+              "cmd"
+            ]
+          }
+        }
+      }
+    ],
+    "add_generation_prompt": true,
+    "enable_thinking": true,
+    "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a location.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"run_command\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\", \"description\": \"Command to run\"}}, \"required\": [\"cmd\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat's the weather in Prague?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "case_name": "tools_declared_thinking_disabled",
+    "input_messages": [
+      {
+        "role": "user",
+        "content": "What's the weather in Prague?"
+      }
+    ],
+    "input_tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather for a location.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "location": {
+                "type": "string",
+                "description": "City name"
+              },
+              "unit": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ]
+              }
+            },
+            "required": [
+              "location"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "run_command",
+          "description": "Run a shell command.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "cmd": {
+                "type": "string",
+                "description": "Command to run"
+              }
+            },
+            "required": [
+              "cmd"
+            ]
+          }
+        }
+      }
+    ],
+    "add_generation_prompt": true,
+    "enable_thinking": false,
+    "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a location.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"run_command\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\", \"description\": \"Command to run\"}}, \"required\": [\"cmd\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat's the weather in Prague?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "case_name": "unicode_content",
+    "input_messages": [
+      {
+        "role": "system",
+        "content": "Jsi užitečný asistent. 🤖"
+      },
+      {
+        "role": "user",
+        "content": "Řekni mi vtip o počasí ☀️🌧️ a použij háčky/čárky: žluťoučký kůň."
+      }
+    ],
+    "input_tools": null,
+    "add_generation_prompt": true,
+    "enable_thinking": null,
+    "rendered": "<|im_start|>system\nJsi užitečný asistent. 🤖<|im_end|>\n<|im_start|>user\nŘekni mi vtip o počasí ☀️🌧️ a použij háčky/čárky: žluťoučký kůň.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+]

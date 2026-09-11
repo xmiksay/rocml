@@ -5,6 +5,7 @@
 //! prompt processing) text generation.
 
 pub mod cache;
+pub mod chat;
 pub mod config;
 pub mod error;
 pub mod forward;
