@@ -8,12 +8,12 @@ use rocml::generate::generate_sampled;
 use rocml::{RocmlError, SamplingParams};
 use serde_json::json;
 
-use crate::common;
+use crate::common::{self, ModelArgs};
 
 #[derive(Args, Debug)]
 pub struct BenchArgs {
-    #[arg(long)]
-    model: String,
+    #[command(flatten)]
+    model_args: ModelArgs,
     #[arg(long = "prompt-tokens", default_value_t = 64)]
     prompt_tokens: usize,
     #[arg(long = "decode-tokens", default_value_t = 128)]
@@ -28,8 +28,9 @@ pub fn run(args: &BenchArgs) -> Result<(), RocmlError> {
     if args.runs == 0 {
         return Err(RocmlError::Config("--runs must be at least 1".to_string()));
     }
-    eprintln!("loading {}...", args.model);
-    let mut loaded = common::load(&args.model)?;
+    let resolved = args.model_args.resolve()?;
+    eprintln!("loading {}...", args.model_args.model);
+    let mut loaded = common::load(&resolved.path)?;
     let prompt_ids = synthetic_prompt(&loaded, args.prompt_tokens);
     eprintln!(
         "loaded: {} layers; benchmarking {} prompt tokens / {} decode tokens x {} run(s)",
@@ -75,7 +76,7 @@ pub fn run(args: &BenchArgs) -> Result<(), RocmlError> {
         println!(
             "{}",
             json!({
-                "model": common::model_id(&args.model),
+                "model": common::model_id(&resolved),
                 "prompt_tokens": prompt_ids.len(),
                 "decode_tokens": args.decode_tokens,
                 "runs": args.runs,

@@ -12,6 +12,7 @@ pub mod worker;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rocml::SamplingParams;
 use rocml_core::gguf::GgufFile;
 use rocml_core::tokenizer::BpeTokenizer;
 
@@ -20,6 +21,13 @@ pub struct ServerConfig {
     pub ctx: usize,
     pub max_tokens_default: usize,
     pub no_think: bool,
+    /// Sampling defaults for requests that omit a field — from the resolved
+    /// model's registry preset, or `SamplingParams::default()` (greedy) for
+    /// a path-based `--model`. See `rocml::registry`.
+    pub default_sampling: SamplingParams,
+    /// Overrides the served model id (normally the GGUF file's stem) with
+    /// the registry name, when `--model` resolved through the registry.
+    pub model_id_override: Option<String>,
 }
 
 /// Loads the tokenizer, spawns the model-owning worker thread (see
@@ -37,17 +45,20 @@ pub fn build(config: ServerConfig) -> Result<(axum::Router, std::thread::JoinHan
     let tokenizer = Arc::new(BpeTokenizer::from_gguf(&gguf).map_err(|e| e.to_string())?);
     drop(gguf);
 
-    let model_id = config
-        .model_path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "model".to_string());
+    let model_id = config.model_id_override.unwrap_or_else(|| {
+        config
+            .model_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "model".to_string())
+    });
     let (job_tx, worker_handle) = worker::spawn(config.model_path.clone(), tokenizer.clone())?;
 
     let state = Arc::new(state::AppState {
         job_tx,
         tokenizer,
         model_id,
+        default_sampling: config.default_sampling,
         ctx: config.ctx,
         max_tokens_default: config.max_tokens_default,
         no_think: config.no_think,

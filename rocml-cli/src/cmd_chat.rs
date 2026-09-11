@@ -15,14 +15,20 @@ use rocml::chat::{Message, RenderOpts, ScanEvent, StreamScanner, ToolCall};
 use rocml::generate::generate_sampled;
 use rocml::RocmlError;
 
-use crate::common::{self, SamplingArgs};
+use crate::common::{self, ModelArgs, SamplingArgs};
+
+/// Fallback soft context budget when neither `--ctx` nor a resolved
+/// registry preset supplies one (i.e. a path-based `--model` with no
+/// preset) — this command's pre-registry default.
+const DEFAULT_CTX: usize = 4096;
 
 #[derive(Args, Debug)]
 pub struct ChatArgs {
-    #[arg(long)]
-    model: String,
-    /// Close the `<think>` block immediately (reasoning off) instead of
-    /// leaving it open for the model to fill in.
+    #[command(flatten)]
+    model_args: ModelArgs,
+    /// Close the `<think>` block immediately (reasoning off) instead of the
+    /// resolved model's registry preset (or leaving it open for a
+    /// path-based `--model` with no preset).
     #[arg(long)]
     no_think: bool,
     #[arg(long = "max-tokens", default_value_t = 512)]
@@ -30,16 +36,21 @@ pub struct ChatArgs {
     /// Soft context budget: a turn whose prompt plus `max-tokens` would
     /// exceed this is rejected up front with a friendly error instead of
     /// running into the model's own (harder to interpret) cache-capacity
-    /// error partway through decoding.
-    #[arg(long, default_value_t = 4096)]
-    ctx: usize,
+    /// error partway through decoding. Unset falls back to the resolved
+    /// model's registry preset, then [`DEFAULT_CTX`]; either way it's
+    /// clamped to the engine's current cache cap
+    /// (`rocml::registry::clamp_ctx`).
+    #[arg(long)]
+    ctx: Option<usize>,
     #[command(flatten)]
     sampling: SamplingArgs,
 }
 
 pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
-    eprintln!("loading {}...", args.model);
-    let mut loaded = common::load(&args.model)?;
+    let resolved = args.model_args.resolve()?;
+    let spec = resolved.spec;
+    eprintln!("loading {}...", args.model_args.model);
+    let mut loaded = common::load(&resolved.path)?;
     eprintln!(
         "ready: {} layers, hidden={}, vocab={}. Type a message and press enter \
          (Ctrl+D or /exit to quit).",
@@ -50,9 +61,17 @@ pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
 
     let render_opts = RenderOpts {
         add_generation_prompt: true,
-        enable_thinking: args.no_think.then_some(false),
+        enable_thinking: if args.no_think {
+            Some(false)
+        } else {
+            spec.map(|s| s.thinking_default)
+        },
     };
-    let sampling = args.sampling.to_sampling_params();
+    let sampling = args.sampling.to_sampling_params(spec.map(|s| &s.sampling));
+    let ctx = rocml::registry::clamp_ctx(
+        args.ctx
+            .unwrap_or_else(|| spec.map_or(DEFAULT_CTX, |s| s.default_ctx)),
+    );
     let mut messages: Vec<Message> = Vec::new();
     let stdin = io::stdin();
     let mut line = String::new();
@@ -82,11 +101,11 @@ pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
             }
         };
         let prompt_ids = loaded.tokenizer.encode(&prompt);
-        if prompt_ids.len() + args.max_tokens > args.ctx {
+        if prompt_ids.len() + args.max_tokens > ctx {
             eprintln!(
                 "error: this turn needs ~{} tokens of context, over the --ctx budget of {}",
                 prompt_ids.len() + args.max_tokens,
-                args.ctx
+                ctx
             );
             messages.pop();
             continue;

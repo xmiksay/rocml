@@ -1,37 +1,70 @@
-//! Shared plumbing: GGUF/tokenizer/model loading and the sampling-flag set
-//! every subcommand that generates text takes identically.
+//! Shared plumbing: model-registry resolution, GGUF/tokenizer/model
+//! loading, and the sampling-flag set every subcommand that generates text
+//! takes identically.
 
 use std::path::Path;
 
 use clap::Args;
-use rocml::{Model, RocmlError, SamplingParams};
+use rocml::{Model, ResolvedModel, RocmlError, SamplingParams};
 use rocml_core::gguf::GgufFile;
 use rocml_core::tokenizer::BpeTokenizer;
+
+/// `--model`/`--no-download` flags shared by every subcommand that loads a
+/// model.
+#[derive(Args, Debug, Clone)]
+pub struct ModelArgs {
+    /// Registry name (e.g. `qwen3.5-2b`) or a path to a `.gguf` file.
+    #[arg(long)]
+    pub model: String,
+    /// A registry hit whose file is missing errors out instead of
+    /// downloading it via `hf` (the default).
+    #[arg(long)]
+    pub no_download: bool,
+}
+
+impl ModelArgs {
+    pub fn resolve(&self) -> Result<ResolvedModel, RocmlError> {
+        rocml::resolve(&self.model, !self.no_download)
+    }
+}
 
 /// Sampling flags shared by `chat` and `generate`. `bench` doesn't take
 /// these — it always runs greedy, since it measures throughput, not output
 /// quality, and greedy keeps every run's token count reproducible.
+///
+/// Every field is `Option` (no `default_value_t`) so an unset flag is
+/// distinguishable from an explicit one: [`SamplingArgs::to_sampling_params`]
+/// needs that distinction to let a resolved model's registry preset supply
+/// defaults without an unset flag clobbering them.
 #[derive(Args, Debug, Clone)]
 pub struct SamplingArgs {
-    /// Sampling temperature; `0` (the default) is greedy decoding.
-    #[arg(long, short = 't', default_value_t = 0.0)]
-    pub temperature: f32,
+    /// Sampling temperature; unset falls back to the resolved model's
+    /// registry preset, then greedy decoding (`0.0`).
+    #[arg(long, short = 't')]
+    pub temperature: Option<f32>,
     #[arg(long)]
     pub top_p: Option<f32>,
     #[arg(long)]
     pub top_k: Option<usize>,
-    #[arg(long, default_value_t = 0)]
-    pub seed: u64,
+    #[arg(long)]
+    pub seed: Option<u64>,
 }
 
 impl SamplingArgs {
-    pub fn to_sampling_params(&self) -> SamplingParams {
+    /// Merges these explicit CLI overrides onto `preset` (a resolved
+    /// model's registry sampling defaults) — an unset flag falls through to
+    /// `preset`, an explicit flag always wins. `preset: None` (a path-based
+    /// `--model` with no registry entry) falls through to
+    /// `SamplingParams::default()` (greedy), matching this CLI's
+    /// pre-registry behavior exactly.
+    pub fn to_sampling_params(&self, preset: Option<&SamplingParams>) -> SamplingParams {
+        let base = preset.copied().unwrap_or_default();
         SamplingParams {
-            temperature: self.temperature,
-            top_k: self.top_k,
-            top_p: self.top_p,
-            seed: self.seed,
-            ..SamplingParams::default()
+            temperature: self.temperature.unwrap_or(base.temperature),
+            top_k: self.top_k.or(base.top_k),
+            top_p: self.top_p.or(base.top_p),
+            seed: self.seed.unwrap_or(base.seed),
+            ..base
         }
     }
 }
@@ -54,12 +87,18 @@ pub fn load(model_path: impl AsRef<Path>) -> Result<Loaded, RocmlError> {
     Ok(Loaded { tokenizer, model })
 }
 
-/// The model file's stem, used as the served/reported model id (e.g.
-/// `Qwen3.5-2B-Q8_0` from `.../Qwen3.5-2B-Q8_0.gguf`).
-pub fn model_id(model_path: impl AsRef<Path>) -> String {
-    model_path
-        .as_ref()
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "model".to_string())
+/// The reported model id: the registry name for a resolved registry hit
+/// (e.g. `qwen3.5-2b`), else the model file's stem (e.g. `Qwen3.5-2B-Q8_0`
+/// from `.../Qwen3.5-2B-Q8_0.gguf`) for a path-based `--model`.
+pub fn model_id(resolved: &ResolvedModel) -> String {
+    resolved
+        .spec
+        .map(|s| s.name.to_string())
+        .unwrap_or_else(|| {
+            resolved
+                .path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "model".to_string())
+        })
 }

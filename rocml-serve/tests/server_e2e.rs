@@ -52,6 +52,8 @@ async fn spawn_test_server(model_path: PathBuf) -> TestServer {
         ctx: 4096,
         max_tokens_default: 128,
         no_think: true,
+        default_sampling: rocml::SamplingParams::default(),
+        model_id_override: None,
     })
     .expect("server failed to build (model load / tokenizer)");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

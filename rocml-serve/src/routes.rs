@@ -93,7 +93,7 @@ async fn handle_request(
     // Clamp rather than reject when only the *combination* overflows —
     // an over-budget prompt alone is the hard error above.
     let max_new_tokens = requested_max.min(state.ctx - prompt_ids.len()).max(1);
-    let sampling = mapping::map_sampling(&request);
+    let sampling = mapping::map_sampling(&request, &state.default_sampling);
     let stop_strings = mapping::stop_strings(&request);
     let prompt_tokens = prompt_ids.len();
 

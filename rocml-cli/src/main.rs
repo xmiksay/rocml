@@ -4,6 +4,7 @@
 mod cmd_bench;
 mod cmd_chat;
 mod cmd_generate;
+mod cmd_models;
 mod common;
 
 use std::process::ExitCode;
@@ -25,6 +26,8 @@ enum Command {
     Bench(cmd_bench::BenchArgs),
     /// One-shot prompt completion.
     Generate(cmd_generate::GenerateArgs),
+    /// List the compiled-in model registry and each entry's on-disk status.
+    Models(cmd_models::ModelsArgs),
 }
 
 fn main() -> ExitCode {
@@ -33,6 +36,7 @@ fn main() -> ExitCode {
         Command::Chat(args) => cmd_chat::run(args),
         Command::Bench(args) => cmd_bench::run(args),
         Command::Generate(args) => cmd_generate::run(args),
+        Command::Models(args) => cmd_models::run(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

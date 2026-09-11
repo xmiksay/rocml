@@ -5,6 +5,7 @@
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
+use rocml::SamplingParams;
 use rocml_core::tokenizer::BpeTokenizer;
 
 use crate::worker::Job;
@@ -14,8 +15,13 @@ pub struct AppState {
     pub tokenizer: Arc<BpeTokenizer>,
     /// Served as both `GET /v1/models`' single entry and the value
     /// `POST /v1/chat/completions` compares an incoming `model` field
-    /// against.
+    /// against. The resolved registry name when `--model` was a registry
+    /// hit, else the GGUF file's stem.
     pub model_id: String,
+    /// Sampling defaults applied to any request field the client leaves
+    /// unset — the resolved model's registry preset, or the engine's own
+    /// greedy default for a path-based `--model`.
+    pub default_sampling: SamplingParams,
     /// Soft context budget: requests whose prompt alone exceeds this are
     /// rejected; requests that would exceed it once `max_tokens` is added
     /// have `max_tokens` clamped down instead. The model's own KV cache

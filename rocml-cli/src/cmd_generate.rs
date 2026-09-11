@@ -10,19 +10,25 @@ use rocml::chat::{Message, RenderOpts};
 use rocml::generate::generate_sampled;
 use rocml::RocmlError;
 
-use crate::common::{self, SamplingArgs};
+use crate::common::{self, ModelArgs, SamplingArgs};
 
 #[derive(Args, Debug)]
 pub struct GenerateArgs {
-    #[arg(long)]
-    model: String,
+    #[command(flatten)]
+    model_args: ModelArgs,
     #[arg(long)]
     prompt: String,
     /// Skip the chat template and feed `prompt` as a raw continuation —
     /// matches how the qwen3.5 parity fixtures were captured, and useful
-    /// for probing raw completion behavior on any model.
+    /// for probing raw completion behavior on any model. Ignores
+    /// `--no-think` (there's no template to prime a `<think>` block in).
     #[arg(long)]
     raw: bool,
+    /// Close the `<think>` block immediately (reasoning off) instead of the
+    /// resolved model's registry preset (or the template's own default for
+    /// a path-based `--model`).
+    #[arg(long)]
+    no_think: bool,
     #[arg(short = 'n', long = "max-tokens", default_value_t = 64)]
     n: usize,
     #[command(flatten)]
@@ -30,8 +36,10 @@ pub struct GenerateArgs {
 }
 
 pub fn run(args: &GenerateArgs) -> Result<(), RocmlError> {
-    eprintln!("loading {}...", args.model);
-    let mut loaded = common::load(&args.model)?;
+    let resolved = args.model_args.resolve()?;
+    let spec = resolved.spec;
+    eprintln!("loading {}...", args.model_args.model);
+    let mut loaded = common::load(&resolved.path)?;
     let mem = loaded.model.memory_info()?;
     eprintln!(
         "loaded: {} layers, hidden={}, vocab={}; VRAM free {:.0} MiB / total {:.0} MiB",
@@ -46,12 +54,17 @@ pub fn run(args: &GenerateArgs) -> Result<(), RocmlError> {
         args.prompt.clone()
     } else {
         let messages = [Message::user(&args.prompt)];
+        let enable_thinking = if args.no_think {
+            Some(false)
+        } else {
+            spec.map(|s| s.thinking_default)
+        };
         rocml::chat::render(
             &messages,
             &[],
             RenderOpts {
                 add_generation_prompt: true,
-                enable_thinking: None,
+                enable_thinking,
             },
         )
         .map_err(|e| RocmlError::Config(e.to_string()))?
@@ -60,7 +73,7 @@ pub fn run(args: &GenerateArgs) -> Result<(), RocmlError> {
 
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let sampling = args.sampling.to_sampling_params();
+    let sampling = args.sampling.to_sampling_params(spec.map(|s| &s.sampling));
     let stats = generate_sampled(
         &mut loaded.model,
         &loaded.tokenizer,

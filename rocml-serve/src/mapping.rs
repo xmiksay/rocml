@@ -55,16 +55,19 @@ pub fn map_tools(input: &[ToolIn]) -> Vec<Tool> {
         .collect()
 }
 
-pub fn map_sampling(req: &ChatCompletionRequest) -> SamplingParams {
+/// Merges the request's explicit sampling fields onto `defaults` — the
+/// resolved model's registry preset, or the engine's own greedy default for
+/// a path-based `--model` with no preset. An absent request field falls
+/// through to `defaults` rather than an OpenAI-style hardcoded default (e.g.
+/// `temperature: 1.0`), since greedy is also the safer choice for
+/// tool-calling reliability when there's no preset to fall back on.
+pub fn map_sampling(req: &ChatCompletionRequest, defaults: &SamplingParams) -> SamplingParams {
     SamplingParams {
-        // The engine's own default is greedy; that's also the safer choice
-        // for tool-calling reliability, so an absent `temperature` stays
-        // greedy rather than adopting OpenAI's own default of 1.0.
-        temperature: req.temperature.unwrap_or(0.0),
-        top_k: req.top_k,
-        top_p: req.top_p,
-        seed: req.seed.unwrap_or(0),
-        ..SamplingParams::default()
+        temperature: req.temperature.unwrap_or(defaults.temperature),
+        top_k: req.top_k.or(defaults.top_k),
+        top_p: req.top_p.or(defaults.top_p),
+        seed: req.seed.unwrap_or(defaults.seed),
+        ..*defaults
     }
 }
 
