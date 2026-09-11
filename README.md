@@ -5,7 +5,7 @@ rocml is a standalone Rust inference engine for Qwen3.5-hybrid/Ornith and dense 
 ## Crates
 
 - `rocml` — the engine (GGUF loading, GPU forward passes, sampling, chat templating).
-- `rocml-cli` — `chat` (interactive REPL), `bench` (throughput harness), `generate` (one-shot completion).
+- `rocml-cli` — `chat` (interactive REPL), `bench` (throughput harness), `generate` (one-shot completion), `models` (list the model registry).
 - `rocml-serve` — `POST /v1/chat/completions` (streaming and non-streaming, tool calls) and `GET /v1/models`.
 
 ## Build requirements
@@ -29,12 +29,35 @@ rocml is a standalone Rust inference engine for Qwen3.5-hybrid/Ornith and dense 
 
 All cargo invocations are run with `CARGO_BUILD_JOBS=4` to avoid overloading the build machine.
 
+## Model registry
+
+`--model` on every binary below accepts either a path to a `.gguf` file (unchanged, no defaults applied) or one of these compiled-in names (`rocml/src/registry.rs`), which additionally supply a default context budget, sampling params, and thinking-mode default:
+
+| Name | Family | File | Default sampling | Thinking |
+|---|---|---|---|---|
+| `ornith-9b` | qwen3.5-hybrid | `Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
+| `qwen3.5-2b` | qwen3.5-hybrid | `Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf` | temp 1.0, top_p 1.0, top_k 20 | off |
+| `qwen3.5-0.8b` | qwen3.5-hybrid | `Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf` | temp 1.0, top_p 1.0, top_k 20 | off |
+| `qwen3-0.6b` | qwen3-dense | `Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
+| `qwen3-1.7b` | qwen3-dense | `Qwen3-1.7B-GGUF/Qwen3-1.7B-Q8_0.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
+| `qwen3-4b` | qwen3-dense | `Qwen3-4B-GGUF/Qwen3-4B-Q4_K_M.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
+| `qwen3-8b` | qwen3-dense | `Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
+
+Sampling and thinking defaults are each model family's own documented recommendation, verified against its Hugging Face model card (see `rocml/src/registry.rs`'s doc comments for the source of each). `qwen3.5-2b`/`qwen3.5-0.8b` default to reasoning **off** — their own model cards state that's their default — unlike `ornith-9b`/dense Qwen3, which default it on.
+
+`rocml::registry::resolve(name_or_path, download)` turns a `--model` argument into a path: anything containing `/`, ending in `.gguf`, or that already exists as a file is treated as a path outright (no preset applied); anything else is looked up by name. A registry hit whose file is missing under the checkpoint dir (`$ROCML_CHECKPOINT_DIR`, else `$HOME/checkpoints` — see `rocml_core::testpaths`) is downloaded via the `hf` CLI unless `--no-download` is passed, in which case the error names the exact missing path, the source repo, and both remedies.
+
+**Override precedence**: every flag a preset can supply (`--ctx`, `-t/--temperature`, `--top-p`, `--top-k`, `--seed`, `--no-think`) is optional — an unset flag falls through to the resolved model's preset, then (for a path with no preset) the engine's pre-registry default; an explicit flag always wins. A preset's `default_ctx` above the engine's current KV-cache cap (4096 tokens today, see `rocml::cache::MAX_SEQ_CAP`) is clamped down with a warning rather than erroring (`ornith-9b`'s 8192 is expected to hit this until a larger cache lands).
+
+`rocml-cli models` lists the registry with each entry's on-disk presence under the resolved checkpoint dir.
+
 ## rocml-cli
 
 ```
-rocml-cli chat --model <gguf> [--no-think] [-t/--temperature] [--top-p] [--top-k] [--seed] [--max-tokens] [--ctx]
-rocml-cli bench --model <gguf> [--prompt-tokens N] [--decode-tokens N] [--runs N] [--json]
-rocml-cli generate --model <gguf> --prompt <text> [--raw] [-n N]
+rocml-cli chat --model <name-or-gguf> [--no-download] [--no-think] [-t/--temperature] [--top-p] [--top-k] [--seed] [--max-tokens] [--ctx]
+rocml-cli bench --model <name-or-gguf> [--no-download] [--prompt-tokens N] [--decode-tokens N] [--runs N] [--json]
+rocml-cli generate --model <name-or-gguf> --prompt <text> [--no-download] [--raw] [--no-think] [-n N]
+rocml-cli models
 ```
 
 `chat` re-renders and reprocesses the whole conversation from `Model::reset()` each turn (see `rocml-cli/src/cmd_chat.rs`'s doc comment for why) — fine for an interactive REPL, not meant as a throughput benchmark (use `bench` for that).
@@ -42,9 +65,9 @@ rocml-cli generate --model <gguf> --prompt <text> [--raw] [-n N]
 ## rocml-serve
 
 ```
-rocml-serve --model <gguf> [--host 127.0.0.1] [--port 8080] [--ctx N] [--max-tokens-default N] [--no-think]
+rocml-serve --model <name-or-gguf> [--no-download] [--host 127.0.0.1] [--port 8080] [--ctx N] [--max-tokens-default N] [--no-think]
 ```
 
-OpenAI-compatible `POST /v1/chat/completions` (streaming via SSE, tool calls via the `tools`/`tool_calls` fields, `reasoning_content` as the de-facto extension carrying stripped `<think>` content) and `GET /v1/models`. Requests are served by a single dedicated worker thread that owns the model's GPU state and processes one request at a time — no batching or concurrent decode in this version. See `rocml-serve/src/worker.rs` for why the model can't just live behind a `Mutex` on a thread pool instead (HIP state isn't treated as `Send` in this codebase).
+OpenAI-compatible `POST /v1/chat/completions` (streaming via SSE, tool calls via the `tools`/`tool_calls` fields, `reasoning_content` as the de-facto extension carrying stripped `<think>` content) and `GET /v1/models` (reports the resolved registry name, e.g. `qwen3.5-2b`, when `--model` was a registry hit; otherwise the GGUF file's stem). Requests are served by a single dedicated worker thread that owns the model's GPU state and processes one request at a time — no batching or concurrent decode in this version. See `rocml-serve/src/worker.rs` for why the model can't just live behind a `Mutex` on a thread pool instead (HIP state isn't treated as `Send` in this codebase).
 
-The chat renderer is hardcoded to Ornith-1.0-9B's `chat_template.jinja` and used for every model served, including Qwen3.5-2B — their templates differ in a few places (assistant-turn reasoning wrapping in multi-turn history, and critically, the *default* `enable_thinking` value: Ornith defaults reasoning on, Qwen3.5-2B's own template defaults it off). This only matters for the reasoning-default difference in practice; pass `--no-think` if you want Qwen3.5-2B's own default behavior.
+The chat renderer is hardcoded to Ornith-1.0-9B's `chat_template.jinja` and used for every model served — their templates differ in a few places (assistant-turn reasoning wrapping in multi-turn history, and critically, the *default* `enable_thinking` value: Ornith defaults reasoning on, Qwen3.5's own templates default it off). A registry name (e.g. `--model qwen3.5-2b`) now applies that model's own thinking default automatically; `--no-think` remains available (and always wins) for a path-based `--model` or to force it off regardless of the preset. Server-side sampling defaults similarly come from the resolved model's preset — a request field the client omits falls back to it rather than a hardcoded value.
