@@ -19,7 +19,7 @@ pub fn run(_args: &ModelsArgs) -> Result<(), RocmlError> {
             "missing"
         };
         println!(
-            "{:name_width$}  {:<12}  {:<8}  {}",
+            "{:name_width$}  {:<14}  {:<8}  {}",
             spec.name,
             family_label(spec.family),
             present,
