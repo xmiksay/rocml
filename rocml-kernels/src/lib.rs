@@ -80,7 +80,8 @@ pub const GDN_GATE_F32_KERNEL: &str = "gdn_gate_f32";
 
 /// `kernels/gdn_recurrence.hip`: Gated Delta Net fused state update +
 /// readout, one decode step. Launch block size must be
-/// `max(head_k_dim, head_v_dim)`.
+/// `max(head_k_dim, head_v_dim)`. Supports grouped query/key heads
+/// (`num_k_heads` a divisor of `num_heads`, contiguous broadcast).
 pub const GDN_RECURRENCE_DECODE_F32_HSACO: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gdn_recurrence.hsaco"));
 pub const GDN_RECURRENCE_DECODE_F32_KERNEL: &str = "gdn_recurrence_decode_f32";

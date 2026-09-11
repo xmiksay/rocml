@@ -195,36 +195,49 @@ fn gate_degenerate_single_head() {
 
 // ── gdn_recurrence_decode_f32 ────────────────────────────────────────────
 
-fn run_recurrence(num_heads: u32, head_k_dim: u32, head_v_dim: u32) {
+fn run_recurrence(num_heads: u32, num_k_heads: u32, head_k_dim: u32, head_v_dim: u32) {
     let _device = Device::new(0).expect("failed to select device 0");
     let (_m, function) = load(
         rocml_kernels::GDN_RECURRENCE_DECODE_F32_HSACO,
         rocml_kernels::GDN_RECURRENCE_DECODE_F32_KERNEL,
     );
 
-    let (h, kd, vd) = (num_heads as usize, head_k_dim as usize, head_v_dim as usize);
+    let (h, hk, kd, vd) = (
+        num_heads as usize,
+        num_k_heads as usize,
+        head_k_dim as usize,
+        head_v_dim as usize,
+    );
     let state: Vec<f32> = (0..h * kd * vd)
         .map(|i| ((i % 17) as f32) * 0.05 - 0.4)
         .collect();
-    let q: Vec<f32> = (0..h * kd).map(|i| ((i % 13) as f32) * 0.1 - 0.6).collect();
-    let k: Vec<f32> = (0..h * kd).map(|i| ((i % 11) as f32) * 0.1 - 0.5).collect();
+    let q: Vec<f32> = (0..hk * kd)
+        .map(|i| ((i % 13) as f32) * 0.1 - 0.6)
+        .collect();
+    let k: Vec<f32> = (0..hk * kd)
+        .map(|i| ((i % 11) as f32) * 0.1 - 0.5)
+        .collect();
     let v: Vec<f32> = (0..h * vd).map(|i| ((i % 9) as f32) * 0.1 - 0.4).collect();
     let beta: Vec<f32> = (0..h).map(|i| 0.2 + (i as f32) * 0.1).collect();
     let g: Vec<f32> = (0..h).map(|i| -0.1 - (i as f32) * 0.05).collect();
 
-    // CPU reference: per head, decay -> kv_mem (from decayed state) -> delta
-    // -> write S += outer(k, delta) -> y = S^T . q (from updated state).
-    // Mirrors Crane's portable `gated_delta_rule_recurrence` for one step.
+    // CPU reference: per value head, decay -> kv_mem (from decayed state) ->
+    // delta -> write S += outer(k, delta) -> y = S^T . q (from updated
+    // state), with q/k taken from key head `head % num_k_heads` — a tiled
+    // broadcast matching llama.cpp's GGUF V-head reorder (see the kernel's
+    // doc comment). Mirrors Crane's portable `gated_delta_rule_recurrence`
+    // for one step in the `num_k_heads == num_heads` case.
     let mut expected_state = state.clone();
     let mut expected_y = vec![0.0f32; h * vd];
     for head in 0..h {
+        let key_head = head % hk;
         let decay = g[head].exp();
         let s = &mut expected_state[head * kd * vd..(head + 1) * kd * vd];
         for e in s.iter_mut() {
             *e *= decay;
         }
-        let q_h = &q[head * kd..(head + 1) * kd];
-        let k_h = &k[head * kd..(head + 1) * kd];
+        let q_h = &q[key_head * kd..(key_head + 1) * kd];
+        let k_h = &k[key_head * kd..(key_head + 1) * kd];
         let v_h = &v[head * vd..(head + 1) * vd];
         let mut delta = vec![0.0f32; vd];
         for (vi, delta_v) in delta.iter_mut().enumerate() {
@@ -264,7 +277,17 @@ fn run_recurrence(num_heads: u32, head_k_dim: u32, head_v_dim: u32) {
     let g_ptr: *mut c_void = buf_g.device_ptr();
     let y_ptr: *mut c_void = buf_y.device_ptr();
     let mut params = kernel_params!(
-        state_ptr, q_ptr, k_ptr, v_ptr, beta_ptr, g_ptr, y_ptr, num_heads, head_k_dim, head_v_dim
+        state_ptr,
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        beta_ptr,
+        g_ptr,
+        y_ptr,
+        num_heads,
+        num_k_heads,
+        head_k_dim,
+        head_v_dim
     );
 
     let block = head_k_dim.max(head_v_dim);
@@ -274,7 +297,7 @@ fn run_recurrence(num_heads: u32, head_k_dim: u32, head_v_dim: u32) {
         shared_mem_bytes: 2 * (head_k_dim + head_v_dim) * std::mem::size_of::<f32>() as u32,
     };
     // SAFETY: params matches gdn_recurrence_decode_f32's parameter list
-    // (float*, four const float*, const float*, float*, three unsigned) in
+    // (float*, four const float*, const float*, float*, four unsigned) in
     // order; block size is max(head_k_dim, head_v_dim) as the kernel
     // requires; buffers outlive this launch.
     unsafe { function.launch(&cfg, &mut params, None) }.expect("kernel launch failed");
@@ -292,16 +315,24 @@ fn run_recurrence(num_heads: u32, head_k_dim: u32, head_v_dim: u32) {
 
 #[test]
 fn recurrence_square_heads() {
-    run_recurrence(3, 8, 8);
+    run_recurrence(3, 3, 8, 8);
 }
 
 #[test]
 fn recurrence_asymmetric_key_value_dims() {
     // head_k_dim != head_v_dim, and neither is a power of two.
-    run_recurrence(2, 5, 7);
+    run_recurrence(2, 2, 5, 7);
 }
 
 #[test]
 fn recurrence_degenerate_single_head_single_dim() {
-    run_recurrence(1, 1, 1);
+    run_recurrence(1, 1, 1, 1);
+}
+
+#[test]
+fn recurrence_grouped_key_heads() {
+    // num_k_heads < num_heads: tiled broadcast, so value heads {0,2} share
+    // key head 0 and {1,3} share key head 1 (`head % num_k_heads`) — the
+    // Ornith-1.0-9B-shaped case (16 key / 32 value).
+    run_recurrence(4, 2, 5, 7);
 }

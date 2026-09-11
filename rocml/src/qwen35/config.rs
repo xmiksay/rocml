@@ -99,15 +99,19 @@ impl Qwen35Config {
                 "ssm.inner_size {inner_size} is not a multiple of ssm.time_step_rank {num_v_heads}"
             )));
         }
-        // GDN's GQA-style key/value head grouping (`v_per_group > 1`, used
-        // by the 27B+ Qwen3.5 sizes) is out of scope for this milestone —
-        // only the 2B checkpoint, where key and value head counts match, is
-        // supported. See the milestone report for why.
-        if num_k_heads != num_v_heads {
+        // GDN's GQA-style key/value head grouping (`num_v_heads >
+        // num_k_heads`, used by Qwen3.5/Qwen3-Next sizes above 2B, e.g.
+        // Ornith-1.0-9B's 16 key heads / 32 value heads): `gdn_recurrence_decode_f32`
+        // broadcasts key head `h % num_k_heads` to value head `h` — a
+        // *tiled* pattern, not HF transformers' raw `repeat_interleave`,
+        // because llama.cpp's GGUF converter already permutes every
+        // GDN value-head-indexed tensor (V, Z, beta, alpha, A_log, dt_bias,
+        // conv1d's V channels, out_proj's input columns) into tiled order
+        // at conversion time — see that kernel's own doc comment.
+        if !num_v_heads.is_multiple_of(num_k_heads) {
             return Err(RocmlError::Config(format!(
-                "GDN key/value head counts differ ({num_k_heads} vs {num_v_heads}): grouped \
-                 linear attention is not implemented, only Qwen3.5-2B (group_count == \
-                 time_step_rank) is supported"
+                "ssm.time_step_rank {num_v_heads} is not a multiple of ssm.group_count \
+                 {num_k_heads} (required for GDN's grouped query/key broadcast)"
             )));
         }
         let head_v_dim = inner_size / num_v_heads;
