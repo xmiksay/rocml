@@ -104,6 +104,61 @@ impl<T: Copy> DeviceBuffer<T> {
     pub fn device_ptr(&self) -> *mut c_void {
         self.ptr
     }
+
+    /// Copies `len` elements from `src[src_offset..]` into
+    /// `self[dst_offset..]`, entirely on-device (`hipMemcpy` with
+    /// `hipMemcpyDeviceToDevice`). Used e.g. by a KV cache appending one
+    /// time step's row into the middle of a larger per-layer buffer without
+    /// a host round-trip. Errors (rather than panics) if either range would
+    /// run past its buffer's length.
+    pub fn copy_from_device(
+        &mut self,
+        dst_offset: usize,
+        src: &DeviceBuffer<T>,
+        src_offset: usize,
+        len: usize,
+    ) -> Result<(), HipError> {
+        let dst_end = dst_offset
+            .checked_add(len)
+            .ok_or(HipError::LengthMismatch {
+                expected: self.len,
+                actual: usize::MAX,
+            })?;
+        let src_end = src_offset
+            .checked_add(len)
+            .ok_or(HipError::LengthMismatch {
+                expected: src.len,
+                actual: usize::MAX,
+            })?;
+        if dst_end > self.len {
+            return Err(HipError::LengthMismatch {
+                expected: self.len,
+                actual: dst_end,
+            });
+        }
+        if src_end > src.len {
+            return Err(HipError::LengthMismatch {
+                expected: src.len,
+                actual: src_end,
+            });
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let elem_size = mem::size_of::<T>();
+        let bytes = len * elem_size;
+        // SAFETY: bounds were just checked against each buffer's own live
+        // `hipMalloc` allocation, and the byte offsets stay within those
+        // allocations by construction.
+        check(unsafe {
+            ffi::hipMemcpy(
+                (self.ptr as *mut u8).add(dst_offset * elem_size) as *mut c_void,
+                (src.ptr as *const u8).add(src_offset * elem_size) as *const c_void,
+                bytes,
+                ffi::hip_memcpy_device_to_device,
+            )
+        })
+    }
 }
 
 impl<T: Copy> Drop for DeviceBuffer<T> {
@@ -137,6 +192,36 @@ mod tests {
             .copy_to_host(&mut output)
             .expect("copy_to_host failed");
         assert_eq!(input, output);
+    }
+
+    #[test]
+    fn copy_from_device_writes_offset_slice() {
+        let _device = Device::new(0).expect("failed to select device 0");
+        let src_data: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let mut src = DeviceBuffer::<f32>::new(src_data.len()).expect("hipMalloc src failed");
+        src.copy_from_host(&src_data)
+            .expect("copy_from_host failed");
+
+        let mut dst = DeviceBuffer::<f32>::new(32).expect("hipMalloc dst failed");
+        dst.copy_from_host(&[-1.0f32; 32])
+            .expect("copy_from_host failed");
+        dst.copy_from_device(10, &src, 4, 6)
+            .expect("copy_from_device failed");
+
+        let mut out = vec![0.0f32; 32];
+        dst.copy_to_host(&mut out).expect("copy_to_host failed");
+        assert_eq!(&out[10..16], &src_data[4..10]);
+        assert!(out[..10].iter().all(|&v| v == -1.0));
+        assert!(out[16..].iter().all(|&v| v == -1.0));
+    }
+
+    #[test]
+    fn copy_from_device_rejects_out_of_bounds_range() {
+        let _device = Device::new(0).expect("failed to select device 0");
+        let src = DeviceBuffer::<f32>::new(4).expect("hipMalloc src failed");
+        let mut dst = DeviceBuffer::<f32>::new(4).expect("hipMalloc dst failed");
+        assert!(dst.copy_from_device(2, &src, 0, 4).is_err());
+        assert!(dst.copy_from_device(0, &src, 2, 4).is_err());
     }
 
     #[test]
