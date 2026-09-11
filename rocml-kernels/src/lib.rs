@@ -73,3 +73,24 @@ pub const GEMV_T_F32_KERNEL: &str = "gemv_t_f32";
 /// reduction). `n` must be a multiple of 32.
 pub const GEMV_Q8_0_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_q8_0.hsaco"));
 pub const GEMV_Q8_0_KERNEL: &str = "gemv_q8_0";
+
+/// `kernels/gemv_q4_k.hip`: fused dequant-GEMV `y = W * x` where W's rows are
+/// raw GGUF Q4_K blocks (144 bytes/256-element super-block). One workgroup
+/// per output row; block size must be a power of two. `n` must be a multiple
+/// of 256.
+pub const GEMV_Q4_K_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_q4_k.hsaco"));
+pub const GEMV_Q4_K_KERNEL: &str = "gemv_q4_k";
+
+/// `kernels/gemv_q5_k.hip`: fused dequant-GEMV `y = W * x` where W's rows are
+/// raw GGUF Q5_K blocks (176 bytes/256-element super-block). One workgroup
+/// per output row; block size must be a power of two. `n` must be a multiple
+/// of 256.
+pub const GEMV_Q5_K_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_q5_k.hsaco"));
+pub const GEMV_Q5_K_KERNEL: &str = "gemv_q5_k";
+
+/// `kernels/gemv_q6_k.hip`: fused dequant-GEMV `y = W * x` where W's rows are
+/// raw GGUF Q6_K blocks (210 bytes/256-element super-block). One workgroup
+/// per output row; block size must be a power of two. `n` must be a multiple
+/// of 256.
+pub const GEMV_Q6_K_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_q6_k.hsaco"));
+pub const GEMV_Q6_K_KERNEL: &str = "gemv_q6_k";
