@@ -9,3 +9,4 @@ description = "Hand-written HIP kernels for rocml, compiled to code objects at b
 
 [dev-dependencies]
 rocml-hip = { path = "../rocml-hip" }
+half = "2"
