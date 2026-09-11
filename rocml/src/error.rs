@@ -45,4 +45,30 @@ pub enum RocmlError {
 
     #[error("tokenizer has no eos_token_id (tokenizer.ggml.eos_token_id missing from GGUF)")]
     MissingEosToken,
+
+    #[error("unknown model {name:?}; known registry names: {known_names}")]
+    UnknownModel { name: String, known_names: String },
+
+    #[error(
+        "model {name:?} not found at {path} — download it with `hf download {repo} {file} \
+         --local-dir {local_dir}`, point ROCML_CHECKPOINT_DIR at a directory that already has \
+         it, or re-run with downloading enabled (omit --no-download)"
+    )]
+    ModelFileMissing {
+        name: String,
+        path: String,
+        repo: String,
+        file: String,
+        local_dir: String,
+    },
+
+    #[error("`hf download {repo} {file}` failed (exit: {status})")]
+    HfDownloadFailed {
+        repo: String,
+        file: String,
+        status: String,
+    },
+
+    #[error("failed to launch `hf`: {0} (is the huggingface_hub CLI installed and on PATH?)")]
+    HfLaunchFailed(String),
 }
