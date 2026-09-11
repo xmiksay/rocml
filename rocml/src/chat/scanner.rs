@@ -45,6 +45,24 @@ impl StreamScanner {
         Self::default()
     }
 
+    /// A scanner for output generated after a prompt whose
+    /// `add_generation_prompt` tail already opened `<think>\n` (i.e.
+    /// `RenderOpts.enable_thinking != Some(false)`, the template's default —
+    /// see `render`'s doc comment). The opening tag itself never appears in
+    /// the *generated* text in that case (it was part of the prompt), so a
+    /// scanner starting in the default `Mode::Text` would treat the whole
+    /// reasoning block, and even the literal `</think>` closing tag, as
+    /// plain visible content instead of recognizing it as reasoning —
+    /// `parser::extract_thinking` already handles this same "primed
+    /// prompt" shape for the non-streaming case (see its own doc comment);
+    /// this is the streaming equivalent.
+    pub fn new_primed_for_thinking() -> Self {
+        Self {
+            buffer: String::new(),
+            mode: Mode::Thinking,
+        }
+    }
+
     /// Consume one decoded chunk, returning the events it completed. A tag
     /// split across chunk boundaries is held in the internal buffer until
     /// enough of it has arrived to resolve.
@@ -178,6 +196,20 @@ mod tests {
         assert_eq!(
             events,
             vec![ScanEvent::TextDelta("hello world".to_string())]
+        );
+    }
+
+    #[test]
+    fn primed_scanner_treats_leading_text_as_thinking() {
+        let mut scanner = StreamScanner::new_primed_for_thinking();
+        let mut events = scanner.feed("still reasoning").unwrap();
+        events.extend(scanner.feed("</think>answer").unwrap());
+        assert_eq!(
+            events,
+            vec![
+                ScanEvent::ThinkingDelta("still reasoning".to_string()),
+                ScanEvent::TextDelta("answer".to_string()),
+            ]
         );
     }
 

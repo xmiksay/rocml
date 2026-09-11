@@ -72,6 +72,10 @@ async fn handle_request(
         add_generation_prompt: true,
         enable_thinking: state.no_think.then_some(false),
     };
+    // The generation-prompt tail opens `<think>\n` unless thinking is
+    // explicitly off, so the response-side scanner must start already in
+    // thinking mode to match — see `StreamScanner::new_primed_for_thinking`.
+    let thinking_primed = render_opts.enable_thinking != Some(false);
     let prompt_text = chat::render(&messages, &tools, render_opts)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let prompt_ids = state.tokenizer.encode(&prompt_text);
@@ -122,9 +126,17 @@ async fn handle_request(
             max_new_tokens,
             rx,
             started,
+            thinking_primed,
         ))
     } else {
-        let response = collect_response(&state.model_id, prompt_tokens, max_new_tokens, rx).await?;
+        let response = collect_response(
+            &state.model_id,
+            prompt_tokens,
+            max_new_tokens,
+            rx,
+            thinking_primed,
+        )
+        .await?;
         tracing::info!(
             route = "/v1/chat/completions",
             duration_ms = started.elapsed().as_millis() as u64,
@@ -139,8 +151,9 @@ async fn collect_response(
     prompt_tokens: usize,
     max_new_tokens: usize,
     mut rx: mpsc::UnboundedReceiver<WorkerEvent>,
+    thinking_primed: bool,
 ) -> Result<Response, ApiError> {
-    let mut scanner = StreamScanner::new();
+    let mut scanner = new_scanner(thinking_primed);
     let mut acc = AssistantAccumulator::default();
     loop {
         match rx.recv().await {
@@ -209,12 +222,23 @@ fn message_out(acc: &AssistantAccumulator) -> ChatMessageOut {
     }
 }
 
+/// Picks the scanner mode matching how the prompt's generation-prompt tail
+/// left the `<think>` block — see `StreamScanner::new_primed_for_thinking`.
+fn new_scanner(thinking_primed: bool) -> StreamScanner {
+    if thinking_primed {
+        StreamScanner::new_primed_for_thinking()
+    } else {
+        StreamScanner::new()
+    }
+}
+
 fn stream_response(
     model_id: String,
     prompt_tokens: usize,
     max_new_tokens: usize,
     rx: mpsc::UnboundedReceiver<WorkerEvent>,
     started: Instant,
+    thinking_primed: bool,
 ) -> Response {
     let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
     tokio::spawn(pump_stream(
@@ -224,6 +248,7 @@ fn stream_response(
         rx,
         sse_tx,
         started,
+        thinking_primed,
     ));
     Sse::new(UnboundedReceiverStream::new(sse_rx))
         .keep_alive(KeepAlive::default())
@@ -241,6 +266,7 @@ async fn pump_stream(
     mut rx: mpsc::UnboundedReceiver<WorkerEvent>,
     tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
     started: Instant,
+    thinking_primed: bool,
 ) {
     let id = completion_id();
     let created = now_unix();
@@ -258,7 +284,7 @@ async fn pump_stream(
         ),
     );
 
-    let mut scanner = StreamScanner::new();
+    let mut scanner = new_scanner(thinking_primed);
     let mut acc = AssistantAccumulator::default();
     let outcome = loop {
         match rx.recv().await {

@@ -93,7 +93,15 @@ pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
         }
 
         loaded.model.reset()?;
-        let mut scanner = StreamScanner::new();
+        // The primed generation-prompt tail already opened `<think>\n`
+        // unless `--no-think` closed it, so the scanner must start
+        // already-in-thinking to match (see `StreamScanner::
+        // new_primed_for_thinking`'s doc comment).
+        let mut scanner = if render_opts.enable_thinking == Some(false) {
+            StreamScanner::new()
+        } else {
+            StreamScanner::new_primed_for_thinking()
+        };
         let mut content = String::new();
         let mut thinking = String::new();
         let mut tool_calls = Vec::new();
