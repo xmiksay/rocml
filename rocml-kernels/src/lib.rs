@@ -121,6 +121,23 @@ pub const GEMV_Q5_K_KERNEL: &str = "gemv_q5_k";
 pub const GEMV_Q6_K_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_q6_k.hsaco"));
 pub const GEMV_Q6_K_KERNEL: &str = "gemv_q6_k";
 
+/// `kernels/gemm_xwt_quant.hip`: batched prefill-path linear layer for
+/// GGUF-quantized weights, `out[rows,m] = X[rows,n] * dequant(W)^T` — the
+/// batched sibling of `gemv_q*` (which stays the fast path for rows==1
+/// decode). One weight row shared by 8 output rows per workgroup; launch
+/// with block = (32, 8, 1) and `256 * sizeof(f32)` bytes of dynamic shared
+/// memory (see the kernel source's module doc for the tiling design). All
+/// four dtypes share one code object.
+pub const GEMM_XWT_Q8_0_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_xwt_quant.hsaco"));
+pub const GEMM_XWT_Q8_0_KERNEL: &str = "gemm_xwt_q8_0";
+pub const GEMM_XWT_Q4_K_HSACO: &[u8] = GEMM_XWT_Q8_0_HSACO;
+pub const GEMM_XWT_Q4_K_KERNEL: &str = "gemm_xwt_q4_k";
+pub const GEMM_XWT_Q5_K_HSACO: &[u8] = GEMM_XWT_Q8_0_HSACO;
+pub const GEMM_XWT_Q5_K_KERNEL: &str = "gemm_xwt_q5_k";
+pub const GEMM_XWT_Q6_K_HSACO: &[u8] = GEMM_XWT_Q8_0_HSACO;
+pub const GEMM_XWT_Q6_K_KERNEL: &str = "gemm_xwt_q6_k";
+
 /// `kernels/attn_decode.hip`: fused flash-decoding-style single-token causal
 /// attention, split-K over the sequence axis. `attn_decode_partial_f32`
 /// (grid = `[n_kv_heads, n_splits]`, block = `[32, group]`) produces one

@@ -99,6 +99,8 @@ pub struct Kernels {
     gemv_f32_fn: rocml_hip::Function,
     _mod_gemv_f16: Module,
     gemv_f16_fn: rocml_hip::Function,
+    _mod_gemm_f16: Module,
+    gemm_f16_fn: rocml_hip::Function,
     _mod_gemv_t_f32: Module,
     gemv_t_f32_fn: rocml_hip::Function,
     _mod_rope: Module,
@@ -140,6 +142,10 @@ impl Kernels {
             rocml_kernels::GEMV_F16_HSACO,
             rocml_kernels::GEMV_F16_KERNEL,
         )?;
+        let (_mod_gemm_f16, gemm_f16_fn) = load(
+            rocml_kernels::GEMM_XWT_F16_HSACO,
+            rocml_kernels::GEMM_XWT_F16_KERNEL,
+        )?;
         let (_mod_gemv_t_f32, gemv_t_f32_fn) = load(
             rocml_kernels::GEMV_T_F32_HSACO,
             rocml_kernels::GEMV_T_F32_KERNEL,
@@ -179,6 +185,8 @@ impl Kernels {
             gemv_f32_fn,
             _mod_gemv_f16,
             gemv_f16_fn,
+            _mod_gemm_f16,
+            gemm_f16_fn,
             _mod_gemv_t_f32,
             gemv_t_f32_fn,
             _mod_rope,
@@ -295,6 +303,47 @@ impl Kernels {
         n: u32,
     ) -> Result<(), RocmlError> {
         self.quant.gemv(dtype, w, x, y, m, n)
+    }
+
+    /// `gemm_xwt_f16(x, w, out, rows, m, n)`: `out[rows,m] = X[rows,n] * W^T`,
+    /// the batched prefill-path sibling of [`Self::gemv_f16`].
+    pub fn gemm_xwt_f16(
+        &self,
+        x: DevPtr,
+        w: DevPtr,
+        out: DevPtr,
+        rows: u32,
+        m: u32,
+        n: u32,
+    ) -> Result<(), RocmlError> {
+        const TILE: u32 = 16;
+        let cfg = LaunchConfig {
+            grid: (m.div_ceil(TILE), rows.div_ceil(TILE), 1),
+            block: (TILE, TILE, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut params = kernel_params!(x, w, out, rows, m, n);
+        // SAFETY: params matches gemm_xwt_f16's signature (const float*,
+        // const half*, float*, unsigned x3); block = (16, 16, 1) matches the
+        // kernel's fixed TILE.
+        unsafe { self.gemm_f16_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
+    }
+
+    /// `out[rows,m] = X[rows,n] * dequant(W)^T` where `W`'s rows are raw
+    /// GGUF `dtype` blocks — batched sibling of [`Self::gemv_quant`], see
+    /// [`LinearWeight`](crate::weights::LinearWeight)`::matmul`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_quant(
+        &self,
+        dtype: GgmlDType,
+        x: DevPtr,
+        w: DevPtr,
+        out: DevPtr,
+        rows: u32,
+        m: u32,
+        n: u32,
+    ) -> Result<(), RocmlError> {
+        self.quant.gemm(dtype, x, w, out, rows, m, n)
     }
 
     /// `gemv_t_f32(a, x, y, rows, n)`: y = A^T * x, A row-major rows x n f32.

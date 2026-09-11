@@ -109,6 +109,28 @@ impl LinearWeight {
             Self::Quant { dtype, raw } => kernels.gemv_quant(*dtype, offset(raw, 0), x, y, m, n),
         }
     }
+
+    /// `out[rows,m] = X[rows,n] * W^T`: the batched prefill-path sibling of
+    /// [`Self::matvec`], dispatching to `gemm_xwt_f16`/`gemm_xwt_<quant>`.
+    /// `m`/`n` must match the shape this weight was loaded with, same as
+    /// `matvec`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul(
+        &self,
+        kernels: &Kernels,
+        x: DevPtr,
+        out: DevPtr,
+        rows: u32,
+        m: u32,
+        n: u32,
+    ) -> Result<(), RocmlError> {
+        match self {
+            Self::F16(buf) => kernels.gemm_xwt_f16(x, offset(buf, 0), out, rows, m, n),
+            Self::Quant { dtype, raw } => {
+                kernels.gemm_quant(*dtype, x, offset(raw, 0), out, rows, m, n)
+            }
+        }
+    }
 }
 
 /// Per-layer spot checks: `LinearWeight::load` + `matvec` against a handful

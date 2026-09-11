@@ -140,6 +140,82 @@ pub fn expected_gemv(
         .collect()
 }
 
+/// CPU reference for the batched `gemm_xwt_q*` kernels: dequantize each of
+/// `m` rows and dot it against each of `rows` `x` rows, `out[rows,m]`.
+pub fn expected_gemm(
+    dtype: GgmlDType,
+    w_bytes: &[u8],
+    x: &[f32],
+    rows: usize,
+    m: usize,
+    n: usize,
+) -> Vec<f32> {
+    let row_bytes = w_bytes.len() / m;
+    let deq_rows: Vec<Vec<f32>> = (0..m)
+        .map(|row| {
+            let row_slice = &w_bytes[row * row_bytes..(row + 1) * row_bytes];
+            dequantize(dtype, row_slice).expect("cpu dequantize failed")
+        })
+        .collect();
+    let mut out = vec![0.0f32; rows * m];
+    for r in 0..rows {
+        let x_row = &x[r * n..(r + 1) * n];
+        for (col, deq) in deq_rows.iter().enumerate() {
+            out[r * m + col] = deq.iter().zip(x_row).map(|(a, b)| a * b).sum();
+        }
+    }
+    out
+}
+
+/// Uploads `w_bytes`/`x`, launches `gemm_xwt_<type>` (`kernel_name` from
+/// `hsaco`) as `gemm_xwt_<type>(const float* x, const void* w, float* out,
+/// unsigned rows, unsigned m, unsigned n)` with the fixed block=(32,8,1)/
+/// 1KiB-shared-mem contract `gemm_xwt_quant.hip` requires, and downloads
+/// `out` (`rows x m`).
+pub fn run_gemm_quant_kernel(
+    hsaco: &[u8],
+    kernel_name: &str,
+    w_bytes: &[u8],
+    x: &[f32],
+    rows: u32,
+    m: u32,
+    n: u32,
+) -> Vec<f32> {
+    let _device = Device::new(0).expect("failed to select device 0");
+    let module = Module::load_from_bytes(hsaco).expect("module load failed");
+    let function = module
+        .get_function(kernel_name)
+        .expect("kernel lookup failed");
+
+    let mut buf_x = DeviceBuffer::<f32>::new(x.len()).expect("hipMalloc x failed");
+    let mut buf_w = DeviceBuffer::<u8>::new(w_bytes.len()).expect("hipMalloc w failed");
+    let buf_out = DeviceBuffer::<f32>::new((rows * m) as usize).expect("hipMalloc out failed");
+    buf_x.copy_from_host(x).expect("copy x failed");
+    buf_w.copy_from_host(w_bytes).expect("copy w failed");
+
+    let x_ptr: *mut c_void = buf_x.device_ptr();
+    let w_ptr: *mut c_void = buf_w.device_ptr();
+    let out_ptr: *mut c_void = buf_out.device_ptr();
+    let mut params = kernel_params!(x_ptr, w_ptr, out_ptr, rows, m, n);
+
+    const TILE_ROWS: u32 = 8;
+    const TILE_ELEMS: u32 = 256;
+    let cfg = LaunchConfig {
+        grid: (m, rows.div_ceil(TILE_ROWS), 1),
+        block: (32, TILE_ROWS, 1),
+        shared_mem_bytes: TILE_ELEMS * std::mem::size_of::<f32>() as u32,
+    };
+    // SAFETY: params matches every gemm_xwt_<type> kernel's parameter list
+    // (const float*, const void*, float*, unsigned x3) in order, and all
+    // device buffers outlive this launch. Block = (32, 8, 1) matches the
+    // kernel's fixed TILE_ROWS/warp-per-row design.
+    unsafe { function.launch(&cfg, &mut params, None) }.expect("kernel launch failed");
+
+    let mut actual = vec![0.0f32; (rows * m) as usize];
+    buf_out.copy_to_host(&mut actual).expect("copy out failed");
+    actual
+}
+
 /// Uploads `w_bytes`/`x`, launches `kernel_name` from `hsaco` as
 /// `gemv_<type>(const void* w, const float* x, float* y, unsigned m, unsigned n)`
 /// with one 128-thread workgroup per output row, and downloads `y`.

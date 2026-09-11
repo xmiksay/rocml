@@ -18,6 +18,15 @@ use rocml_hip::{kernel_params, LaunchConfig, Module};
 use super::kernels::{load, DevPtr, REDUCE_BLOCK};
 use crate::error::RocmlError;
 
+/// Reduction elements staged into LDS per outer iteration by every
+/// `gemm_xwt_q*` kernel — fixes the dynamic shared memory request
+/// (`TILE_ELEMS * sizeof(f32)`) regardless of dtype (see
+/// `kernels/gemm_xwt_quant.hip`'s module doc).
+const GEMM_QUANT_TILE_ELEMS: u32 = 256;
+/// Output rows one `gemm_xwt_q*` workgroup shares a weight row across —
+/// fixes the launch's block.y and grid.y.
+const GEMM_QUANT_TILE_ROWS: u32 = 8;
+
 pub(crate) struct QuantKernels {
     _mod_q8_0: Module,
     q8_0_fn: rocml_hip::Function,
@@ -27,6 +36,14 @@ pub(crate) struct QuantKernels {
     q5_k_fn: rocml_hip::Function,
     _mod_q6_k: Module,
     q6_k_fn: rocml_hip::Function,
+    _mod_gemm_q8_0: Module,
+    gemm_q8_0_fn: rocml_hip::Function,
+    _mod_gemm_q4_k: Module,
+    gemm_q4_k_fn: rocml_hip::Function,
+    _mod_gemm_q5_k: Module,
+    gemm_q5_k_fn: rocml_hip::Function,
+    _mod_gemm_q6_k: Module,
+    gemm_q6_k_fn: rocml_hip::Function,
 }
 
 impl QuantKernels {
@@ -47,6 +64,22 @@ impl QuantKernels {
             rocml_kernels::GEMV_Q6_K_HSACO,
             rocml_kernels::GEMV_Q6_K_KERNEL,
         )?;
+        let (_mod_gemm_q8_0, gemm_q8_0_fn) = load(
+            rocml_kernels::GEMM_XWT_Q8_0_HSACO,
+            rocml_kernels::GEMM_XWT_Q8_0_KERNEL,
+        )?;
+        let (_mod_gemm_q4_k, gemm_q4_k_fn) = load(
+            rocml_kernels::GEMM_XWT_Q4_K_HSACO,
+            rocml_kernels::GEMM_XWT_Q4_K_KERNEL,
+        )?;
+        let (_mod_gemm_q5_k, gemm_q5_k_fn) = load(
+            rocml_kernels::GEMM_XWT_Q5_K_HSACO,
+            rocml_kernels::GEMM_XWT_Q5_K_KERNEL,
+        )?;
+        let (_mod_gemm_q6_k, gemm_q6_k_fn) = load(
+            rocml_kernels::GEMM_XWT_Q6_K_HSACO,
+            rocml_kernels::GEMM_XWT_Q6_K_KERNEL,
+        )?;
 
         Ok(Self {
             _mod_q8_0,
@@ -57,6 +90,14 @@ impl QuantKernels {
             q5_k_fn,
             _mod_q6_k,
             q6_k_fn,
+            _mod_gemm_q8_0,
+            gemm_q8_0_fn,
+            _mod_gemm_q4_k,
+            gemm_q4_k_fn,
+            _mod_gemm_q5_k,
+            gemm_q5_k_fn,
+            _mod_gemm_q6_k,
+            gemm_q6_k_fn,
         })
     }
 
@@ -95,6 +136,43 @@ impl QuantKernels {
         // SAFETY: params matches every gemv_<quant>'s signature (const
         // void*, const float*, float*, unsigned, unsigned); block size is
         // the required power of two.
+        unsafe { function.launch(&cfg, &mut params, None) }.map_err(Into::into)
+    }
+
+    /// `gemm_xwt_<dtype>(x, w, out, rows, m, n)`: `out[rows,m] = X[rows,n] *
+    /// dequant(W)^T`, the batched prefill-path sibling of [`Self::gemv`].
+    /// Same dtype restriction as `gemv` (Q8_0/Q4_K/Q5_K/Q6_K only).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gemm(
+        &self,
+        dtype: GgmlDType,
+        x: DevPtr,
+        w: DevPtr,
+        out: DevPtr,
+        rows: u32,
+        m: u32,
+        n: u32,
+    ) -> Result<(), RocmlError> {
+        let function = match dtype {
+            GgmlDType::Q8_0 => &self.gemm_q8_0_fn,
+            GgmlDType::Q4_K => &self.gemm_q4_k_fn,
+            GgmlDType::Q5_K => &self.gemm_q5_k_fn,
+            GgmlDType::Q6_K => &self.gemm_q6_k_fn,
+            other => {
+                return Err(RocmlError::Config(format!(
+                    "gemm_quant: {other:?} has no fused kernel (internal loader bug)"
+                )))
+            }
+        };
+        let cfg = LaunchConfig {
+            grid: (m, rows.div_ceil(GEMM_QUANT_TILE_ROWS), 1),
+            block: (32, GEMM_QUANT_TILE_ROWS, 1),
+            shared_mem_bytes: GEMM_QUANT_TILE_ELEMS * size_of::<f32>() as u32,
+        };
+        let mut params = kernel_params!(x, w, out, rows, m, n);
+        // SAFETY: params matches every gemm_xwt_<quant>'s signature (const
+        // float*, const void*, float*, unsigned x3); block = (32, 8, 1)
+        // matches the kernel's fixed warp-per-row tiling.
         unsafe { function.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 }
