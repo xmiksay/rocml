@@ -11,6 +11,7 @@ use rocml_core::gguf::GgufFile;
 use rocml_hip::MemoryInfo;
 
 use crate::error::RocmlError;
+use crate::profile::Profiler;
 
 pub enum Model {
     // Both variants are boxed: each holds a whole forward pass's weights,
@@ -45,6 +46,20 @@ impl Model {
         match self {
             Self::Dense(m) => m.forward_token(token_id),
             Self::Hybrid(m) => m.forward_token(token_id),
+        }
+    }
+
+    /// Like [`Self::forward_token`], instrumented through `prof` when given
+    /// — see `crate::profile` for what gets recorded and at what
+    /// granularity.
+    pub fn forward_token_profiled(
+        &mut self,
+        token_id: u32,
+        prof: Option<&Profiler>,
+    ) -> Result<Vec<f32>, RocmlError> {
+        match self {
+            Self::Dense(m) => m.forward_token_profiled(token_id, prof),
+            Self::Hybrid(m) => m.forward_token_profiled(token_id, prof),
         }
     }
 

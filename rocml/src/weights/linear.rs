@@ -80,6 +80,19 @@ impl LinearWeight {
         Ok(Self::F16(buf))
     }
 
+    /// Exact on-device byte size of this weight matrix — the raw quantized
+    /// block bytes for `Quant`, or `2 * elements` for the f16 fallback.
+    /// Used by `rocml::profile::cost::matvec_bytes` so the profiler's byte
+    /// accounting reflects what's actually resident in VRAM (e.g. Q6_K's
+    /// ~6.5 bits/weight, not a guessed constant) rather than re-deriving it
+    /// from dtype metadata.
+    pub fn byte_size(&self) -> u64 {
+        match self {
+            Self::F16(buf) => buf.len() as u64 * 2,
+            Self::Quant { raw, .. } => raw.len() as u64,
+        }
+    }
+
     /// `y = W * x`: dispatches to the plain f16 gemv or the matching fused
     /// dequant-gemv kernel. `m`/`n` must match the shape this weight was
     /// loaded with (the same contract `Kernels::gemv_f16` already has).

@@ -19,6 +19,7 @@ use scratch::Scratch;
 use crate::cache::KvCache;
 use crate::config::ModelConfig;
 use crate::error::RocmlError;
+use crate::profile::{self, OpKind, Phase, Profiler};
 use crate::weights::ModelWeights;
 
 pub struct Model {
@@ -85,6 +86,20 @@ impl Model {
     /// Runs one decode step for `token_id` at the current cache position and
     /// returns that step's vocab-sized logits (host-side, f32).
     pub fn forward_token(&mut self, token_id: u32) -> Result<Vec<f32>, RocmlError> {
+        self.forward_token_profiled(token_id, None)
+    }
+
+    /// Like [`Self::forward_token`], but instruments every op through `prof`
+    /// when given. During `Phase::Prefill`, per-layer sub-ops are *not*
+    /// individually timed — see the `profile` module doc for why (bounding
+    /// event count over a long token-serial prefill loop) — each layer is
+    /// instead timed as a single [`OpKind::Layer`] span with analytically
+    /// pre-summed bytes/flops.
+    pub fn forward_token_profiled(
+        &mut self,
+        token_id: u32,
+        prof: Option<&Profiler>,
+    ) -> Result<Vec<f32>, RocmlError> {
         let pos = self.pos;
         let max_seq = self.cache.max_seq();
         if pos >= max_seq {
@@ -94,43 +109,119 @@ impl Model {
             });
         }
         let hidden = self.config.embedding_length;
+        let cur_len = pos + 1;
+        let coarse_prefill = prof.map(|p| p.phase() == Phase::Prefill).unwrap_or(false);
 
         self.scratch.token_id.copy_from_host(&[token_id])?;
-        self.kernels.embedding(
-            offset(&self.scratch.token_id, 0),
-            offset(&self.weights.token_embd, 0),
-            offset(&self.scratch.x, 0),
-            1,
-            hidden,
+        Profiler::scope(
+            prof,
+            None,
+            OpKind::Embed,
+            profile::embed_bytes(hidden),
+            0,
+            || {
+                self.kernels.embedding(
+                    offset(&self.scratch.token_id, 0),
+                    offset(&self.weights.token_embd, 0),
+                    offset(&self.scratch.x, 0),
+                    1,
+                    hidden,
+                )
+            },
         )?;
 
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
-            attention::attention_step(
-                &self.kernels,
-                &self.config,
-                layer,
-                &mut self.cache,
-                &mut self.scratch,
-                layer_idx,
-                pos,
-            )?;
-            ffn::ffn_step(&self.kernels, &self.config, layer, &mut self.scratch)?;
+            if coarse_prefill {
+                let (attn_bytes, attn_flops) =
+                    attention::attention_step_cost(&self.config, layer, cur_len);
+                let (ffn_bytes, ffn_flops) = ffn::ffn_step_cost(&self.config, layer);
+                Profiler::scope(
+                    prof,
+                    Some(layer_idx as u32),
+                    OpKind::Layer,
+                    attn_bytes + ffn_bytes,
+                    attn_flops + ffn_flops,
+                    || {
+                        attention::attention_step(
+                            &self.kernels,
+                            &self.config,
+                            layer,
+                            &mut self.cache,
+                            &mut self.scratch,
+                            layer_idx,
+                            pos,
+                            None,
+                        )?;
+                        ffn::ffn_step(
+                            &self.kernels,
+                            &self.config,
+                            layer,
+                            &mut self.scratch,
+                            None,
+                            None,
+                        )
+                    },
+                )?;
+            } else {
+                attention::attention_step(
+                    &self.kernels,
+                    &self.config,
+                    layer,
+                    &mut self.cache,
+                    &mut self.scratch,
+                    layer_idx,
+                    pos,
+                    prof,
+                )?;
+                ffn::ffn_step(
+                    &self.kernels,
+                    &self.config,
+                    layer,
+                    &mut self.scratch,
+                    prof,
+                    Some(layer_idx as u32),
+                )?;
+            }
         }
 
-        self.kernels.rmsnorm(
-            offset(&self.scratch.x, 0),
-            offset(&self.weights.output_norm, 0),
-            offset(&self.scratch.xn, 0),
-            1,
-            hidden,
-            self.config.rms_eps,
+        Profiler::scope(
+            prof,
+            None,
+            OpKind::Norm,
+            profile::norm_bytes(1, hidden),
+            profile::norm_flops(1, hidden),
+            || {
+                self.kernels.rmsnorm(
+                    offset(&self.scratch.x, 0),
+                    offset(&self.weights.output_norm, 0),
+                    offset(&self.scratch.xn, 0),
+                    1,
+                    hidden,
+                    self.config.rms_eps,
+                )
+            },
         )?;
-        self.weights.output.matvec(
-            &self.kernels,
-            offset(&self.scratch.xn, 0),
-            offset(&self.scratch.logits, 0),
+        let lm_head_bytes = profile::matvec_bytes(
+            self.weights.output.byte_size(),
             self.config.vocab_size,
             hidden,
+        );
+        let lm_head_flops = profile::matvec_flops(self.config.vocab_size, hidden);
+        Profiler::scope(
+            prof,
+            None,
+            OpKind::LmHead,
+            lm_head_bytes,
+            lm_head_flops,
+            || {
+                self.weights.output.matvec(
+                    &self.kernels,
+                    offset(&self.scratch.xn, 0),
+                    offset(&self.scratch.logits, 0),
+                    self.config.vocab_size,
+                    hidden,
+                )
+            },
         )?;
 
         let mut logits = vec![0.0f32; self.config.vocab_size as usize];

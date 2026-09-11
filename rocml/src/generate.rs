@@ -9,6 +9,7 @@ use rocml_core::tokenizer::BpeTokenizer;
 
 use crate::error::RocmlError;
 use crate::model::Model;
+use crate::profile::{Phase, Profiler};
 use crate::sample::{self, Rng, SamplingParams};
 
 #[derive(Debug, Clone, Copy)]
@@ -89,6 +90,7 @@ pub fn generate_sampled(
         max_new_tokens,
         stop_on_eos,
         params,
+        None,
         |s| {
             on_text(s);
             false
@@ -117,10 +119,44 @@ pub fn generate_sampled_with_stop(
         max_new_tokens,
         stop_on_eos,
         params,
+        None,
         on_text,
     )
 }
 
+/// Like [`generate_sampled`], but records per-op timing/bytes/FLOPs through
+/// `prof` (issue #5's observability instrumentation) — `prof.set_phase` is
+/// flipped from `Prefill` to `Decode` at the same boundary
+/// [`GenerateStats`]'s own prompt/decode split uses, so a `Profiler::finish()`
+/// report and this call's returned tok/s numbers describe the same two
+/// windows.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_sampled_profiled(
+    model: &mut Model,
+    tokenizer: &BpeTokenizer,
+    prompt_ids: &[u32],
+    max_new_tokens: usize,
+    stop_on_eos: bool,
+    params: &SamplingParams,
+    prof: Option<&Profiler>,
+    mut on_text: impl FnMut(&str),
+) -> Result<GenerateStats, RocmlError> {
+    generate_core(
+        model,
+        tokenizer,
+        prompt_ids,
+        max_new_tokens,
+        stop_on_eos,
+        params,
+        prof,
+        |s| {
+            on_text(s);
+            false
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn generate_core(
     model: &mut Model,
     tokenizer: &BpeTokenizer,
@@ -128,6 +164,7 @@ fn generate_core(
     max_new_tokens: usize,
     stop_on_eos: bool,
     params: &SamplingParams,
+    prof: Option<&Profiler>,
     mut on_text: impl FnMut(&str) -> bool,
 ) -> Result<GenerateStats, RocmlError> {
     let eos = tokenizer.eos_token_id;
@@ -137,13 +174,19 @@ fn generate_core(
     let mut rng = Rng::new(params.seed);
     let mut stop_requested = false;
 
+    if let Some(p) = prof {
+        p.set_phase(Phase::Prefill);
+    }
     let prompt_start = Instant::now();
     let mut logits = Vec::new();
     for &id in prompt_ids {
-        logits = model.forward_token(id)?;
+        logits = model.forward_token_profiled(id, prof)?;
     }
     let prompt_seconds = prompt_start.elapsed().as_secs_f64();
 
+    if let Some(p) = prof {
+        p.set_phase(Phase::Decode);
+    }
     let decode_start = Instant::now();
     while !stop_requested && generated_tokens < max_new_tokens && !logits.is_empty() {
         let next_id = sample::sample(&logits, &history, params, &mut rng);
@@ -160,7 +203,7 @@ fn generate_core(
         if stop_requested {
             break;
         }
-        logits = model.forward_token(next_id)?;
+        logits = model.forward_token_profiled(next_id, prof)?;
     }
     flush_pending(&mut pending, &mut |s| {
         on_text(s);

@@ -11,6 +11,7 @@ pub mod error;
 pub mod forward;
 pub mod generate;
 mod model;
+pub mod profile;
 pub mod qwen35;
 pub mod registry;
 pub mod sample;
@@ -18,7 +19,11 @@ pub mod weights;
 
 pub use config::ModelConfig;
 pub use error::RocmlError;
-pub use generate::{generate, generate_sampled, generate_sampled_with_stop, GenerateStats};
+pub use generate::{
+    generate, generate_sampled, generate_sampled_profiled, generate_sampled_with_stop,
+    GenerateStats,
+};
 pub use model::Model;
+pub use profile::{OpKind, Phase, Profiler, Report};
 pub use registry::{resolve, ModelFamily, ModelSpec, ResolvedModel};
 pub use sample::{Rng, SamplingParams};

@@ -7,6 +7,7 @@ use super::kernels::HybridKernels;
 use super::scratch::Scratch;
 use crate::error::RocmlError;
 use crate::forward::kernels::{offset, Kernels};
+use crate::profile::{self, OpKind, Profiler};
 use crate::qwen35::cache::AttnPlane;
 use crate::qwen35::config::Qwen35Config;
 use crate::qwen35::weights::AttnLayerWeights;
@@ -21,6 +22,8 @@ pub(crate) fn attention_step(
     max_seq: u32,
     scratch: &mut Scratch,
     pos: u32,
+    prof: Option<&Profiler>,
+    layer_idx: Option<u32>,
 ) -> Result<(), RocmlError> {
     let hidden = config.embedding_length;
     let head_dim = config.head_dim;
@@ -31,13 +34,22 @@ pub(crate) fn attention_step(
     let q_dim = config.q_dim();
     let kv_dim = config.kv_dim();
 
-    kernels.rmsnorm(
-        offset(&scratch.x, 0),
-        offset(&layer.attn_norm, 0),
-        offset(&scratch.xn, 0),
-        1,
-        hidden,
-        config.rms_eps,
+    Profiler::scope(
+        prof,
+        layer_idx,
+        OpKind::Norm,
+        profile::norm_bytes(1, hidden),
+        profile::norm_flops(1, hidden),
+        || {
+            kernels.rmsnorm(
+                offset(&scratch.x, 0),
+                offset(&layer.attn_norm, 0),
+                offset(&scratch.xn, 0),
+                1,
+                hidden,
+                config.rms_eps,
+            )
+        },
     )?;
 
     let q_out = if layer.has_output_gate {
@@ -45,154 +57,228 @@ pub(crate) fn attention_step(
     } else {
         q_dim
     };
-    layer.attn_q.matvec(
-        kernels,
-        offset(&scratch.xn, 0),
-        offset(&scratch.attn_q_raw, 0),
-        q_out,
-        hidden,
-    )?;
-    layer.attn_k.matvec(
-        kernels,
-        offset(&scratch.xn, 0),
-        offset(&scratch.attn_k, 0),
-        kv_dim,
-        hidden,
-    )?;
-    layer.attn_v.matvec(
-        kernels,
-        offset(&scratch.xn, 0),
-        offset(&scratch.attn_v, 0),
-        kv_dim,
-        hidden,
-    )?;
-
-    // Per-head extraction: HF/GGUF fuse `[query(head_dim) | gate(head_dim)]`
-    // per head (stride `2*head_dim`), not a flat `[Q | gate]` split — see
-    // `AttnLayerWeights::attn_q`'s doc comment.
-    let Scratch {
-        attn_q_raw,
-        attn_q,
-        attn_gate,
-        ..
-    } = scratch;
-    let stride = if layer.has_output_gate {
-        2 * head_dim
-    } else {
-        head_dim
-    };
-    for h in 0..n_heads {
-        attn_q.copy_from_device(
-            (h * head_dim) as usize,
-            attn_q_raw,
-            (h * stride) as usize,
-            head_dim as usize,
+    let qkv_bytes = profile::matvec_bytes(layer.attn_q.byte_size(), q_out, hidden)
+        + profile::matvec_bytes(layer.attn_k.byte_size(), kv_dim, hidden)
+        + profile::matvec_bytes(layer.attn_v.byte_size(), kv_dim, hidden)
+        + profile::norm_bytes(n_heads, head_dim)
+        + profile::norm_bytes(n_kv_heads, head_dim);
+    let qkv_flops = profile::matvec_flops(q_out, hidden)
+        + profile::matvec_flops(kv_dim, hidden) * 2
+        + profile::norm_flops(n_heads, head_dim)
+        + profile::norm_flops(n_kv_heads, head_dim);
+    Profiler::scope(prof, layer_idx, OpKind::Qkv, qkv_bytes, qkv_flops, || {
+        layer.attn_q.matvec(
+            kernels,
+            offset(&scratch.xn, 0),
+            offset(&scratch.attn_q_raw, 0),
+            q_out,
+            hidden,
         )?;
-        if layer.has_output_gate {
-            attn_gate.copy_from_device(
+        layer.attn_k.matvec(
+            kernels,
+            offset(&scratch.xn, 0),
+            offset(&scratch.attn_k, 0),
+            kv_dim,
+            hidden,
+        )?;
+        layer.attn_v.matvec(
+            kernels,
+            offset(&scratch.xn, 0),
+            offset(&scratch.attn_v, 0),
+            kv_dim,
+            hidden,
+        )?;
+
+        // Per-head extraction: HF/GGUF fuse `[query(head_dim) | gate(head_dim)]`
+        // per head (stride `2*head_dim`), not a flat `[Q | gate]` split — see
+        // `AttnLayerWeights::attn_q`'s doc comment.
+        let Scratch {
+            attn_q_raw,
+            attn_q,
+            attn_gate,
+            ..
+        } = scratch;
+        let stride = if layer.has_output_gate {
+            2 * head_dim
+        } else {
+            head_dim
+        };
+        for h in 0..n_heads {
+            attn_q.copy_from_device(
                 (h * head_dim) as usize,
                 attn_q_raw,
-                (h * stride + head_dim) as usize,
+                (h * stride) as usize,
                 head_dim as usize,
             )?;
+            if layer.has_output_gate {
+                attn_gate.copy_from_device(
+                    (h * head_dim) as usize,
+                    attn_q_raw,
+                    (h * stride + head_dim) as usize,
+                    head_dim as usize,
+                )?;
+            }
         }
-    }
 
-    kernels.rmsnorm(
-        offset(&scratch.attn_q, 0),
-        offset(&layer.attn_q_norm, 0),
-        offset(&scratch.attn_q, 0),
-        n_heads,
-        head_dim,
-        config.rms_eps,
-    )?;
-    kernels.rmsnorm(
-        offset(&scratch.attn_k, 0),
-        offset(&layer.attn_k_norm, 0),
-        offset(&scratch.attn_k, 0),
-        n_kv_heads,
-        head_dim,
-        config.rms_eps,
-    )?;
-
-    hybrid.rope_partial(
-        offset(&scratch.attn_q, 0),
-        1,
-        n_heads,
-        head_dim,
-        config.rope_dim_count,
-        pos,
-        config.rope_freq_base,
-    )?;
-    hybrid.rope_partial(
-        offset(&scratch.attn_k, 0),
-        1,
-        n_kv_heads,
-        head_dim,
-        config.rope_dim_count,
-        pos,
-        config.rope_freq_base,
-    )?;
-
-    plane.append(
-        pos,
-        max_seq,
-        n_kv_heads,
-        head_dim,
-        &scratch.attn_k,
-        &scratch.attn_v,
-    )?;
-
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
-    for h in 0..n_heads {
-        let kvh = h / group;
-        let k_plane = offset(
-            plane.k_buffer(),
-            plane.head_plane_offset(kvh, max_seq, head_dim),
-        );
-        let q_head = offset(&scratch.attn_q, (h * head_dim) as usize);
-        let score_row = offset(&scratch.attn_scores, (h * max_seq) as usize);
-        kernels.gemv_f32(k_plane, q_head, score_row, cur_len, head_dim)?;
-    }
-
-    let valid_len_host = vec![cur_len; n_heads as usize];
-    scratch.attn_valid_len.copy_from_host(&valid_len_host)?;
-    kernels.softmax_varlen(
-        offset(&scratch.attn_scores, 0),
-        offset(&scratch.attn_valid_len, 0),
-        n_heads,
-        max_seq,
-        scale,
-    )?;
-
-    for h in 0..n_heads {
-        let kvh = h / group;
-        let v_plane = offset(
-            plane.v_buffer(),
-            plane.head_plane_offset(kvh, max_seq, head_dim),
-        );
-        let probs = offset(&scratch.attn_scores, (h * max_seq) as usize);
-        let out_head = offset(&scratch.attn_concat, (h * head_dim) as usize);
-        kernels.gemv_t_f32(v_plane, probs, out_head, cur_len, head_dim)?;
-    }
-
-    if layer.has_output_gate {
-        hybrid.sigmoid_mul(
-            offset(&scratch.attn_concat, 0),
-            offset(&scratch.attn_gate, 0),
-            offset(&scratch.attn_concat, 0),
-            q_dim,
+        kernels.rmsnorm(
+            offset(&scratch.attn_q, 0),
+            offset(&layer.attn_q_norm, 0),
+            offset(&scratch.attn_q, 0),
+            n_heads,
+            head_dim,
+            config.rms_eps,
         )?;
-    }
+        kernels.rmsnorm(
+            offset(&scratch.attn_k, 0),
+            offset(&layer.attn_k_norm, 0),
+            offset(&scratch.attn_k, 0),
+            n_kv_heads,
+            head_dim,
+            config.rms_eps,
+        )?;
 
-    layer.attn_output.matvec(
-        kernels,
-        offset(&scratch.attn_concat, 0),
-        offset(&scratch.attn_out, 0),
-        hidden,
-        q_dim,
+        hybrid.rope_partial(
+            offset(&scratch.attn_q, 0),
+            1,
+            n_heads,
+            head_dim,
+            config.rope_dim_count,
+            pos,
+            config.rope_freq_base,
+        )?;
+        hybrid.rope_partial(
+            offset(&scratch.attn_k, 0),
+            1,
+            n_kv_heads,
+            head_dim,
+            config.rope_dim_count,
+            pos,
+            config.rope_freq_base,
+        )
+    })?;
+
+    let score_bytes = profile::attn_score_bytes(n_heads, cur_len, head_dim) + kv_dim as u64 * 2 * 4;
+    let score_flops = profile::attn_score_flops(n_heads, cur_len, head_dim);
+    Profiler::scope(
+        prof,
+        layer_idx,
+        OpKind::AttnScore,
+        score_bytes,
+        score_flops,
+        || {
+            plane.append(
+                pos,
+                max_seq,
+                n_kv_heads,
+                head_dim,
+                &scratch.attn_k,
+                &scratch.attn_v,
+            )?;
+
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            for h in 0..n_heads {
+                let kvh = h / group;
+                let k_plane = offset(
+                    plane.k_buffer(),
+                    plane.head_plane_offset(kvh, max_seq, head_dim),
+                );
+                let q_head = offset(&scratch.attn_q, (h * head_dim) as usize);
+                let score_row = offset(&scratch.attn_scores, (h * max_seq) as usize);
+                kernels.gemv_f32(k_plane, q_head, score_row, cur_len, head_dim)?;
+            }
+
+            let valid_len_host = vec![cur_len; n_heads as usize];
+            scratch.attn_valid_len.copy_from_host(&valid_len_host)?;
+            kernels.softmax_varlen(
+                offset(&scratch.attn_scores, 0),
+                offset(&scratch.attn_valid_len, 0),
+                n_heads,
+                max_seq,
+                scale,
+            )
+        },
     )?;
-    kernels.add_inplace(offset(&scratch.x, 0), offset(&scratch.attn_out, 0), hidden)?;
+
+    let out_bytes = profile::attn_out_bytes(n_heads, cur_len, head_dim)
+        + profile::matvec_bytes(layer.attn_output.byte_size(), hidden, q_dim);
+    let out_flops =
+        profile::attn_out_flops(n_heads, cur_len, head_dim) + profile::matvec_flops(hidden, q_dim);
+    Profiler::scope(
+        prof,
+        layer_idx,
+        OpKind::AttnOut,
+        out_bytes,
+        out_flops,
+        || {
+            for h in 0..n_heads {
+                let kvh = h / group;
+                let v_plane = offset(
+                    plane.v_buffer(),
+                    plane.head_plane_offset(kvh, max_seq, head_dim),
+                );
+                let probs = offset(&scratch.attn_scores, (h * max_seq) as usize);
+                let out_head = offset(&scratch.attn_concat, (h * head_dim) as usize);
+                kernels.gemv_t_f32(v_plane, probs, out_head, cur_len, head_dim)?;
+            }
+
+            if layer.has_output_gate {
+                hybrid.sigmoid_mul(
+                    offset(&scratch.attn_concat, 0),
+                    offset(&scratch.attn_gate, 0),
+                    offset(&scratch.attn_concat, 0),
+                    q_dim,
+                )?;
+            }
+
+            layer.attn_output.matvec(
+                kernels,
+                offset(&scratch.attn_concat, 0),
+                offset(&scratch.attn_out, 0),
+                hidden,
+                q_dim,
+            )?;
+            kernels.add_inplace(offset(&scratch.x, 0), offset(&scratch.attn_out, 0), hidden)
+        },
+    )?;
 
     Ok(())
+}
+
+/// Analytical bytes/flops for one full attention_step (see
+/// `crate::forward::attention::attention_step_cost`'s doc comment).
+pub(crate) fn attention_step_cost(
+    config: &Qwen35Config,
+    layer: &AttnLayerWeights,
+    cur_len: u32,
+) -> (u64, u64) {
+    let hidden = config.embedding_length;
+    let head_dim = config.head_dim;
+    let n_heads = config.head_count;
+    let n_kv_heads = config.head_count_kv;
+    let q_dim = config.q_dim();
+    let kv_dim = config.kv_dim();
+    let q_out = if layer.has_output_gate {
+        2 * q_dim
+    } else {
+        q_dim
+    };
+
+    let bytes = profile::norm_bytes(1, hidden)
+        + profile::matvec_bytes(layer.attn_q.byte_size(), q_out, hidden)
+        + profile::matvec_bytes(layer.attn_k.byte_size(), kv_dim, hidden)
+        + profile::matvec_bytes(layer.attn_v.byte_size(), kv_dim, hidden)
+        + profile::norm_bytes(n_heads, head_dim)
+        + profile::norm_bytes(n_kv_heads, head_dim)
+        + profile::attn_score_bytes(n_heads, cur_len, head_dim)
+        + profile::attn_out_bytes(n_heads, cur_len, head_dim)
+        + profile::matvec_bytes(layer.attn_output.byte_size(), hidden, q_dim);
+    let flops = profile::norm_flops(1, hidden)
+        + profile::matvec_flops(q_out, hidden)
+        + profile::matvec_flops(kv_dim, hidden) * 2
+        + profile::norm_flops(n_heads, head_dim)
+        + profile::norm_flops(n_kv_heads, head_dim)
+        + profile::attn_score_flops(n_heads, cur_len, head_dim)
+        + profile::attn_out_flops(n_heads, cur_len, head_dim)
+        + profile::matvec_flops(hidden, q_dim);
+    (bytes, flops)
 }
