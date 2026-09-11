@@ -55,12 +55,37 @@ Sampling and thinking defaults are each model family's own documented recommenda
 
 ```
 rocml-cli chat --model <name-or-gguf> [--no-download] [--no-think] [-t/--temperature] [--top-p] [--top-k] [--seed] [--max-tokens] [--ctx]
-rocml-cli bench --model <name-or-gguf> [--no-download] [--prompt-tokens N] [--decode-tokens N] [--runs N] [--json]
-rocml-cli generate --model <name-or-gguf> --prompt <text> [--no-download] [--raw] [--no-think] [-n N]
+rocml-cli bench --model <name-or-gguf> [--no-download] [--prompt-tokens N] [--decode-tokens N] [--runs N] [--depth N] [--profile] [--json]
+rocml-cli generate --model <name-or-gguf> --prompt <text> [--no-download] [--raw] [--no-think] [-n N] [--profile]
 rocml-cli models
 ```
 
 `chat` re-renders and reprocesses the whole conversation from `Model::reset()` each turn (see `rocml-cli/src/cmd_chat.rs`'s doc comment for why) — fine for an interactive REPL, not meant as a throughput benchmark (use `bench` for that).
+
+`bench --depth N` pre-fills N synthetic tokens of context through the normal prefill path, then measures decode throughput starting from that depth instead of from an empty cache — the head-to-head metric vs. llama.cpp's own "decode t/s at depth D" numbers, since decode cost (attention/GDN-recurrence bytes read) grows with how much context already exists. Both the prefill-to-depth rate and the post-depth decode rate are reported.
+
+See [Observability](#observability) below for `--profile`.
+
+## Observability
+
+`bench --profile` and `generate --profile` collect per-op, per-layer, per-phase (prefill vs. decode) instrumentation — bytes moved, FLOPs, wall time, and position relative to this card's roofline (~624 GB/s HBM, ~15-20 TFLOP/s fp16 on gfx1101) — and print a report after the run (`bench --profile --json` embeds the same data under a `"profile"` key instead).
+
+```
+$ rocml-cli bench --model qwen3.5-2b --profile
+...
+== decode phase: 842.31 ms profiled ==
+-- by op-kind --
+label                             n         ms     %time      GB/s   GFLOP/s %BWroof %FLroof
+ffn-gate-up                     127     312.040     37.0%     238.4      59.1   38.2%    0.3%
+qkv                             127     198.442     23.6%     181.9      45.3   29.2%    0.3%
+...
+
+== top bottlenecks ==
+decode ffn-gate-up: 37.0% of decode time, 238.4 GB/s (38.2% of BW roofline), 59.1 GFLOP/s (0.3% of FLOP roofline)
+...
+```
+
+Profiling is opt-in and costs nothing when off: every instrumented call site is `Profiler::scope(prof, ..., || { ... })`, a plain function call when `prof` is `None`. When on, per-op HIP events are recorded through the whole run and only synchronized once at the end (`Profiler::finish`), not inside the hot loop — see `rocml/src/profile/mod.rs`'s doc comment for the full design, including why a long `--depth` prefill times each layer as one coarse span instead of per-op (bounding event count) while decode keeps full per-op granularity. Byte/FLOP counts are analytical (weight sizes, KV/state sizes, dtype-aware), not measured — see `rocml/src/profile/cost.rs`.
 
 ## rocml-serve
 

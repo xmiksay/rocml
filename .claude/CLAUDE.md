@@ -43,6 +43,14 @@ Tests in `rocml-hip`, the `rocml-kernels` integration tests, `rocml`'s forward p
 
 `rocml/src/weights/linear.rs` also carries its own `#[cfg(test)]` per-layer spot checks (`cargo test --lib`, real hardware + real checkpoints, skip-if-missing): `LinearWeight::load` + `matvec` against one dense-Qwen3 tensor and one qwen3.5 GDN-layer/full-attention-layer tensor each, compared to `rocml-core`'s CPU dequant + a CPU dot product — this is the loader/dispatch layer, complementing the fused kernels' own tests in `rocml-kernels/tests/gemv_q*.rs`.
 
+## Observability (issue #5)
+
+`rocml/src/profile/` is a run-scoped `Profiler` that records per-op spans (layer index, op-kind — embed/norm/qkv/attn-score/attn-out/gdn-conv/gdn-recur/gdn-out/ffn-gate-up/ffn-down/lm-head/layer — phase, bytes, FLOPs, wall time via `rocml-hip`'s `Event`/`elapsed_ms`), aggregated by `rocml/src/profile/report.rs` into per-layer and per-op-kind roofline rows (GB/s, GFLOP/s, % of the gfx1101 roofline — 624 GB/s / 17.5 TFLOP/s fp16 midpoint — plus a top-bottlenecks summary). `rocml/src/profile/cost.rs` holds the pure, unit-tested byte/FLOP formulas (analytical, not measured — `LinearWeight::byte_size()` supplies exact on-device weight sizes).
+
+Threaded through both forward passes (`rocml/src/forward/`, `rocml/src/qwen35/forward/`) as `Option<&Profiler>` — a `Copy` type (the profiler uses `RefCell`/`Cell` internally), so it passes into every nested call by value with no `&mut` reborrow plumbing. Every instrumented call site is `Profiler::scope(prof, layer, op, bytes, flops, || { ...kernel calls... })`, which is a plain function call when `prof` is `None` — profiling off costs nothing. Decode gets full per-op granularity; a prefill's token-serial loop times each layer as one `OpKind::Layer` span instead (bytes/flops still analytically broken out) to keep event count bounded at long `--depth` — see the module doc comment for the exact reasoning and the `MAX_TIMED_EVENTS` safety net.
+
+`rocml-cli bench --profile` (report on the final of `--runs`, `--json` embeds it under `"profile"`) and `generate --profile` print the report. `bench --depth N` pre-fills N synthetic tokens through the normal prefill path before measuring decode t/s — reuses the same prefill/decode phase split `generate_sampled_profiled` already threads through `Profiler::set_phase`, so no separate code path was needed.
+
 ## Kernel build pipeline
 
 `rocml-kernels/build.rs` shells out to `hipcc` for every `*.hip` file under `kernels/`:
