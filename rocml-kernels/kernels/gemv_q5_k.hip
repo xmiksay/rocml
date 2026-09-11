@@ -1,9 +1,15 @@
 // Fused dequant-GEMV for Q5_K: like Q4_K but with an extra high-bit plane
 // (`qh`) giving 5-bit codes. W's rows are raw GGUF Q5_K blocks (176 bytes),
-// never materialized to f32 in VRAM. One workgroup per output row; each lane
-// owns a strided subset of the row's 256-element super-blocks. Must match
-// rocml-core's `quant::q5_k::dequantize` exactly, including the `u1`/`u2`
-// high-bit mask rotation across sub-block pairs.
+// never materialized to f32 in VRAM. Must match rocml-core's
+// `quant::q5_k::dequantize` exactly, including the `u1`/`u2` high-bit mask
+// rotation across sub-block pairs (reduction ORDER may differ — see below).
+//
+// Launch contract and occupancy fix: identical to `gemv_q4_k.hip` — see its
+// file comment for the full rationale. Chunk `c` (0..7, GROUP_SIZE=8 lanes
+// per super-block) is sub-block pair `c/2`, low nibble/`u1` if `c` is even,
+// high nibble/`u2` if odd; `get_scale_min_k4(c, ...)` and the `u1`/`u2` mask
+// rotation both collapse to a function of `c` alone the same way the Q4_K
+// scale/min index does.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -24,9 +30,13 @@ extern "C" __global__ void gemv_q5_k(
     const unsigned char* row_ptr =
         (const unsigned char*)w + (size_t)row * blocks_per_row * block_bytes;
 
-    extern __shared__ float partial[];
+    const unsigned GROUP_SIZE = 8;
+    const unsigned lane = threadIdx.x % GROUP_SIZE;
+    const unsigned group = threadIdx.x / GROUP_SIZE;
+    const unsigned num_groups = blockDim.x / GROUP_SIZE;
+
     float sum = 0.0f;
-    for (unsigned blk = threadIdx.x; blk < blocks_per_row; blk += blockDim.x) {
+    for (unsigned blk = group; blk < blocks_per_row; blk += num_groups) {
         const unsigned char* bptr = row_ptr + (size_t)blk * block_bytes;
         __half d_h, dmin_h;
         std::memcpy(&d_h, bptr, sizeof(__half));
@@ -38,41 +48,41 @@ extern "C" __global__ void gemv_q5_k(
         const unsigned char* qs = bptr + 48;
         const float* xs = x + (size_t)blk * qk;
 
-        // Mirrors dequantize_row_q5_K: qh stays fixed across the 4 sub-block
-        // pairs while the tested bit (u1/u2) rotates left by 2 each time.
-        unsigned is = 0;
-        unsigned char u1 = 1, u2 = 2;
-        float local = 0.0f;
-        for (unsigned j = 0; j < qk; j += 64) {
-            const unsigned char* ql = qs + j / 2;
-            unsigned char sc, mn;
-            get_scale_min_k4(is, scales, &sc, &mn);
-            float d1 = d * sc;
-            float m1 = dmin * mn;
-            get_scale_min_k4(is + 1, scales, &sc, &mn);
-            float d2 = d * sc;
-            float m2 = dmin * mn;
-            const float* x1 = xs + j;
-            const float* x2 = xs + j + 32;
+        unsigned pair = lane / 2;
+        unsigned half = lane & 1;
+        unsigned j = pair * 64;
+        const unsigned char* ql = qs + j / 2;
+        unsigned char sc, mn;
+        get_scale_min_k4(lane, scales, &sc, &mn);
+        float dd = d * (float)sc;
+        float mm = dmin * (float)mn;
+        const float* xh = xs + j + half * 32;
+        // Mirrors dequantize_row_q5_K's u1/u2 rotation: sub-block pair
+        // `pair`'s tested bit is `1 << (2*pair)` for the low-nibble half,
+        // `2 << (2*pair)` for the high-nibble half.
+        unsigned char u = (unsigned char)((half == 0 ? 1u : 2u) << (2 * pair));
 
+        float local = 0.0f;
 #pragma unroll
-            for (unsigned l = 0; l < 32; ++l) {
-                float hi1 = (qh[l] & u1) ? 16.0f : 0.0f;
-                float hi2 = (qh[l] & u2) ? 16.0f : 0.0f;
-                local += (d1 * ((float)(ql[l] & 0xF) + hi1) - m1) * x1[l];
-                local += (d2 * ((float)(ql[l] >> 4) + hi2) - m2) * x2[l];
-            }
-            is += 2;
-            u1 <<= 2;
-            u2 <<= 2;
+        for (unsigned l = 0; l < 32; ++l) {
+            unsigned char nib = half == 0 ? (ql[l] & 0xF) : (ql[l] >> 4);
+            float hi = (qh[l] & u) ? 16.0f : 0.0f;
+            local += (dd * ((float)nib + hi) - mm) * xh[l];
         }
         sum += local;
     }
 
-    partial[threadIdx.x] = sum;
+#pragma unroll
+    for (unsigned offset = GROUP_SIZE / 2; offset > 0; offset >>= 1) {
+        sum += __shfl_xor(sum, offset, GROUP_SIZE);
+    }
+
+    extern __shared__ float partial[];
+    if (lane == 0) {
+        partial[group] = sum;
+    }
     __syncthreads();
-    // Requires a power-of-two block size so this halves evenly to index 0.
-    for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    for (unsigned stride = num_groups / 2; stride > 0; stride >>= 1) {
         if (threadIdx.x < stride) {
             partial[threadIdx.x] += partial[threadIdx.x + stride];
         }
