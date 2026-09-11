@@ -7,8 +7,8 @@ use std::io::Write;
 
 use clap::Args;
 use rocml::chat::{Message, RenderOpts};
-use rocml::generate::generate_sampled;
-use rocml::RocmlError;
+use rocml::generate::generate_sampled_profiled;
+use rocml::{Profiler, RocmlError};
 
 use crate::common::{self, ModelArgs, SamplingArgs};
 
@@ -33,6 +33,10 @@ pub struct GenerateArgs {
     n: usize,
     #[command(flatten)]
     sampling: SamplingArgs,
+    /// Collect per-op/per-layer roofline instrumentation and print a report
+    /// after generation (see `rocml::profile`).
+    #[arg(long)]
+    profile: bool,
 }
 
 pub fn run(args: &GenerateArgs) -> Result<(), RocmlError> {
@@ -74,13 +78,15 @@ pub fn run(args: &GenerateArgs) -> Result<(), RocmlError> {
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     let sampling = args.sampling.to_sampling_params(spec.map(|s| &s.sampling));
-    let stats = generate_sampled(
+    let profiler = args.profile.then(Profiler::new);
+    let stats = generate_sampled_profiled(
         &mut loaded.model,
         &loaded.tokenizer,
         &prompt_ids,
         args.n,
         true,
         &sampling,
+        profiler.as_ref(),
         |chunk| {
             let _ = lock.write_all(chunk.as_bytes());
             let _ = lock.flush();
@@ -97,6 +103,10 @@ pub fn run(args: &GenerateArgs) -> Result<(), RocmlError> {
         stats.decode_seconds,
         stats.decode_tokens_per_sec(),
     );
+
+    if let Some(profiler) = &profiler {
+        println!("{}", profiler.finish()?.to_human());
+    }
 
     Ok(())
 }

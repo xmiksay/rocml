@@ -4,8 +4,8 @@
 //! greedy keeps every run's token count identical for a clean median.
 
 use clap::Args;
-use rocml::generate::generate_sampled;
-use rocml::{RocmlError, SamplingParams};
+use rocml::generate::generate_sampled_profiled;
+use rocml::{Profiler, RocmlError, SamplingParams};
 use serde_json::json;
 
 use crate::common::{self, ModelArgs};
@@ -20,8 +20,22 @@ pub struct BenchArgs {
     decode_tokens: usize,
     #[arg(long, default_value_t = 3)]
     runs: usize,
+    /// Pre-fill this many synthetic tokens of existing context (through the
+    /// normal prefill path) before measuring decode throughput, instead of
+    /// `--prompt-tokens` — the head-to-head metric vs llama.cpp at a given
+    /// context depth (e.g. `--depth 2048`). Both the prefill-to-depth and
+    /// the subsequent decode rate are reported.
+    #[arg(long)]
+    depth: Option<usize>,
     #[arg(long)]
     json: bool,
+    /// Collect per-op/per-layer roofline instrumentation and print a report
+    /// after the run (see `rocml::profile`). Only the final run is
+    /// profiled — the others still contribute to the tok/s median, but
+    /// profiling every run would mix `--runs` independent sessions' spans
+    /// into one report for no benefit.
+    #[arg(long)]
+    profile: bool,
 }
 
 pub fn run(args: &BenchArgs) -> Result<(), RocmlError> {
@@ -31,33 +45,43 @@ pub fn run(args: &BenchArgs) -> Result<(), RocmlError> {
     let resolved = args.model_args.resolve()?;
     eprintln!("loading {}...", args.model_args.model);
     let mut loaded = common::load(&resolved.path)?;
-    let prompt_ids = synthetic_prompt(&loaded, args.prompt_tokens);
+    let prompt_len = args.depth.unwrap_or(args.prompt_tokens);
+    let prompt_ids = synthetic_prompt(&loaded, prompt_len);
     eprintln!(
-        "loaded: {} layers; benchmarking {} prompt tokens / {} decode tokens x {} run(s)",
+        "loaded: {} layers; benchmarking {} prompt tokens / {} decode tokens x {} run(s){}",
         loaded.model.block_count(),
         prompt_ids.len(),
         args.decode_tokens,
         args.runs,
+        args.depth
+            .map(|d| format!(" (decode measured at depth {d})"))
+            .unwrap_or_default(),
     );
 
     let mut prompt_tps = Vec::with_capacity(args.runs);
     let mut decode_tps = Vec::with_capacity(args.runs);
     let sampling = SamplingParams::greedy();
+    let mut report = None;
     for run_idx in 0..args.runs {
         loaded.model.reset()?;
+        let profiler = (args.profile && run_idx + 1 == args.runs).then(Profiler::new);
         // `stop_on_eos: false` forces exactly `decode_tokens` tokens every
         // run regardless of what the (synthetic, meaningless) filler prompt
         // happens to continue with, so every run measures the same amount
         // of decode work.
-        let stats = generate_sampled(
+        let stats = generate_sampled_profiled(
             &mut loaded.model,
             &loaded.tokenizer,
             &prompt_ids,
             args.decode_tokens,
             false,
             &sampling,
+            profiler.as_ref(),
             |_| {},
         )?;
+        if let Some(p) = &profiler {
+            report = Some(p.finish()?);
+        }
         eprintln!(
             "  run {}/{}: prompt {:.1} tok/s, decode {:.1} tok/s",
             run_idx + 1,
@@ -73,22 +97,32 @@ pub fn run(args: &BenchArgs) -> Result<(), RocmlError> {
     let decode_median = median(&mut decode_tps);
 
     if args.json {
-        println!(
-            "{}",
-            json!({
-                "model": common::model_id(&resolved),
-                "prompt_tokens": prompt_ids.len(),
-                "decode_tokens": args.decode_tokens,
-                "runs": args.runs,
-                "prompt_tokens_per_sec_median": prompt_median,
-                "decode_tokens_per_sec_median": decode_median,
-            })
-        );
+        let mut out = json!({
+            "model": common::model_id(&resolved),
+            "prompt_tokens": prompt_ids.len(),
+            "decode_tokens": args.decode_tokens,
+            "depth": args.depth,
+            "runs": args.runs,
+            "prompt_tokens_per_sec_median": prompt_median,
+            "decode_tokens_per_sec_median": decode_median,
+        });
+        if let Some(report) = &report {
+            out["profile"] =
+                serde_json::to_value(report).unwrap_or_else(|e| json!({"error": e.to_string()}));
+        }
+        println!("{out}");
     } else {
+        let depth_note = args
+            .depth
+            .map(|d| format!(" @ depth {d}"))
+            .unwrap_or_default();
         println!(
-            "prompt: {:.1} tok/s (median of {}); decode: {:.1} tok/s (median of {})",
+            "prompt: {:.1} tok/s (median of {}); decode{depth_note}: {:.1} tok/s (median of {})",
             prompt_median, args.runs, decode_median, args.runs
         );
+        if let Some(report) = &report {
+            println!("{}", report.to_human());
+        }
     }
 
     Ok(())
