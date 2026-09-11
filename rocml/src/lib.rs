@@ -12,9 +12,11 @@ pub mod forward;
 pub mod generate;
 mod model;
 pub mod qwen35;
+pub mod sample;
 pub mod weights;
 
 pub use config::ModelConfig;
 pub use error::RocmlError;
-pub use generate::{generate, GenerateStats};
+pub use generate::{generate, generate_sampled, GenerateStats};
 pub use model::Model;
+pub use sample::{Rng, SamplingParams};

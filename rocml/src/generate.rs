@@ -9,6 +9,7 @@ use rocml_core::tokenizer::BpeTokenizer;
 
 use crate::error::RocmlError;
 use crate::model::Model;
+use crate::sample::{self, Rng, SamplingParams};
 
 #[derive(Debug, Clone, Copy)]
 pub struct GenerateStats {
@@ -53,11 +54,39 @@ pub fn generate(
     prompt_ids: &[u32],
     max_new_tokens: usize,
     stop_on_eos: bool,
+    on_text: impl FnMut(&str),
+) -> Result<GenerateStats, RocmlError> {
+    generate_sampled(
+        model,
+        tokenizer,
+        prompt_ids,
+        max_new_tokens,
+        stop_on_eos,
+        &SamplingParams::greedy(),
+        on_text,
+    )
+}
+
+/// Like [`generate`], but draws each next token via [`sample::sample`]
+/// against `params` instead of always taking the argmax — `params.is_greedy`
+/// (temperature `<= 0`) reduces to exactly the same argmax path `generate`
+/// always used, so this is a strict superset, not a behavior change for
+/// existing greedy callers (the parity fixture tests call `Model` directly,
+/// not this function, so they're unaffected either way).
+pub fn generate_sampled(
+    model: &mut Model,
+    tokenizer: &BpeTokenizer,
+    prompt_ids: &[u32],
+    max_new_tokens: usize,
+    stop_on_eos: bool,
+    params: &SamplingParams,
     mut on_text: impl FnMut(&str),
 ) -> Result<GenerateStats, RocmlError> {
     let eos = tokenizer.eos_token_id;
     let mut pending = Vec::new();
     let mut generated_tokens = 0usize;
+    let mut history: Vec<u32> = prompt_ids.to_vec();
+    let mut rng = Rng::new(params.seed);
 
     let prompt_start = Instant::now();
     let mut logits = Vec::new();
@@ -68,11 +97,12 @@ pub fn generate(
 
     let decode_start = Instant::now();
     while generated_tokens < max_new_tokens && !logits.is_empty() {
-        let next_id = argmax(&logits);
+        let next_id = sample::sample(&logits, &history, params, &mut rng);
         if stop_on_eos && Some(next_id) == eos {
             break;
         }
         push_token_text(tokenizer, next_id, &mut pending, &mut on_text);
+        history.push(next_id);
         generated_tokens += 1;
         logits = model.forward_token(next_id)?;
     }
@@ -85,18 +115,6 @@ pub fn generate(
         prompt_seconds,
         decode_seconds,
     })
-}
-
-fn argmax(logits: &[f32]) -> u32 {
-    let mut best_idx = 0u32;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best_idx = i as u32;
-        }
-    }
-    best_idx
 }
 
 fn push_token_text(
@@ -171,11 +189,5 @@ mod tests {
         let mut out = String::new();
         flush_pending(&mut pending, &mut |s| out.push_str(s));
         assert_eq!(out, "hello");
-    }
-
-    #[test]
-    fn argmax_picks_highest_logit() {
-        assert_eq!(argmax(&[0.1, 5.0, -3.0, 4.9]), 1);
-        assert_eq!(argmax(&[0.0]), 0);
     }
 }
