@@ -1,0 +1,11 @@
+[package]
+name = "rocml-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hand-written HIP kernels for rocml, compiled to code objects at build time"
+
+[dependencies]
+
+[dev-dependencies]
+rocml-hip = { path = "../rocml-hip" }
