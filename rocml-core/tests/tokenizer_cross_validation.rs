@@ -74,9 +74,11 @@ fn glob_one(pattern: &str) -> Option<std::path::PathBuf> {
 /// which is the point of this battery. Special-token handling is checked
 /// separately in `rocml_special_token_is_a_single_id`, against rocml alone.
 ///
-/// Also excludes NFD-decomposed combining-mark text (e.g. "e" + U+0301
-/// instead of precomposed "é") — see `known_gap_no_nfc_normalization`
-/// below for why that one specific shape doesn't match yet.
+/// NFD-decomposed combining-mark text (e.g. "e" + U+0301 instead of
+/// precomposed "é") is exercised separately in
+/// `matches_reference_on_nfd_decomposed_combining_marks` below, alongside
+/// its precomposed counterpart, since the interesting assertion there is
+/// that both spellings now tokenize identically.
 const TRICKY_INPUTS: &[&str] = &[
     "The quick brown fox jumps over the lazy dog.",
     "Příliš žluťoučký kůň úpěl ďábelské ódy",
@@ -115,26 +117,29 @@ fn matches_real_qwen35_tokenizer_json_on_tricky_inputs() {
     }
 }
 
-/// Documents a real, unresolved gap found while building the battery above:
-/// the real `tokenizer.json` configures an NFC `normalizer` (composing
-/// decomposed Unicode — e.g. "e" + combining acute accent U+0301 — into a
-/// single precomposed character, e.g. "é") that `BpeTokenizer` does not
-/// implement. rocml's `[\p{L}\p{M}]+` regex fix correctly *groups* a
-/// decomposed base letter with its combining marks into one pre-token, but
-/// without NFC normalization the resulting byte sequence still isn't the
-/// one the vocab's merges were trained on (which came from NFC-normalized
-/// text), so it falls back to several smaller pieces instead of the single
-/// token the real vocab has for the composed form.
-///
-/// Not fixed here: proper Unicode NFC needs canonical decomposition/
-/// composition and combining-class-reordering tables that are exactly the
-/// kind of thing a hand-rolled implementation gets subtly wrong, and adding
-/// a normalization crate (e.g. `unicode-normalization`) is outside this
-/// milestone's fixed dependency allowlist (memmap2, thiserror, half,
-/// fancy-regex) — flagging for a decision rather than either silently
-/// eating the gap or unilaterally adding a new dependency.
+/// (decomposed, precomposed) pairs: the left spelling uses a base letter
+/// followed by a combining mark, the right spelling is the same text with
+/// that pair canonically composed into one code point. NFC normalization
+/// (mirroring the qwen35 tokenizer.json's `normalizer` stage — see
+/// `BpeTokenizer::encode`) must make both spellings tokenize identically.
+const NFD_DECOMPOSED_INPUTS: &[(&str, &str)] = &[
+    // "e" + combining acute accent (U+0301) -> "é".
+    ("e\u{0301}cole", "école"),
+    // "z" + combining caron (U+030C) -> "ž" ("život" = Czech for "life").
+    ("z\u{030C}ivot", "život"),
+];
+
+/// Was `known_gap_no_nfc_normalization` before `BpeTokenizer::encode` grew
+/// NFC normalization: the real `tokenizer.json` configures an NFC
+/// `normalizer` (composing e.g. "e" + combining acute accent U+0301 into a
+/// single precomposed "é") because its vocab's merges were trained on
+/// NFC-normalized text — a decomposed spelling that skips this step falls
+/// back to several smaller pieces instead of the single token the vocab
+/// has for the composed form. rocml's `[\p{L}\p{M}]+` regex correctly
+/// *groups* a decomposed base letter with its combining marks into one
+/// pre-token, but grouping alone isn't composing; both are required.
 #[test]
-fn known_gap_no_nfc_normalization() {
+fn matches_reference_on_nfd_decomposed_combining_marks() {
     if skip_if_missing(QWEN35_GGUF_PATH) || skip_if_missing(QWEN35_HF_TOKENIZER_PATH) {
         return;
     }
@@ -142,23 +147,29 @@ fn known_gap_no_nfc_normalization() {
     let ours = BpeTokenizer::from_gguf(&gguf).unwrap();
     let reference = Tokenizer::from_file(QWEN35_HF_TOKENIZER_PATH).unwrap();
 
-    // "e" + combining acute accent (U+0301), NOT precomposed "é".
-    let decomposed = "e\u{0301}cole";
-    let got = ours.encode(decomposed);
-    let want = reference
-        .encode(decomposed, false)
-        .unwrap()
-        .get_ids()
-        .to_vec();
-    assert_ne!(
-        got, want,
-        "if this now passes, rocml gained NFC normalization (or the \
-         reference dropped it) — promote this input into TRICKY_INPUTS \
-         and delete this test"
-    );
-    // rocml still round-trips its own tokenization losslessly even though
-    // it disagrees with the reference on how many tokens that should take.
-    assert_eq!(ours.decode(&got), decomposed);
+    for &(decomposed, composed) in NFD_DECOMPOSED_INPUTS {
+        let got = ours.encode(decomposed);
+        let want = reference
+            .encode(decomposed, false)
+            .unwrap_or_else(|e| panic!("reference encode failed for {decomposed:?}: {e}"))
+            .get_ids()
+            .to_vec();
+        assert_eq!(got, want, "token id mismatch for NFD input {decomposed:?}");
+
+        // `encode` NFC-normalizes internally, so decoding yields the
+        // composed spelling, not the original decomposed bytes — expected,
+        // and it matches the reference tokenizer's own (lossy) behavior.
+        assert_eq!(
+            ours.decode(&got),
+            composed,
+            "decode roundtrip for {decomposed:?}"
+        );
+
+        // The decomposed and precomposed spellings must now tokenize
+        // identically, proving NFC normalization actually ran rather than
+        // the regex's `[\p{L}\p{M}]+` grouping happening to line up.
+        assert_eq!(got, ours.encode(composed));
+    }
 }
 
 #[test]

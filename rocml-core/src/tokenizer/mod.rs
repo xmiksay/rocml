@@ -2,10 +2,11 @@
 //! the qwen3.5-family pre-tokenization regex, verified against the real HF
 //! `tokenizer.json` for this model family).
 //!
-//! Pipeline for `encode`: split off special/control tokens first (they must
-//! never be touched by BPE) -> regex pre-tokenize each remaining text run
-//! into "words" -> remap each word's UTF-8 bytes into GPT-2's byte-level
-//! char alphabet -> greedy lowest-rank BPE merge -> vocab lookup.
+//! Pipeline for `encode`: NFC-normalize the input -> split off
+//! special/control tokens (they must never be touched by BPE) -> regex
+//! pre-tokenize each remaining text run into "words" -> remap each word's
+//! UTF-8 bytes into GPT-2's byte-level char alphabet -> greedy lowest-rank
+//! BPE merge -> vocab lookup.
 
 mod bpe;
 mod byte_level;
@@ -17,6 +18,7 @@ pub use error::TokenizerError;
 use std::collections::HashMap;
 
 use fancy_regex::Regex;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::gguf::GgufFile;
 
@@ -127,8 +129,15 @@ impl BpeTokenizer {
     /// catastrophic-backtracking shape) degrades to per-byte fallback
     /// tokens for the unmatched remainder instead of erroring out.
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        // Mirrors the qwen35 tokenizer.json's NFC `normalizer` stage: the
+        // vocab's merges were trained on NFC-normalized text, so e.g. "e" +
+        // combining acute accent (U+0301) must be canonically composed to
+        // "é" *before* special-token splitting and BPE, or it falls back to
+        // several smaller pieces instead of the single token the vocab has
+        // for the composed form.
+        let normalized: String = text.nfc().collect();
         let mut ids = Vec::new();
-        for segment in special::split(text, &self.specials) {
+        for segment in special::split(&normalized, &self.specials) {
             match segment {
                 special::Segment::Special(id) => ids.push(id),
                 special::Segment::Text(chunk) => self.encode_normal_text(chunk, &mut ids),

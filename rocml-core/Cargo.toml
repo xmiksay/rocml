@@ -10,6 +10,7 @@ memmap2 = "0.9"
 thiserror = "1"
 half = "2"
 fancy-regex = "0.19"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 tokenizers = "0.23"
