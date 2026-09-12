@@ -7,10 +7,11 @@
 // (`BlockQ6K.scales: [i8; 16]`, per ggml/candle) — hence `signed char`
 // below; a byte >= 0x80 is a negative scale, not a large positive one.
 //
-// Launch contract (fixed by the host, `rocml::forward::kernels_quant`, not
-// this crate): one workgroup per output row, `REDUCE_BLOCK` (128) threads,
-// power-of-two block size, `blockDim.x * sizeof(float)` bytes of dynamic
-// shared memory.
+// Launch contract: same shape as `gemv_q4_k.hip` — one workgroup per
+// `ROWS_PER_WG` (2) consecutive output rows, `REDUCE_BLOCK` (128) threads,
+// `blockDim.x * ROWS_PER_WG * sizeof(float)` bytes of dynamic shared memory
+// — see that file's comment for the full multi-row rationale (identical
+// here).
 //
 // Occupancy fix: same rationale as `gemv_q4_k.hip`'s original 8-lane-group
 // split — multiple lanes cooperate on one super-block instead of one lane
@@ -48,16 +49,16 @@
 
 extern "C" __global__ void gemv_q6_k(
     const void* w, const float* x, float* y, unsigned m, unsigned n) {
-    unsigned row = blockIdx.x;
-    if (row >= m) {
+    const unsigned ROWS_PER_WG = 2;
+    unsigned row_base = blockIdx.x * ROWS_PER_WG;
+    if (row_base >= m) {
         return;
     }
 
     const unsigned qk = 256;
     const unsigned block_bytes = 210;
     unsigned blocks_per_row = n / qk;
-    const unsigned char* row_ptr =
-        (const unsigned char*)w + (size_t)row * blocks_per_row * block_bytes;
+    const unsigned char* w_bytes = (const unsigned char*)w;
 
     // See the file comment for why Q6_K needs a full wavefront (32 lanes)
     // per super-block instead of Q4_K/Q5_K's 8.
@@ -66,15 +67,13 @@ extern "C" __global__ void gemv_q6_k(
     const unsigned group = threadIdx.x / GROUP_SIZE;
     const unsigned num_groups = blockDim.x / GROUP_SIZE;
 
-    float sum = 0.0f;
+    float sum[ROWS_PER_WG];
+#pragma unroll
+    for (unsigned r = 0; r < ROWS_PER_WG; ++r) {
+        sum[r] = 0.0f;
+    }
+
     for (unsigned blk = group; blk < blocks_per_row; blk += num_groups) {
-        const unsigned char* bptr = row_ptr + (size_t)blk * block_bytes;
-        const unsigned char* ql_full = bptr;
-        const unsigned char* qh_full = bptr + 128;
-        const signed char* sc_full = (const signed char*)(bptr + 192);
-        __half d_h;
-        std::memcpy(&d_h, bptr + 208, sizeof(__half));
-        float d = __half2float(d_h);
         const float* xs = x + (size_t)blk * qk;
 
         unsigned half_idx = lane / 16;
@@ -84,58 +83,85 @@ extern "C" __global__ void gemv_q6_k(
         // per-lane constant instead of a per-iteration branch.
         unsigned l_quarter = lane & 3;
         unsigned l_half = l_quarter / 2;
-        const unsigned char* ql = ql_full + 64 * half_idx;
-        const unsigned char* qh = qh_full + 32 * half_idx;
-        const signed char* sc = sc_full + 8 * half_idx;
         const float* xh = xs + 128 * half_idx + 32 * out_group + 8 * l_quarter;
 
         // out_group in {0,1,2,3} = ggml's q1..q4: q{1,3} read ql[l]'s
         // low/high nibble, q{2,4} read ql[l+32]'s; the qh shift and scale
-        // index both step by 2 per out_group. `scale` is constant across
-        // this lane's loop, so `d * scale` is hoisted out of it.
+        // index both step by 2 per out_group.
         unsigned ql_off = (out_group & 1) * 32;
         bool high_nibble = out_group >= 2;
         unsigned qh_shift = out_group * 2;
-        float dscale = d * (float)sc[l_half + out_group * 2];
-
-        // See the file comment: `ql_idx = l_quarter*8 + l` is 8 consecutive
-        // byte offsets as `l` runs 0..7, so both code planes are read once
-        // each as a wide 8-byte load instead of 8 single-byte loads.
+        unsigned sc_idx = l_half + out_group * 2;
         unsigned ql_idx0 = l_quarter * 8;
-        unsigned long long ql_word, qh_word;
-        std::memcpy(&ql_word, ql + ql_off + ql_idx0, sizeof(ql_word));
-        std::memcpy(&qh_word, qh + ql_idx0, sizeof(qh_word));
 
-        float local = 0.0f;
 #pragma unroll
-        for (unsigned l = 0; l < 8; ++l) {
-            unsigned char qlb = (unsigned char)(ql_word >> (8 * l));
-            unsigned char qhb = (unsigned char)(qh_word >> (8 * l));
-            int nib = high_nibble ? (qlb >> 4) : (qlb & 0xF);
-            int qv = (nib | (((qhb >> qh_shift) & 3) << 4)) - 32;
-            local += dscale * (float)qv * xh[l];
+        for (unsigned r = 0; r < ROWS_PER_WG; ++r) {
+            unsigned row = min(row_base + r, m - 1);
+            const unsigned char* bptr = w_bytes +
+                (size_t)row * blocks_per_row * block_bytes + (size_t)blk * block_bytes;
+            const unsigned char* ql_full = bptr;
+            const unsigned char* qh_full = bptr + 128;
+            const signed char* sc_full = (const signed char*)(bptr + 192);
+            __half d_h;
+            std::memcpy(&d_h, bptr + 208, sizeof(__half));
+            float d = __half2float(d_h);
+
+            const unsigned char* ql = ql_full + 64 * half_idx;
+            const unsigned char* qh = qh_full + 32 * half_idx;
+            const signed char* sc = sc_full + 8 * half_idx;
+            float dscale = d * (float)sc[sc_idx];
+
+            // See the file comment: 8 consecutive bytes per lane, one wide
+            // load each instead of 8 single-byte loads.
+            unsigned long long ql_word, qh_word;
+            std::memcpy(&ql_word, ql + ql_off + ql_idx0, sizeof(ql_word));
+            std::memcpy(&qh_word, qh + ql_idx0, sizeof(qh_word));
+
+            float local = 0.0f;
+#pragma unroll
+            for (unsigned l = 0; l < 8; ++l) {
+                unsigned char qlb = (unsigned char)(ql_word >> (8 * l));
+                unsigned char qhb = (unsigned char)(qh_word >> (8 * l));
+                int nib = high_nibble ? (qlb >> 4) : (qlb & 0xF);
+                int qv = (nib | (((qhb >> qh_shift) & 3) << 4)) - 32;
+                local += dscale * (float)qv * xh[l];
+            }
+            sum[r] += local;
         }
-        sum += local;
     }
 
 #pragma unroll
-    for (unsigned offset = GROUP_SIZE / 2; offset > 0; offset >>= 1) {
-        sum += __shfl_xor(sum, offset, GROUP_SIZE);
+    for (unsigned r = 0; r < ROWS_PER_WG; ++r) {
+#pragma unroll
+        for (unsigned offset = GROUP_SIZE / 2; offset > 0; offset >>= 1) {
+            sum[r] += __shfl_xor(sum[r], offset, GROUP_SIZE);
+        }
     }
 
     extern __shared__ float partial[];
     if (lane == 0) {
-        partial[group] = sum;
+#pragma unroll
+        for (unsigned r = 0; r < ROWS_PER_WG; ++r) {
+            partial[r * blockDim.x + group] = sum[r];
+        }
     }
     __syncthreads();
     for (unsigned stride = num_groups / 2; stride > 0; stride >>= 1) {
         if (threadIdx.x < stride) {
-            partial[threadIdx.x] += partial[threadIdx.x + stride];
+#pragma unroll
+            for (unsigned r = 0; r < ROWS_PER_WG; ++r) {
+                partial[r * blockDim.x + threadIdx.x] += partial[r * blockDim.x + threadIdx.x + stride];
+            }
         }
         __syncthreads();
     }
 
     if (threadIdx.x == 0) {
-        y[row] = partial[0];
+#pragma unroll
+        for (unsigned r = 0; r < ROWS_PER_WG; ++r) {
+            if (row_base + r < m) {
+                y[row_base + r] = partial[r * blockDim.x];
+            }
+        }
     }
 }

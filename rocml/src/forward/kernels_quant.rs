@@ -51,6 +51,19 @@ const GEMM_WMMA_K_STAGE: u32 = 16;
 /// Warps per `gemm_xwt_wmma_q*` workgroup — fixes the launch's block.y.
 const GEMM_WMMA_WARPS_PER_BLOCK: u32 = 16;
 
+/// Output rows one `gemv_q*` workgroup owns — mirrors every `gemv_q*.hip`
+/// kernel's `ROWS_PER_WG` (fixes the launch's `grid.x` and dynamic shared
+/// memory request). See `gemv_q4_k.hip`'s module doc for why: at the
+/// smallest served `m` (4096), one row per workgroup left each workgroup's
+/// whole lifetime as a single iteration of uncovered memory latency, and 2
+/// independent per-lane weight loads per iteration gives the scheduler
+/// something to overlap that latency with instead — measured (not assumed)
+/// as the best of {1,2,4,8} across both the isolated kernel microbench and
+/// real end-to-end decode tok/s; 4 and 8 look better in isolation on the
+/// largest shapes but cost more on the smallest ones (register pressure)
+/// and lose overall.
+const GEMV_ROWS_PER_WG: u32 = 2;
+
 pub(crate) struct QuantKernels {
     _mod_q8_0: Module,
     q8_0_fn: rocml_hip::Function,
@@ -184,14 +197,15 @@ impl QuantKernels {
             }
         };
         let cfg = LaunchConfig {
-            grid: (m, 1, 1),
+            grid: (m.div_ceil(GEMV_ROWS_PER_WG), 1, 1),
             block: (REDUCE_BLOCK, 1, 1),
-            shared_mem_bytes: REDUCE_BLOCK * size_of::<f32>() as u32,
+            shared_mem_bytes: REDUCE_BLOCK * GEMV_ROWS_PER_WG * size_of::<f32>() as u32,
         };
         let mut params = kernel_params!(w, x, y, m, n);
         // SAFETY: params matches every gemv_<quant>'s signature (const
         // void*, const float*, float*, unsigned, unsigned); block size is
-        // the required power of two.
+        // the required power of two, and grid/shared-mem match every
+        // gemv_q*.hip kernel's `ROWS_PER_WG`-rows-per-workgroup contract.
         unsafe { function.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 

@@ -314,9 +314,15 @@ pub fn run_gemm_wmma_kernel(
     actual
 }
 
+/// Rows per workgroup every `gemv_q*.hip` kernel now owns — must match each
+/// kernel's own `ROWS_PER_WG` constant and `rocml`'s `GEMV_ROWS_PER_WG` (not
+/// exposed to this crate, so duplicated here, same as `BLOCK` below).
+pub const GEMV_ROWS_PER_WG: u32 = 2;
+
 /// Uploads `w_bytes`/`x`, launches `kernel_name` from `hsaco` as
 /// `gemv_<type>(const void* w, const float* x, float* y, unsigned m, unsigned n)`
-/// with one 128-thread workgroup per output row, and downloads `y`.
+/// with one 128-thread workgroup per `GEMV_ROWS_PER_WG` output rows, and
+/// downloads `y`.
 pub fn run_gemv_kernel(
     hsaco: &[u8],
     kernel_name: &str,
@@ -344,9 +350,9 @@ pub fn run_gemv_kernel(
 
     let block = 128u32;
     let cfg = LaunchConfig {
-        grid: (m, 1, 1),
+        grid: (m.div_ceil(GEMV_ROWS_PER_WG), 1, 1),
         block: (block, 1, 1),
-        shared_mem_bytes: block * std::mem::size_of::<f32>() as u32,
+        shared_mem_bytes: block * GEMV_ROWS_PER_WG * std::mem::size_of::<f32>() as u32,
     };
     // SAFETY: params matches every gemv_<type> kernel's parameter list
     // (const void*, const float*, float*, unsigned, unsigned) in order, and

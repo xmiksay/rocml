@@ -4,9 +4,12 @@
 // exactly: `(qs[i] as i8) as f32 * d`.
 //
 // Launch contract (fixed by the host, `rocml::forward::kernels_quant`, not
-// this crate): one workgroup per output row, `REDUCE_BLOCK` (128) threads,
-// power-of-two block size, `blockDim.x * sizeof(float)` bytes of dynamic
-// shared memory.
+// this crate): one workgroup per `ROWS_PER_WG` (2) consecutive output rows,
+// `REDUCE_BLOCK` (128) threads, power-of-two block size,
+// `blockDim.x * ROWS_PER_WG * sizeof(float)` bytes of dynamic shared memory
+// — see `gemv_q4_k.hip`'s file comment for the full multi-row rationale
+// (identical here: `x`/scale-independent quantities computed once per `blk`
+// iteration and reused across `ROWS_PER_WG` independent weight loads).
 //
 // Occupancy: Q8_0's 32-wide blocks already give one-lane-per-block full
 // occupancy at n>=4096 (blocks_per_row=n/32>=128=blockDim.x) — the issue
@@ -27,8 +30,9 @@
 
 extern "C" __global__ void gemv_q8_0(
     const void* w, const float* x, float* y, unsigned m, unsigned n) {
-    unsigned row = blockIdx.x;
-    if (row >= m) {
+    const unsigned ROWS_PER_WG = 2;
+    unsigned row_base = blockIdx.x * ROWS_PER_WG;
+    if (row_base >= m) {
         return;
     }
 
@@ -37,53 +41,79 @@ extern "C" __global__ void gemv_q8_0(
     const unsigned GROUP_SIZE = 4;
     const unsigned chunk = qk / GROUP_SIZE;
     unsigned blocks_per_row = n / qk;
-    const unsigned char* row_ptr =
-        (const unsigned char*)w + (size_t)row * blocks_per_row * block_bytes;
+    const unsigned char* w_bytes = (const unsigned char*)w;
 
     const unsigned lane = threadIdx.x % GROUP_SIZE;
     const unsigned group = threadIdx.x / GROUP_SIZE;
     const unsigned num_groups = blockDim.x / GROUP_SIZE;
 
-    float sum = 0.0f;
+    float sum[ROWS_PER_WG];
+#pragma unroll
+    for (unsigned r = 0; r < ROWS_PER_WG; ++r) {
+        sum[r] = 0.0f;
+    }
+
     for (unsigned blk = group; blk < blocks_per_row; blk += num_groups) {
-        const unsigned char* bptr = row_ptr + (size_t)blk * block_bytes;
-        // d is 2-byte-aligned (block_bytes is even) but not 4-byte-aligned in
-        // general, so read it via memcpy rather than a typed pointer cast.
-        __half d_h;
-        std::memcpy(&d_h, bptr, sizeof(__half));
-        float d = __half2float(d_h);
-        const signed char* qs = (const signed char*)(bptr + 2) + lane * chunk;
         const float* xs = x + (size_t)blk * qk + lane * chunk;
 
-        // d factors out of the block's dot product (distributivity over the
-        // sum), so it's applied once per block instead of per element —
-        // same result as rocml-core's per-element `q as f32 * d`, fewer flops.
-        float local = 0.0f;
 #pragma unroll
-        for (unsigned i = 0; i < chunk; ++i) {
-            local += (float)qs[i] * xs[i];
+        for (unsigned r = 0; r < ROWS_PER_WG; ++r) {
+            unsigned row = min(row_base + r, m - 1);
+            const unsigned char* bptr =
+                w_bytes + (size_t)row * blocks_per_row * block_bytes + (size_t)blk * block_bytes;
+            // d is 2-byte-aligned (block_bytes is even) but not 4-byte-aligned
+            // in general, so read it via memcpy rather than a typed pointer
+            // cast.
+            __half d_h;
+            std::memcpy(&d_h, bptr, sizeof(__half));
+            float d = __half2float(d_h);
+            const signed char* qs = (const signed char*)(bptr + 2) + lane * chunk;
+
+            // d factors out of the block's dot product (distributivity over
+            // the sum), so it's applied once per block instead of per
+            // element — same result as rocml-core's per-element
+            // `q as f32 * d`, fewer flops.
+            float local = 0.0f;
+#pragma unroll
+            for (unsigned i = 0; i < chunk; ++i) {
+                local += (float)qs[i] * xs[i];
+            }
+            sum[r] += d * local;
         }
-        sum += d * local;
     }
 
 #pragma unroll
-    for (unsigned offset = GROUP_SIZE / 2; offset > 0; offset >>= 1) {
-        sum += __shfl_xor(sum, offset, GROUP_SIZE);
+    for (unsigned r = 0; r < ROWS_PER_WG; ++r) {
+#pragma unroll
+        for (unsigned offset = GROUP_SIZE / 2; offset > 0; offset >>= 1) {
+            sum[r] += __shfl_xor(sum[r], offset, GROUP_SIZE);
+        }
     }
 
     extern __shared__ float partial[];
     if (lane == 0) {
-        partial[group] = sum;
+#pragma unroll
+        for (unsigned r = 0; r < ROWS_PER_WG; ++r) {
+            partial[r * blockDim.x + group] = sum[r];
+        }
     }
     __syncthreads();
     for (unsigned stride = num_groups / 2; stride > 0; stride >>= 1) {
         if (threadIdx.x < stride) {
-            partial[threadIdx.x] += partial[threadIdx.x + stride];
+#pragma unroll
+            for (unsigned r = 0; r < ROWS_PER_WG; ++r) {
+                partial[r * blockDim.x + threadIdx.x] += partial[r * blockDim.x + threadIdx.x + stride];
+            }
         }
         __syncthreads();
     }
 
     if (threadIdx.x == 0) {
-        y[row] = partial[0];
+#pragma unroll
+        for (unsigned r = 0; r < ROWS_PER_WG; ++r) {
+            if (row_base + r < m) {
+                y[row_base + r] = partial[r * blockDim.x];
+            }
+        }
     }
 }
