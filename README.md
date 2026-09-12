@@ -85,7 +85,7 @@ decode ffn-gate-up: 37.0% of decode time, 238.4 GB/s (38.2% of BW roofline), 59.
 ...
 ```
 
-Profiling is opt-in and costs nothing when off: every instrumented call site is `Profiler::scope(prof, ..., || { ... })`, a plain function call when `prof` is `None`. When on, per-op HIP events are recorded through the whole run and only synchronized once at the end (`Profiler::finish`), not inside the hot loop — see `rocml/src/profile/mod.rs`'s doc comment for the full design, including why a long `--depth` prefill times each layer as one coarse span instead of per-op (bounding event count) while decode keeps full per-op granularity. Byte/FLOP counts are analytical (weight sizes, KV/state sizes, dtype-aware), not measured — see `rocml/src/profile/cost.rs`.
+Profiling is opt-in and costs nothing when off: every instrumented call site is `Profiler::scope(prof, ..., || { ... })`, a plain function call when `prof` is `None`. When on, per-op HIP events are recorded through the whole run and only synchronized once at the end (`Profiler::finish`), not inside the hot loop — see `rocml/src/profile/mod.rs`'s doc comment for the full design. The qwen35 hybrid architecture's prompt phase runs through a batched, chunked forward pass (issue #6) with full per-op granularity, one event set per chunk; the dense Qwen3 architecture's still-token-serial prefill instead times each layer as one coarse span (bounding event count at a long `--depth`). Decode keeps full per-op granularity on both architectures. Byte/FLOP counts are analytical (weight sizes, KV/state sizes, dtype-aware), not measured — see `rocml/src/profile/cost.rs`.
 
 ## rocml-serve
 
