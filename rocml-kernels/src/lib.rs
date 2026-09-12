@@ -196,3 +196,17 @@ pub const ATTN_PREFILL_F32_KERNEL: &str = "attn_prefill_f32";
 /// f16-KV-cache sibling of `attn_prefill_f32` (issue #3's default KV dtype).
 pub const ATTN_PREFILL_F16_HSACO: &[u8] = ATTN_PREFILL_F32_HSACO;
 pub const ATTN_PREFILL_F16_KERNEL: &str = "attn_prefill_f16";
+
+/// `kernels/kv_quant.hip`: quantize-on-evict for the KIVI-style mixed KV
+/// cache (issue #2) — one batch launch per evicted `WINDOW_LEN`-position
+/// block. K is per-channel Q8 (`quantize_evict_k_f16_to_q8`, block =
+/// `[head_dim, 1, 1]`, grid = `[n_kv_heads, 1, 1]`); V is per-token, either
+/// Q8 or Q4-packed (`quantize_evict_v_f16_to_q{8,4}`, block = `[32, 1, 1]`,
+/// grid = `[n_kv_heads, window_len, 1]`). All three share one code object.
+pub const QUANTIZE_EVICT_K_Q8_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/kv_quant.hsaco"));
+pub const QUANTIZE_EVICT_K_Q8_KERNEL: &str = "quantize_evict_k_f16_to_q8";
+pub const QUANTIZE_EVICT_V_Q8_HSACO: &[u8] = QUANTIZE_EVICT_K_Q8_HSACO;
+pub const QUANTIZE_EVICT_V_Q8_KERNEL: &str = "quantize_evict_v_f16_to_q8";
+pub const QUANTIZE_EVICT_V_Q4_HSACO: &[u8] = QUANTIZE_EVICT_K_Q8_HSACO;
+pub const QUANTIZE_EVICT_V_Q4_KERNEL: &str = "quantize_evict_v_f16_to_q4";
