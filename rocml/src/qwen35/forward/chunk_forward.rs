@@ -16,10 +16,13 @@ use crate::qwen35::config::LayerKind;
 use crate::qwen35::weights::LayerWeights;
 
 /// Prompt-chunk size `generate` drives the hybrid forward pass with, chosen
-/// by measurement among {128, 256, 512} on Ornith-1.0-9B/Qwen3.5-2B (see
-/// issue #6's report) — 256 balanced the per-launch overhead a smaller chunk
-/// pays against the larger chunk's bigger (wasted) tail-of-prompt padding.
-pub const PREFILL_CHUNK_SIZE: u32 = 256;
+/// by measurement among {128, 256, 512} on Qwen3.5-2B `bench --depth 2048`
+/// (see issue #6's report): 246/241/239 tok/s respectively — a small but
+/// consistent edge for the smallest chunk, since this GEMM/GDN-chunk-kernel
+/// implementation isn't yet compute-bound enough at these depths for a
+/// bigger chunk's better per-launch amortization to outweigh its slightly
+/// larger constant-ish per-token kernel overhead.
+pub const PREFILL_CHUNK_SIZE: u32 = 128;
 
 impl Model {
     /// Splits `prompt_ids` (non-empty) into `PREFILL_CHUNK_SIZE`-token
