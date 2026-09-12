@@ -105,6 +105,44 @@ pub fn gdn_recur_flops(num_v_heads: u32, head_k_dim: u32, head_v_dim: u32) -> u6
     state_elems * 6
 }
 
+/// The chunkwise (blocked delta-rule) recurrence's dominant traffic: per
+/// head, ~8 `[tile, head_dim]`-shaped scratch matrices (q/k-norm, k_beta,
+/// new_values, k_cumdecay, v_new) each written once and read back roughly
+/// once, plus the two `[tile, tile]` matrices (kb/Tinv, kq) — see
+/// `gdn_chunkwise.rs`/`kernels/gdn_chunkwise.hip` for the actual buffer
+/// list this approximates.
+pub fn gdn_chunkwise_bytes(
+    num_v_heads: u32,
+    tile_len: u32,
+    head_k_dim: u32,
+    head_v_dim: u32,
+) -> u64 {
+    let t = tile_len as u64;
+    let s = head_k_dim.max(head_v_dim) as u64;
+    let cc = t * t * F32 * 2; // write + read, per [tile,tile] matrix
+    let cs = t * s * F32 * 2; // write + read, per [tile,head_dim] matrix
+    num_v_heads as u64 * (2 * cc + 6 * cs)
+}
+
+/// The chunkwise recurrence's useful FLOPs: per head, four `tile x tile x
+/// head_dim` matmul-shaped stages (kb, kq, new_values, k_cumdecay — the
+/// intra-chunk UT-transform machinery) plus four `tile x head_k_dim x
+/// head_v_dim` stages (v_new, the output's two terms, the state update).
+/// Both `head_k_dim`/`head_v_dim` collapse to their max since every model
+/// this codebase loads has them equal.
+pub fn gdn_chunkwise_flops(
+    num_v_heads: u32,
+    tile_len: u32,
+    head_k_dim: u32,
+    head_v_dim: u32,
+) -> u64 {
+    let t = tile_len as u64;
+    let s = head_k_dim.max(head_v_dim) as u64;
+    let intra = 4 * t * t * s * 2;
+    let cross = 4 * t * s * s * 2;
+    num_v_heads as u64 * (intra + cross)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

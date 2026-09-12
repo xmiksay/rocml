@@ -1,17 +1,16 @@
 //! One Gated Delta Net layer's chunked-prefill step: batched input
 //! projections (`LinearWeight::matmul`), the batched causal conv1d+SiLU
-//! kernel, the batched gate kernel, and the batched recurrence kernel (which
-//! also fuses in the per-head L2 norm — see `kernels/gdn_chunk.hip`'s doc
-//! comment) — the chunked sibling of `gdn::gdn_layer_step`, processing
-//! `chunk_len` tokens in one pass through each kernel. See issue #6.
-//!
-//! `L2_NORM_EPS` mirrors `gdn.rs`'s own constant (Crane's hardcoded `1e-6`,
-//! independent of `rms_eps`) — duplicated rather than shared across the two
-//! sibling step modules to keep each one self-contained (a one-`const` diff
-//! isn't worth a shared-constants module for).
+//! kernel, the batched gate kernel, and the chunkwise (blocked delta-rule)
+//! recurrence pipeline (`gdn_chunkwise::gdn_chunkwise_step`, issue #6's
+//! chunkwise rewrite — see that module's and `kernels/gdn_chunkwise.hip`'s
+//! doc comments for the algebra and per-head L2-norm derivation) — the
+//! chunked sibling of `gdn::gdn_layer_step`, processing `chunk_len` tokens
+//! in one pass through each stage.
 
 use super::chunk_kernels::ChunkKernels;
 use super::chunk_scratch::ChunkScratch;
+use super::gdn_chunkwise::gdn_chunkwise_step;
+use super::gdn_chunkwise_kernels::GdnChunkwiseKernels;
 use crate::error::RocmlError;
 use crate::forward::kernels::{offset, Kernels};
 use crate::profile::{self, OpKind, Profiler};
@@ -19,12 +18,11 @@ use crate::qwen35::cache::GdnLayerState;
 use crate::qwen35::config::{GdnConfig, Qwen35Config};
 use crate::qwen35::weights::GdnLayerWeights;
 
-const L2_NORM_EPS: f32 = 1e-6;
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gdn_chunk_step(
     kernels: &Kernels,
     chunk: &ChunkKernels,
+    cw: &GdnChunkwiseKernels,
     config: &Qwen35Config,
     layer: &GdnLayerWeights,
     state: &mut GdnLayerState,
@@ -117,34 +115,27 @@ pub(crate) fn gdn_chunk_step(
         },
     )?;
 
-    let recur_bytes = profile::gdn_recur_bytes(gdn.num_v_heads, gdn.head_k_dim, gdn.head_v_dim)
-        + profile::norm_bytes(chunk_len * gdn.num_k_heads, gdn.head_k_dim) * 2;
-    let recur_flops = profile::gdn_recur_flops(gdn.num_v_heads, gdn.head_k_dim, gdn.head_v_dim)
-        * chunk_len as u64
-        + profile::norm_flops(chunk_len * gdn.num_k_heads, gdn.head_k_dim) * 2;
+    // Cost formulas are quadratic in the tile size, so approximate with one
+    // `GDN_RECUR_TILE`-sized tile's cost times the tile count rather than
+    // `chunk_len` directly — exact when `chunk_len <= GDN_RECUR_TILE` (every
+    // current caller), a slight over-count on a hypothetical bigger request.
+    let tiles = chunk_len
+        .div_ceil(super::chunk_scratch::GDN_RECUR_TILE)
+        .max(1);
+    let tile_len = chunk_len.min(super::chunk_scratch::GDN_RECUR_TILE);
+    let recur_bytes =
+        profile::gdn_chunkwise_bytes(gdn.num_v_heads, tile_len, gdn.head_k_dim, gdn.head_v_dim)
+            * tiles as u64;
+    let recur_flops =
+        profile::gdn_chunkwise_flops(gdn.num_v_heads, tile_len, gdn.head_k_dim, gdn.head_v_dim)
+            * tiles as u64;
     Profiler::scope(
         prof,
         layer_idx,
         OpKind::GdnRecur,
         recur_bytes,
         recur_flops,
-        || {
-            chunk.gdn_recurrence_chunk(
-                offset(&state.state, 0),
-                offset(&scratch.gdn_conv_out, 0),
-                offset(&scratch.gdn_beta, 0),
-                offset(&scratch.gdn_g, 0),
-                offset(&scratch.gdn_y, 0),
-                gdn.num_v_heads,
-                gdn.num_k_heads,
-                gdn.head_k_dim,
-                gdn.head_v_dim,
-                gdn.conv_dim,
-                gdn.key_dim,
-                chunk_len,
-                L2_NORM_EPS,
-            )
-        },
+        || gdn_chunkwise_step(cw, gdn, state, scratch, chunk_len),
     )?;
 
     let out_bytes = profile::norm_bytes(chunk_len * gdn.num_v_heads, gdn.head_v_dim)

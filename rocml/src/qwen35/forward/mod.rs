@@ -12,6 +12,8 @@ mod ffn;
 mod ffn_chunk;
 mod gdn;
 mod gdn_chunk;
+mod gdn_chunkwise;
+mod gdn_chunkwise_kernels;
 mod kernels;
 pub(crate) mod kernels_mixed;
 mod scratch;
@@ -21,6 +23,7 @@ use std::path::Path;
 
 use chunk_kernels::ChunkKernels;
 use chunk_scratch::ChunkScratch;
+use gdn_chunkwise_kernels::GdnChunkwiseKernels;
 use kernels::HybridKernels;
 use kernels_mixed::MixedKernels;
 use rocml_core::gguf::GgufFile;
@@ -54,6 +57,9 @@ pub struct Model {
     /// (the same way `scratch`/`hybrid` always are), since the public API
     /// always processes the prompt in chunks (see `crate::generate`).
     chunk_kernels: ChunkKernels,
+    /// Chunkwise (blocked delta-rule) GDN recurrence kernels — see
+    /// `gdn_chunkwise.rs`. Loaded unconditionally alongside `chunk_kernels`.
+    gdn_cw_kernels: GdnChunkwiseKernels,
     chunk_scratch: ChunkScratch,
     pos: u32,
 }
@@ -125,6 +131,7 @@ impl Model {
         let mixed_kernels = MixedKernels::load_all()?;
         let scratch = Scratch::new(&config)?;
         let chunk_kernels = ChunkKernels::load_all()?;
+        let gdn_cw_kernels = GdnChunkwiseKernels::load_all()?;
         let chunk_scratch = ChunkScratch::new(&config)?;
 
         Ok(Self {
@@ -137,6 +144,7 @@ impl Model {
             mixed_kernels,
             scratch,
             chunk_kernels,
+            gdn_cw_kernels,
             chunk_scratch,
             pos: 0,
         })

@@ -114,6 +114,7 @@ impl Model {
                     gdn_chunk_step(
                         &self.kernels,
                         &self.chunk_kernels,
+                        &self.gdn_cw_kernels,
                         &self.config,
                         gdn_weights,
                         state,

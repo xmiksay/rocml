@@ -14,6 +14,18 @@ use crate::error::RocmlError;
 /// measurement among {128, 256, 512} — see `generate::prefill_chunk_size`.
 pub const CHUNK_CAP: u32 = 512;
 
+/// Upper bound on one chunkwise-recurrence *tile* (`gdn_chunkwise.rs`
+/// sub-chunks any `chunk_len > GDN_RECUR_TILE` into tiles this size, run in
+/// sequence, carrying state between them) — capped at 128 because the
+/// per-head triangular-inverse kernel needs a whole `tile x tile` f32
+/// matrix in LDS, and gfx1101's dynamic shared memory budget is 64KB
+/// (`128*128*4 == 65536`). In practice `chunk_len` is always
+/// `PREFILL_CHUNK_SIZE` (128) or less already, so this sub-chunking loop
+/// never actually iterates more than once — it exists so `forward_chunk`'s
+/// documented `1..=CHUNK_CAP` contract stays true rather than silently
+/// assuming its one current caller's chunk size forever.
+pub const GDN_RECUR_TILE: u32 = 128;
+
 pub struct ChunkScratch {
     pub x: DeviceBuffer<f32>,
     pub xn: DeviceBuffer<f32>,
@@ -32,6 +44,19 @@ pub struct ChunkScratch {
     pub gdn_g: DeviceBuffer<f32>,
     pub gdn_y: DeviceBuffer<f32>,
     pub gdn_out: DeviceBuffer<f32>,
+
+    // Chunkwise gated-delta-rule recurrence scratch (`gdn_chunkwise.rs`),
+    // sized for one `GDN_RECUR_TILE`-token tile — head-major (see
+    // `kernels/gdn_chunkwise.hip`'s module doc for why): `[num_v_heads,
+    // tile, head_k_dim]`/`[num_v_heads, tile, head_v_dim]` unless noted.
+    pub gdn_cw_q_norm: DeviceBuffer<f32>,
+    pub gdn_cw_k_norm: DeviceBuffer<f32>,
+    pub gdn_cw_k_beta: DeviceBuffer<f32>,
+    pub gdn_cw_g_cum: DeviceBuffer<f32>, // [num_v_heads, tile]
+    pub gdn_cw_cum_decay_exp: DeviceBuffer<f32>, // [num_v_heads, tile]
+    pub gdn_cw_kb: DeviceBuffer<f32>,    // [num_v_heads, tile, tile] (becomes Tinv in place)
+    pub gdn_cw_kq: DeviceBuffer<f32>,    // [num_v_heads, tile, tile]
+    pub gdn_cw_v_new: DeviceBuffer<f32>,
 
     // Full-attention layer scratch, `[CHUNK_CAP, ...]`.
     pub attn_q_raw: DeviceBuffer<f32>,
@@ -57,6 +82,9 @@ impl ChunkScratch {
         let conv_dim = gdn.conv_dim as usize;
         let value_dim = gdn.value_dim as usize;
         let num_v_heads = gdn.num_v_heads as usize;
+        let head_k_dim = gdn.head_k_dim as usize;
+        let head_v_dim = gdn.head_v_dim as usize;
+        let tile = GDN_RECUR_TILE as usize;
         let q_dim = config.q_dim() as usize;
         let kv_dim = config.kv_dim() as usize;
         let ffn = config.feed_forward_length as usize;
@@ -76,6 +104,15 @@ impl ChunkScratch {
             gdn_g: DeviceBuffer::new(cap * num_v_heads)?,
             gdn_y: DeviceBuffer::new(cap * value_dim)?,
             gdn_out: DeviceBuffer::new(cap * hidden)?,
+
+            gdn_cw_q_norm: DeviceBuffer::new(tile * head_k_dim * num_v_heads)?,
+            gdn_cw_k_norm: DeviceBuffer::new(tile * head_k_dim * num_v_heads)?,
+            gdn_cw_k_beta: DeviceBuffer::new(tile * head_k_dim * num_v_heads)?,
+            gdn_cw_g_cum: DeviceBuffer::new(tile * num_v_heads)?,
+            gdn_cw_cum_decay_exp: DeviceBuffer::new(tile * num_v_heads)?,
+            gdn_cw_kb: DeviceBuffer::new(tile * tile * num_v_heads)?,
+            gdn_cw_kq: DeviceBuffer::new(tile * tile * num_v_heads)?,
+            gdn_cw_v_new: DeviceBuffer::new(tile * head_v_dim * num_v_heads)?,
 
             attn_q_raw: DeviceBuffer::new(cap * 2 * q_dim)?,
             attn_q: DeviceBuffer::new(cap * q_dim)?,

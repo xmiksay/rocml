@@ -1,13 +1,12 @@
 //! Typed launch helpers for the chunked-prefill-only kernels: the batched
-//! GDN conv1d/recurrence chunk kernels (`kernels/gdn_chunk.hip`) and the
-//! small reshape/broadcast kernels a T-token chunk needs that a single
-//! decode step didn't — per-head extraction, batched KV-cache append, and
-//! the GDN gate's per-token broadcast (`kernels/chunk_reshape.hip`). Split
-//! out of `kernels.rs` (which already sits close to the workspace's 400-line
-//! cap) so the decode-step and chunk-step kernel sets stay in their own
-//! files.
-
-use std::mem::size_of;
+//! GDN conv1d chunk kernel (`kernels/gdn_chunk.hip` — the recurrence's
+//! chunk kernel that used to live here moved to `gdn_chunkwise_kernels.rs`,
+//! see that module's doc comment) and the small reshape/broadcast kernels a
+//! T-token chunk needs that a single decode step didn't — per-head
+//! extraction, batched KV-cache append, and the GDN gate's per-token
+//! broadcast (`kernels/chunk_reshape.hip`). Split out of `kernels.rs`
+//! (which already sits close to the workspace's 400-line cap) so the
+//! decode-step and chunk-step kernel sets stay in their own files.
 
 use rocml_hip::{kernel_params, LaunchConfig, Module};
 
@@ -19,8 +18,6 @@ const LINEAR_BLOCK: u32 = 256;
 pub struct ChunkKernels {
     _mod_conv_chunk: Module,
     conv_chunk_fn: rocml_hip::Function,
-    _mod_recurrence_chunk: Module,
-    recurrence_chunk_fn: rocml_hip::Function,
     _mod_extract_heads: Module,
     extract_heads_fn: rocml_hip::Function,
     _mod_scatter_kv: Module,
@@ -36,10 +33,6 @@ impl ChunkKernels {
         let (_mod_conv_chunk, conv_chunk_fn) = load(
             rocml_kernels::GDN_CONV1D_CHUNK_F32_HSACO,
             rocml_kernels::GDN_CONV1D_CHUNK_F32_KERNEL,
-        )?;
-        let (_mod_recurrence_chunk, recurrence_chunk_fn) = load(
-            rocml_kernels::GDN_RECURRENCE_CHUNK_F32_HSACO,
-            rocml_kernels::GDN_RECURRENCE_CHUNK_F32_KERNEL,
         )?;
         let (_mod_extract_heads, extract_heads_fn) = load(
             rocml_kernels::EXTRACT_HEADS_F32_HSACO,
@@ -61,8 +54,6 @@ impl ChunkKernels {
         Ok(Self {
             _mod_conv_chunk,
             conv_chunk_fn,
-            _mod_recurrence_chunk,
-            recurrence_chunk_fn,
             _mod_extract_heads,
             extract_heads_fn,
             _mod_scatter_kv,
@@ -98,59 +89,6 @@ impl ChunkKernels {
         // SAFETY: params matches causal_conv1d_chunk_f32's signature (const
         // float*, float*, const float*, float*, unsigned x3).
         unsafe { self.conv_chunk_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
-    }
-
-    /// `gdn_recurrence_chunk_f32`: batched Gated Delta Net recurrence (state
-    /// update + readout, including the per-head L2 norm the decode path
-    /// applies via a separate `rmsnorm` call — see the kernel source's doc
-    /// comment) over a `chunk_len`-token chunk in one launch per layer — the
-    /// prefill-chunk sibling of `HybridKernels::gdn_recurrence_decode`.
-    /// `conv_out` is `[chunk_len, conv_dim]` (`[Q|K|V]`-per-row,
-    /// `gdn_layer_step`'s existing per-token layout batched over tokens with
-    /// no reshape); `beta`/`g` are `[chunk_len, num_heads]`; `y` is
-    /// `[chunk_len, num_heads, head_v_dim]`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gdn_recurrence_chunk(
-        &self,
-        state: DevPtr,
-        conv_out: DevPtr,
-        beta: DevPtr,
-        g: DevPtr,
-        y: DevPtr,
-        num_heads: u32,
-        num_k_heads: u32,
-        head_k_dim: u32,
-        head_v_dim: u32,
-        conv_dim: u32,
-        key_dim: u32,
-        chunk_len: u32,
-        l2_eps: f32,
-    ) -> Result<(), RocmlError> {
-        let block = head_k_dim.max(head_v_dim);
-        let cfg = LaunchConfig {
-            grid: (num_heads, 1, 1),
-            block: (block, 1, 1),
-            shared_mem_bytes: 2 * (head_k_dim + head_v_dim) * size_of::<f32>() as u32,
-        };
-        let mut params = kernel_params!(
-            state,
-            conv_out,
-            beta,
-            g,
-            y,
-            num_heads,
-            num_k_heads,
-            head_k_dim,
-            head_v_dim,
-            conv_dim,
-            key_dim,
-            chunk_len,
-            l2_eps
-        );
-        // SAFETY: params matches gdn_recurrence_chunk_f32's signature
-        // (float*, const float* x3, float*, six unsigned, unsigned, float);
-        // block size is max(head_k_dim, head_v_dim) as required.
-        unsafe { self.recurrence_chunk_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 
     /// `extract_heads_f32(src, dst, tokens, heads, head_dim, src_stride,
