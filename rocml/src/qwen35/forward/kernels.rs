@@ -24,6 +24,19 @@ pub struct HybridKernels {
     recurrence_fn: rocml_hip::Function,
     _mod_sigmoid_mul: Module,
     sigmoid_mul_fn: rocml_hip::Function,
+    // Staged for issue #6's chunked-prefill forward pass, not yet wired into
+    // any caller (`gdn::gdn_layer_step` still runs the decode-step kernels
+    // token-by-token) — see the kernel-level tests in
+    // `rocml-kernels/tests/gdn_chunk.rs` for their correctness coverage in
+    // the meantime.
+    #[allow(dead_code)]
+    _mod_conv_chunk: Module,
+    #[allow(dead_code)]
+    conv_chunk_fn: rocml_hip::Function,
+    #[allow(dead_code)]
+    _mod_recurrence_chunk: Module,
+    #[allow(dead_code)]
+    recurrence_chunk_fn: rocml_hip::Function,
 }
 
 impl HybridKernels {
@@ -48,6 +61,14 @@ impl HybridKernels {
             rocml_kernels::ELEMENTWISE_HSACO,
             rocml_kernels::SIGMOID_MUL_F32_KERNEL,
         )?;
+        let (_mod_conv_chunk, conv_chunk_fn) = load(
+            rocml_kernels::GDN_CONV1D_CHUNK_F32_HSACO,
+            rocml_kernels::GDN_CONV1D_CHUNK_F32_KERNEL,
+        )?;
+        let (_mod_recurrence_chunk, recurrence_chunk_fn) = load(
+            rocml_kernels::GDN_RECURRENCE_CHUNK_F32_HSACO,
+            rocml_kernels::GDN_RECURRENCE_CHUNK_F32_KERNEL,
+        )?;
 
         Ok(Self {
             _mod_rope_partial,
@@ -60,6 +81,10 @@ impl HybridKernels {
             recurrence_fn,
             _mod_sigmoid_mul,
             sigmoid_mul_fn,
+            _mod_conv_chunk,
+            conv_chunk_fn,
+            _mod_recurrence_chunk,
+            recurrence_chunk_fn,
         })
     }
 
@@ -178,6 +203,90 @@ impl HybridKernels {
         // (float*, four const float*, const float*, float*, four unsigned);
         // block size is max(head_k_dim, head_v_dim) as required.
         unsafe { self.recurrence_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
+    }
+
+    /// `causal_conv1d_chunk_f32`: batched GDN causal-conv over a
+    /// `chunk_len`-token chunk in one launch, mutating `conv_state` in
+    /// place — the prefill-chunk sibling of [`Self::gdn_conv1d_decode`].
+    /// Not yet called from the forward pass (see the struct-level doc
+    /// comment); kernel-level correctness is covered by
+    /// `rocml-kernels/tests/gdn_chunk.rs`.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    pub fn gdn_conv1d_chunk(
+        &self,
+        x: DevPtr,
+        conv_state: DevPtr,
+        weight: DevPtr,
+        out: DevPtr,
+        channels: u32,
+        kernel_size: u32,
+        chunk_len: u32,
+    ) -> Result<(), RocmlError> {
+        let cfg = LaunchConfig {
+            grid: (channels.div_ceil(LINEAR_BLOCK), 1, 1),
+            block: (LINEAR_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut params =
+            kernel_params!(x, conv_state, weight, out, channels, kernel_size, chunk_len);
+        // SAFETY: params matches causal_conv1d_chunk_f32's signature (const
+        // float*, float*, const float*, float*, unsigned x3).
+        unsafe { self.conv_chunk_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
+    }
+
+    /// `gdn_recurrence_chunk_f32`: batched Gated Delta Net recurrence
+    /// (state update + readout, including the per-head L2 norm the decode
+    /// path applies via a separate `rmsnorm` call — see the kernel source's
+    /// doc comment) over a `chunk_len`-token chunk in one launch per layer —
+    /// the prefill-chunk sibling of [`Self::gdn_recurrence_decode`].
+    /// `conv_out` is `[chunk_len, conv_dim]` (`[Q|K|V]`-per-row, `gdn_layer_step`'s
+    /// existing per-token layout batched over tokens with no reshape);
+    /// `beta`/`g` are `[chunk_len, num_heads]`; `y` is `[chunk_len,
+    /// num_heads, head_v_dim]`. Not yet called from the forward pass (see
+    /// the struct-level doc comment); kernel-level correctness is covered by
+    /// `rocml-kernels/tests/gdn_chunk.rs`.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    pub fn gdn_recurrence_chunk(
+        &self,
+        state: DevPtr,
+        conv_out: DevPtr,
+        beta: DevPtr,
+        g: DevPtr,
+        y: DevPtr,
+        num_heads: u32,
+        num_k_heads: u32,
+        head_k_dim: u32,
+        head_v_dim: u32,
+        conv_dim: u32,
+        key_dim: u32,
+        chunk_len: u32,
+        l2_eps: f32,
+    ) -> Result<(), RocmlError> {
+        let block = head_k_dim.max(head_v_dim);
+        let cfg = LaunchConfig {
+            grid: (num_heads, 1, 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 2 * (head_k_dim + head_v_dim) * size_of::<f32>() as u32,
+        };
+        let mut params = kernel_params!(
+            state,
+            conv_out,
+            beta,
+            g,
+            y,
+            num_heads,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_dim,
+            key_dim,
+            chunk_len,
+            l2_eps
+        );
+        // SAFETY: params matches gdn_recurrence_chunk_f32's signature
+        // (float*, const float* x3, float*, six unsigned, unsigned, float);
+        // block size is max(head_k_dim, head_v_dim) as required.
+        unsafe { self.recurrence_chunk_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 
     /// `sigmoid_mul_f32(x, gate, out, n)`: out = x * sigmoid(gate).

@@ -86,6 +86,17 @@ pub const GDN_RECURRENCE_DECODE_F32_HSACO: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gdn_recurrence.hsaco"));
 pub const GDN_RECURRENCE_DECODE_F32_KERNEL: &str = "gdn_recurrence_decode_f32";
 
+/// `kernels/gdn_chunk.hip`: Gated Delta Net batched causal conv1d
+/// (`causal_conv1d_chunk_f32`) and gated-delta-rule recurrence
+/// (`gdn_recurrence_chunk_f32`) over a whole prefill chunk in one launch
+/// each, reproducing their `_decode_f32` siblings' per-step math exactly.
+/// Both share one code object.
+pub const GDN_CONV1D_CHUNK_F32_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gdn_chunk.hsaco"));
+pub const GDN_CONV1D_CHUNK_F32_KERNEL: &str = "causal_conv1d_chunk_f32";
+pub const GDN_RECURRENCE_CHUNK_F32_HSACO: &[u8] = GDN_CONV1D_CHUNK_F32_HSACO;
+pub const GDN_RECURRENCE_CHUNK_F32_KERNEL: &str = "gdn_recurrence_chunk_f32";
+
 /// `kernels/gemv_t.hip`: decode-attention building block `y = A^T * x`, A is
 /// row-major rows x n (e.g. a cached-V plane, one row per time step). One
 /// thread per output column, looping over rows; no block-size constraint.
