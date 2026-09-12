@@ -4,6 +4,14 @@
 //! sink/bulk/window model this implements, and `kernels/kv_quant.hip`/
 //! `kernels/attn_decode_mixed.hip`'s module docs for the exact buffer
 //! layouts this allocates and feeds.
+//!
+//! `chunk` (child module, split out purely for the 400-line file cap) adds
+//! [`MixedAttnPlane::append_chunk`], the chunked-prefill sibling of
+//! [`MixedAttnPlane::append`] below — see that module's doc comment for the
+//! batched-append design and the bit-identity-with-token-serial invariant
+//! it must uphold.
+
+mod chunk;
 
 use half::f16;
 use rocml_hip::DeviceBuffer;

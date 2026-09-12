@@ -5,6 +5,7 @@
 //! split into chunks.
 
 use super::attention_chunk::attention_chunk_step;
+use super::attention_chunk_mixed::attention_chunk_step_mixed;
 use super::chunk_scratch::CHUNK_CAP;
 use super::ffn_chunk::ffn_chunk_step;
 use super::gdn_chunk::gdn_chunk_step;
@@ -12,6 +13,7 @@ use super::Model;
 use crate::error::RocmlError;
 use crate::forward::kernels::offset;
 use crate::profile::{self, OpKind, Profiler};
+use crate::qwen35::cache::AttnLayerCache;
 use crate::qwen35::config::LayerKind;
 use crate::qwen35::weights::LayerWeights;
 
@@ -137,26 +139,44 @@ impl Model {
                     )?;
                 }
                 (LayerWeights::Attention(attn_weights), LayerKind::FullAttention) => {
-                    // Chunked prefill only ever runs when the cache has no
-                    // mixed layers (see `Model::forward_prompt`'s doc
-                    // comment) — attn_dense_mut errors clearly if that
-                    // invariant is ever violated instead of silently
-                    // misinterpreting a quantized plane as dense.
-                    let plane = self.cache.attn_dense_mut(layer_idx)?;
-                    attention_chunk_step(
-                        &self.kernels,
-                        &self.hybrid,
-                        &self.chunk_kernels,
-                        &self.config,
-                        attn_weights,
-                        plane,
-                        max_seq,
-                        &mut self.chunk_scratch,
-                        pos_base,
-                        chunk_len,
-                        prof,
-                        Some(layer_idx_u32),
-                    )?;
+                    // Boundary layers stay dense fp16 regardless of
+                    // `KvCacheMode` (see `HybridCache::new`'s doc comment);
+                    // layers strictly between them are `Mixed` whenever the
+                    // cache is quantized. Both variants get a chunked-prefill
+                    // path — see `attention_chunk_mixed.rs`'s module doc for
+                    // why the mixed one is its own file rather than a branch
+                    // inside `attention_chunk_step`.
+                    match self.cache.attn_mut(layer_idx)? {
+                        AttnLayerCache::Dense(plane) => attention_chunk_step(
+                            &self.kernels,
+                            &self.hybrid,
+                            &self.chunk_kernels,
+                            &self.config,
+                            attn_weights,
+                            plane,
+                            max_seq,
+                            &mut self.chunk_scratch,
+                            pos_base,
+                            chunk_len,
+                            prof,
+                            Some(layer_idx_u32),
+                        )?,
+                        AttnLayerCache::Mixed(plane) => attention_chunk_step_mixed(
+                            &self.kernels,
+                            &self.hybrid,
+                            &self.chunk_kernels,
+                            &self.mixed_kernels,
+                            &self.flash_mixed_kernels,
+                            &self.config,
+                            attn_weights,
+                            plane,
+                            &mut self.chunk_scratch,
+                            pos_base,
+                            chunk_len,
+                            prof,
+                            Some(layer_idx_u32),
+                        )?,
+                    }
                     ffn_chunk_step(
                         &self.kernels,
                         &attn_weights.ffn,

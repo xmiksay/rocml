@@ -174,7 +174,6 @@ pub struct HybridCache {
     max_seq: u32,
     gdn: Vec<Option<GdnLayerState>>,
     attn: Vec<Option<AttnLayerCache>>,
-    has_mixed_layers: bool,
 }
 
 impl HybridCache {
@@ -209,7 +208,6 @@ impl HybridCache {
 
         let mut gdn = Vec::with_capacity(cfg.layer_kinds.len());
         let mut attn = Vec::with_capacity(cfg.layer_kinds.len());
-        let mut has_mixed_layers = false;
         for (idx, &kind) in cfg.layer_kinds.iter().enumerate() {
             match kind {
                 LayerKind::LinearAttention => {
@@ -220,7 +218,6 @@ impl HybridCache {
                     gdn.push(None);
                     let is_boundary = Some(idx) == first_boundary || Some(idx) == last_boundary;
                     let layer_cache = if mode.is_quantized() && !is_boundary {
-                        has_mixed_layers = true;
                         AttnLayerCache::Mixed(MixedAttnPlane::new(
                             cfg.head_count_kv,
                             cfg.head_dim,
@@ -239,24 +236,11 @@ impl HybridCache {
                 }
             }
         }
-        Ok(Self {
-            max_seq,
-            gdn,
-            attn,
-            has_mixed_layers,
-        })
+        Ok(Self { max_seq, gdn, attn })
     }
 
     pub fn max_seq(&self) -> u32 {
         self.max_seq
-    }
-
-    /// Whether any layer uses the mixed quantized layout — `Model::forward_prompt`
-    /// uses this to fall back to token-serial prefill (issue #6's chunked
-    /// path doesn't support the mixed cache yet, see that function's doc
-    /// comment).
-    pub fn has_mixed_layers(&self) -> bool {
-        self.has_mixed_layers
     }
 
     /// Zeroes every GDN layer's conv/recurrence state for a fresh sequence,
@@ -298,7 +282,11 @@ impl HybridCache {
             .ok_or_else(|| RocmlError::Config(format!("cache: layer {layer_idx} has no GDN state")))
     }
 
-    /// Decode-path accessor: either variant. See `qwen35::forward::attention::attention_step`.
+    /// Accessor for both the decode-step path
+    /// (`qwen35::forward::attention::attention_step`) and the chunked-prefill
+    /// path (`chunk_forward.rs`, which matches on the returned
+    /// `AttnLayerCache` variant to dispatch
+    /// `attention_chunk_step`/`attention_chunk_step_mixed`).
     pub fn attn_mut(&mut self, layer_idx: usize) -> Result<&mut AttnLayerCache, RocmlError> {
         self.attn
             .get_mut(layer_idx)
@@ -306,22 +294,5 @@ impl HybridCache {
             .ok_or_else(|| {
                 RocmlError::Config(format!("cache: layer {layer_idx} has no attention plane"))
             })
-    }
-
-    /// Chunked-prefill-path accessor: errors if this layer turned out to be
-    /// `Mixed` — the chunked path (issue #6) doesn't support the mixed
-    /// cache, so `Model::forward_prompt` only ever calls it when
-    /// `has_mixed_layers()` is false, making this branch unreachable in
-    /// practice; it's a clear error rather than a panic in case that
-    /// invariant is ever violated.
-    pub fn attn_dense_mut(&mut self, layer_idx: usize) -> Result<&mut AttnPlane, RocmlError> {
-        match self.attn_mut(layer_idx)? {
-            AttnLayerCache::Dense(plane) => Ok(plane),
-            AttnLayerCache::Mixed(_) => Err(RocmlError::Config(format!(
-                "cache: layer {layer_idx} uses the mixed KV cache, which chunked prefill \
-                 doesn't support (internal bug: forward_prompt should have fallen back to \
-                 token-serial prefill)"
-            ))),
-        }
     }
 }
