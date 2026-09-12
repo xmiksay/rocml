@@ -23,6 +23,9 @@ test:
 		--skip ornith_9b_greedy_decode_is_well_formed_and_deterministic \
 		--skip qwen35_2b_chunked_prefill_matches_token_serial \
 		--skip fp16_kv_matches_f32_kv_logits_and_greedy_decode \
+		--skip q8_mixed_kv_vs_fp16_logits_and_greedy_stability \
+		--skip q4_mixed_kv_vs_fp16_logits_and_greedy_stability \
+		--skip q4_mixed_kv_greedy_divergence_is_a_near_tie_when_it_happens \
 		--skip chat_completions_end_to_end
 	$(MAKE) test-model
 
@@ -46,6 +49,7 @@ test-model:
 	cargo test --release -p rocml --test qwen35_greedy_parity
 	cargo test --release -p rocml --test qwen35_chunked_prefill_parity
 	cargo test --release -p rocml --test kv_dtype_parity
+	cargo test --release -p rocml --test mixed_kv_parity
 	cargo test --release -p rocml --test ornith_e2e
 	cargo test --release -p rocml-serve --test server_e2e
 	cargo test --release -p rocml-serve --test server_e2e -- --ignored ornith_tool_call_is_emitted

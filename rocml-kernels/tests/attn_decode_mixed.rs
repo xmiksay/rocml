@@ -148,6 +148,7 @@ struct Scenario {
     window_len: u32,
     /// How many positions past `window_base` are currently valid (< window_len).
     window_fill: u32,
+    n_splits: u32,
 }
 
 fn run_mixed(scenario: Scenario, v_bits: u32) {
@@ -158,6 +159,7 @@ fn run_mixed(scenario: Scenario, v_bits: u32) {
         sink_len,
         window_len,
         window_fill,
+        n_splits,
     } = scenario;
     assert!(window_fill <= window_len);
     let group = (n_heads / n_kv_heads) as usize;
@@ -299,9 +301,10 @@ fn run_mixed(scenario: Scenario, v_bits: u32) {
     buf_v_scales.copy_from_host(&v_scales_bulk).unwrap();
 
     let buf_out = DeviceBuffer::<f32>::new(n_heads as usize * hd).unwrap();
-    let buf_partial_out = DeviceBuffer::<f32>::new(n_heads as usize * hd).unwrap();
-    let buf_partial_m = DeviceBuffer::<f32>::new(n_heads as usize).unwrap();
-    let buf_partial_l = DeviceBuffer::<f32>::new(n_heads as usize).unwrap();
+    let buf_partial_out =
+        DeviceBuffer::<f32>::new(n_heads as usize * n_splits as usize * hd).unwrap();
+    let buf_partial_m = DeviceBuffer::<f32>::new(n_heads as usize * n_splits as usize).unwrap();
+    let buf_partial_l = DeviceBuffer::<f32>::new(n_heads as usize * n_splits as usize).unwrap();
 
     let q_ptr = buf_q.device_ptr();
     let sink_k_ptr = buf_sink_k.device_ptr();
@@ -320,8 +323,7 @@ fn run_mixed(scenario: Scenario, v_bits: u32) {
     let group_u32 = group as u32;
     let bulk_cap = window_len; // exactly one block's worth in this test
     let num_blocks_total = 1u32;
-    let n_splits = 1u32;
-    let split_len = cur_len;
+    let split_len = cur_len.div_ceil(n_splits);
     let scale = 1.0f32 / (head_dim as f32).sqrt();
 
     let mut params = kernel_params!(
@@ -395,6 +397,7 @@ fn mixed_decode_q8_sink_bulk_and_partial_window() {
             sink_len: 4,
             window_len: 8,
             window_fill: 5,
+            n_splits: 1,
         },
         8,
     );
@@ -410,6 +413,7 @@ fn mixed_decode_q4_sink_bulk_and_partial_window() {
             sink_len: 4,
             window_len: 8,
             window_fill: 5,
+            n_splits: 1,
         },
         4,
     );
@@ -427,7 +431,43 @@ fn mixed_decode_q8_deep_multi_block_head_dim_256() {
             sink_len: 32,
             window_len: 128,
             window_fill: 100,
+            n_splits: 1,
         },
         8,
+    );
+}
+
+#[test]
+fn mixed_decode_q8_split_k_matches_single_split() {
+    // n_splits > 1: exercises the split-K path attn_decode_splits picks at
+    // real model depth (the model-level bug this test was added to isolate
+    // showed up only here, not at n_splits == 1).
+    run_mixed(
+        Scenario {
+            n_heads: 4,
+            n_kv_heads: 1,
+            head_dim: 256,
+            sink_len: 32,
+            window_len: 128,
+            window_fill: 69,
+            n_splits: 2,
+        },
+        8,
+    );
+}
+
+#[test]
+fn mixed_decode_q4_split_k_matches_single_split() {
+    run_mixed(
+        Scenario {
+            n_heads: 4,
+            n_kv_heads: 1,
+            head_dim: 256,
+            sink_len: 32,
+            window_len: 128,
+            window_fill: 69,
+            n_splits: 2,
+        },
+        4,
     );
 }
