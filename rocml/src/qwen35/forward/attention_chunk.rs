@@ -17,6 +17,13 @@ use crate::qwen35::cache::AttnPlane;
 use crate::qwen35::config::Qwen35Config;
 use crate::qwen35::weights::AttnLayerWeights;
 
+/// Below this many total KV positions (`pos_base + chunk_len`, the chunk's
+/// own deepest row), `attn_prefill`'s single-pass ROW_TILE=4 kernel is
+/// dispatched instead of the flash-tiled split-K design — see this file's
+/// call site for why. Picked by measurement (`bench --depth` sweep at
+/// 512/1024/2048); see `.claude/CLAUDE.md`'s flash-prefill section.
+const USE_FLASH_PREFILL_MIN_DEPTH: u32 = 512;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attention_chunk_step(
     kernels: &Kernels,
@@ -200,24 +207,68 @@ pub(crate) fn attention_chunk_step(
             }?;
 
             let scale = 1.0f32 / (head_dim as f32).sqrt();
-            let prefill = match plane.dtype() {
-                KvDtype::F16 => Kernels::attn_prefill_f16,
-                KvDtype::F32 => Kernels::attn_prefill,
-            };
-            prefill(
-                kernels,
-                offset(&scratch.attn_q, 0),
-                k_ptr,
-                v_ptr,
-                offset(&scratch.attn_concat, 0),
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                max_seq,
-                chunk_len,
-                pos_base,
-                scale,
-            )
+            // The flash kernel's split-K reduce pass is a fixed extra
+            // launch that only pays for itself once there's real KV depth
+            // to amortize it against; below this, `attn_prefill`'s single-
+            // pass ROW_TILE=4 design (no reduce launch) wins on pure
+            // overhead. `USE_FLASH_PREFILL_MIN_DEPTH` was picked by
+            // measurement (`bench --depth` sweep) — see `.claude/CLAUDE.md`'s
+            // flash-prefill section for the numbers.
+            if pos_base + chunk_len >= USE_FLASH_PREFILL_MIN_DEPTH {
+                match plane.dtype() {
+                    KvDtype::F16 => kernels.flash.attn_prefill_flash_f16(
+                        offset(&scratch.attn_q, 0),
+                        k_ptr,
+                        v_ptr,
+                        offset(&scratch.attn_concat, 0),
+                        offset(&scratch.attn_flash_partial_out, 0),
+                        offset(&scratch.attn_flash_partial_m, 0),
+                        offset(&scratch.attn_flash_partial_l, 0),
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_seq,
+                        chunk_len,
+                        pos_base,
+                        scale,
+                    ),
+                    KvDtype::F32 => kernels.flash.attn_prefill_flash(
+                        offset(&scratch.attn_q, 0),
+                        k_ptr,
+                        v_ptr,
+                        offset(&scratch.attn_concat, 0),
+                        offset(&scratch.attn_flash_partial_out, 0),
+                        offset(&scratch.attn_flash_partial_m, 0),
+                        offset(&scratch.attn_flash_partial_l, 0),
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_seq,
+                        chunk_len,
+                        pos_base,
+                        scale,
+                    ),
+                }
+            } else {
+                let prefill = match plane.dtype() {
+                    KvDtype::F16 => Kernels::attn_prefill_f16,
+                    KvDtype::F32 => Kernels::attn_prefill,
+                };
+                prefill(
+                    kernels,
+                    offset(&scratch.attn_q, 0),
+                    k_ptr,
+                    v_ptr,
+                    offset(&scratch.attn_concat, 0),
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_seq,
+                    chunk_len,
+                    pos_base,
+                    scale,
+                )
+            }
         },
     )?;
 

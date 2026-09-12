@@ -6,6 +6,7 @@
 mod attention;
 mod ffn;
 pub(crate) mod kernels;
+pub(crate) mod kernels_flash;
 pub(crate) mod kernels_kv;
 pub(crate) mod kernels_quant;
 mod scratch;

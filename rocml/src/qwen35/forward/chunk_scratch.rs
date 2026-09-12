@@ -8,6 +8,7 @@ use rocml_hip::DeviceBuffer;
 
 use super::super::config::Qwen35Config;
 use crate::error::RocmlError;
+use crate::forward::kernels_flash::ATTN_PREFILL_FLASH_MAX_SPLITS;
 
 /// Upper bound on tokens processed by one chunked-prefill launch. The
 /// `generate` loop picks the actual per-call `chunk_len` (`<= CHUNK_CAP`) by
@@ -67,6 +68,16 @@ pub struct ChunkScratch {
     pub attn_concat: DeviceBuffer<f32>,
     pub attn_out: DeviceBuffer<f32>,
 
+    // `attn_prefill_flash`'s split-K scratch (issue #6 flash-prefill
+    // round): `[CHUNK_CAP, n_heads, ATTN_PREFILL_FLASH_MAX_SPLITS,
+    // head_dim]` for the per-(row, head, split) online-softmax partial
+    // output, `[CHUNK_CAP, n_heads, ATTN_PREFILL_FLASH_MAX_SPLITS]` for its
+    // running max/sum — reused across every layer and every call, like the
+    // rest of this struct's buffers. Never read back by the caller.
+    pub attn_flash_partial_out: DeviceBuffer<f32>,
+    pub attn_flash_partial_m: DeviceBuffer<f32>,
+    pub attn_flash_partial_l: DeviceBuffer<f32>,
+
     // FFN scratch, shared by both layer kinds, `[CHUNK_CAP, ffn_dim]`.
     pub ffn_gate: DeviceBuffer<f32>,
     pub ffn_up: DeviceBuffer<f32>,
@@ -88,6 +99,9 @@ impl ChunkScratch {
         let q_dim = config.q_dim() as usize;
         let kv_dim = config.kv_dim() as usize;
         let ffn = config.feed_forward_length as usize;
+        let n_heads = config.head_count as usize;
+        let head_dim = config.head_dim as usize;
+        let max_splits = ATTN_PREFILL_FLASH_MAX_SPLITS as usize;
 
         Ok(Self {
             x: DeviceBuffer::new(cap * hidden)?,
@@ -121,6 +135,10 @@ impl ChunkScratch {
             attn_v: DeviceBuffer::new(cap * kv_dim)?,
             attn_concat: DeviceBuffer::new(cap * q_dim)?,
             attn_out: DeviceBuffer::new(cap * hidden)?,
+
+            attn_flash_partial_out: DeviceBuffer::new(cap * n_heads * max_splits * head_dim)?,
+            attn_flash_partial_m: DeviceBuffer::new(cap * n_heads * max_splits)?,
+            attn_flash_partial_l: DeviceBuffer::new(cap * n_heads * max_splits)?,
 
             ffn_gate: DeviceBuffer::new(cap * ffn)?,
             ffn_up: DeviceBuffer::new(cap * ffn)?,

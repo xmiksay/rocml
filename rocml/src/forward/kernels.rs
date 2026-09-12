@@ -11,6 +11,7 @@ use std::mem::size_of;
 use rocml_core::quant::GgmlDType;
 use rocml_hip::{kernel_params, DeviceBuffer, LaunchConfig, Module};
 
+use super::kernels_flash::FlashPrefillKernels;
 use super::kernels_kv::{KvF16Kernels, ATTN_PREFILL_ROW_TILE};
 use super::kernels_quant::QuantKernels;
 use crate::error::RocmlError;
@@ -120,6 +121,12 @@ pub struct Kernels {
     attn_prefill_fn: rocml_hip::Function,
     quant: QuantKernels,
     kv_f16: KvF16Kernels,
+    /// `pub(crate)` (unlike the other kernel-owning fields above) so
+    /// `qwen35::forward::attention_chunk` can call its methods directly
+    /// instead of `kernels.rs` (already well past the 400-line cap)
+    /// growing a full set of pass-through wrappers — see
+    /// `kernels_flash.rs`'s module doc.
+    pub(crate) flash: FlashPrefillKernels,
 }
 
 pub(crate) fn load(hsaco: &[u8], name: &str) -> Result<(Module, rocml_hip::Function), RocmlError> {
@@ -184,6 +191,7 @@ impl Kernels {
         )?;
         let quant = QuantKernels::load_all()?;
         let kv_f16 = KvF16Kernels::load_all()?;
+        let flash = FlashPrefillKernels::load_all()?;
 
         Ok(Self {
             _mod_embedding,
@@ -214,6 +222,7 @@ impl Kernels {
             attn_prefill_fn,
             quant,
             kv_f16,
+            flash,
         })
     }
 
