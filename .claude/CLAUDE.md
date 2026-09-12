@@ -100,7 +100,7 @@ Issue #6's chunked prefill doesn't support the mixed cache (only the decode-styl
 
 ## Agentic eval (issue #15)
 
-`rocml-cli eval` (`cmd_eval.rs` + `rocml-cli/src/eval/`) measures quantization loss on real tool-use tasks — greedy/deterministic scenarios through the actual chat protocol, in-process, not through `rocml-serve` — rather than wikitext PPL, to decide whether `ornith-9b-q4` (Q4_K_M) can replace `ornith-9b` (Q6_K) as the default registry entry. Split into small files purely for the 400-line cap; `cmd_eval.rs` owns CLI parsing and the top-level run/resume loop, `eval/` holds the pieces:
+`rocml-cli eval` (`cmd_eval.rs` + `rocml-cli/src/eval/`) measures quantization loss on real tool-use tasks — greedy/deterministic scenarios through the actual chat protocol, in-process, not through `rocml-serve` — rather than wikitext PPL, the harness that decided Q4_K_M is the default `ornith-9b` registry entry (Q6_K remains as `ornith-9b-q6`). Split into small files purely for the 400-line cap; `cmd_eval.rs` owns CLI parsing and the top-level run/resume loop, `eval/` holds the pieces:
 
 - `eval::scenario` — the JSON schema (`bench/eval/scenarios.json`, checked in, 20 hand-authored scenarios) for the four scenario kinds: `tool_choice` (exactly one expected tool call + arguments), `no_tool` (zero tool calls), `multi_turn` (an expected first tool call, a canned tool result fed back, then either a second expected tool call or a final-answer substring), `long_context` (a retrieval needle in ~4000/~8000 tokens of filler).
 - `eval::filler` — deterministically generates `long_context` filler prose from a `u64` seed and a small fixed wordlist (a local xorshift64* PRNG, not `rocml::sample::Rng` — that struct's RNG internals are private to the `sample` module) so scenarios store only the needle, its position fraction, and a target length, never kilobytes of filler text.
@@ -109,7 +109,7 @@ Issue #6's chunked prefill doesn't support the mixed cache (only the decode-styl
 - `eval::ppl` — the secondary signal: teacher-forced perplexity over `bench/eval/corpus.txt` (a small public-domain excerpt), one forward pass per token via `Model::forward_token` (not `forward_prompt`, which only returns the last position's logits) — cheap enough at ~2-3K tokens that a batched shortcut isn't worth the complexity.
 - `eval::results` — the results JSON shape (`{label, timestamp_unix, git_rev, model_path, engine_config, per_scenario[], aggregates{}, ppl}`) plus incremental save: `--out` is rewritten after every scenario (and again after PPL), so a run killed partway through a 30-60 minute eval can resume with `--resume`, which skips any scenario id already present in that file.
 
-`make eval` runs both `ornith-9b` and `ornith-9b-q4` at ctx 16384 (long-context scenarios need ~8K tokens of filler plus thinking/answer headroom), `--resume` always on, writing `bench/eval/results/{ornith-q6k-fp16kv,ornith-q4km-fp16kv}.json`.
+`make eval` runs both `ornith-9b-q6` and `ornith-9b` at ctx 16384 (long-context scenarios need ~8K tokens of filler plus thinking/answer headroom), `--resume` always on, writing `bench/eval/results/{ornith-q6k-fp16kv,ornith-q4km-fp16kv}.json`.
 
 ## Kernel build pipeline
 

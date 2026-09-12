@@ -26,7 +26,7 @@ rocml is a standalone Rust inference engine for Qwen3.5-hybrid/Ornith and dense 
 - `make clean` — `cargo clean`
 - `make serve` — run `rocml-serve` against `QWEN_MODEL` (defaults to the Qwen3.5-2B dev/test checkpoint; override with `QWEN_MODEL=/path/to.gguf make serve`)
 - `make bench` — run `rocml-cli bench` against `QWEN_MODEL`, JSON output
-- `make eval` — run the agentic quality-eval harness (issue #15) for both `ornith-9b` (Q6_K) and `ornith-9b-q4` (Q4_K_M) at ctx 16384, writing `bench/eval/results/*.json`
+- `make eval` — run the agentic quality-eval harness (issue #15) for both `ornith-9b-q6` (Q6_K) and `ornith-9b` (Q4_K_M) at ctx 16384, writing `bench/eval/results/*.json`
 
 All cargo invocations are run with `CARGO_BUILD_JOBS=4` to avoid overloading the build machine.
 
@@ -36,8 +36,8 @@ All cargo invocations are run with `CARGO_BUILD_JOBS=4` to avoid overloading the
 
 | Name | Family | File | Default sampling | Thinking |
 |---|---|---|---|---|
-| `ornith-9b` | qwen3.5-hybrid | `Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
-| `ornith-9b-q4` | qwen3.5-hybrid | `Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
+| `ornith-9b` | qwen3.5-hybrid | `Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
+| `ornith-9b-q6` | qwen3.5-hybrid | `Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
 | `qwen3.5-2b` | qwen3.5-hybrid | `Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf` | temp 1.0, top_p 1.0, top_k 20 | off |
 | `qwen3.5-0.8b` | qwen3.5-hybrid | `Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf` | temp 1.0, top_p 1.0, top_k 20 | off |
 | `qwen3-0.6b` | qwen3-dense | `Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
@@ -74,7 +74,7 @@ See [Observability](#observability) below for `--profile`.
 rocml-cli eval --model <name-or-gguf> --label <label> --out <path.json> [--scenarios bench/eval/scenarios.json] [--corpus bench/eval/corpus.txt] [--ctx 16384] [--max-gen-tokens 2048] [--resume]
 ```
 
-A small, deterministic (greedy argmax, fixed everything) quality harness measuring quantization loss on real tool-use tasks rather than wikitext PPL — the answer to "can Q4_K_M replace Q6_K as the default `ornith-9b` registry entry". Runs entirely in-process (no `rocml-serve`), loading the model the same way `chat`/`generate` do and driving it through the real chat protocol (`rocml::chat::render`/`parse_assistant_output`) with thinking mode on (Ornith's own default).
+A small, deterministic (greedy argmax, fixed everything) quality harness measuring quantization loss on real tool-use tasks rather than wikitext PPL — the harness that decided Q4_K_M replaces Q6_K as the default `ornith-9b` registry entry (identical 19/20 agentic score, PPL 1.0807 vs 1.0800, ~2x decode throughput). Runs entirely in-process (no `rocml-serve`), loading the model the same way `chat`/`generate` do and driving it through the real chat protocol (`rocml::chat::render`/`parse_assistant_output`) with thinking mode on (Ornith's own default).
 
 `bench/eval/scenarios.json` (checked in, hand-authored, 20 scenarios) has four kinds, each scored deterministically:
 
@@ -85,7 +85,7 @@ A small, deterministic (greedy argmax, fixed everything) quality harness measuri
 
 `bench/eval/corpus.txt` (a small public-domain text excerpt) feeds a secondary, informational signal: teacher-forced perplexity over the decode path (one forward pass per token). The pass/fail call is the agentic score, not PPL.
 
-Every scored scenario is written to `--out` immediately, so a run interrupted partway through (a 30-60 minute eval killed by, e.g., a wrapping timeout) can be resumed with `--resume`, which skips any scenario id already present in that file (and skips recomputing PPL if it's already recorded). `make eval` runs both the `ornith-9b` (Q6_K) baseline and the `ornith-9b-q4` (Q4_K_M) candidate at ctx 16384, `--resume` always on.
+Every scored scenario is written to `--out` immediately, so a run interrupted partway through (a 30-60 minute eval killed by, e.g., a wrapping timeout) can be resumed with `--resume`, which skips any scenario id already present in that file (and skips recomputing PPL if it's already recorded). `make eval` runs both the `ornith-9b-q6` (Q6_K) baseline and the `ornith-9b` (Q4_K_M) default at ctx 16384, `--resume` always on.
 
 ## Observability
 

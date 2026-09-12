@@ -65,11 +65,16 @@ pub const REGISTRY: &[ModelSpec] = &[
     ModelSpec {
         name: "ornith-9b",
         family: ModelFamily::Qwen35Hybrid,
-        gguf_rel: "Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf",
+        // Q4_K_M promoted to the default entry by the issue-15 agentic eval
+        // (bench/eval/results/): identical agentic score to Q6_K (19/20,
+        // same single scenario-design failure), PPL 1.0807 vs 1.0800, for
+        // ~2x decode throughput (34.4 vs 18.6 tok/s) and ~1.7GB more KV
+        // headroom. Q6_K stays available as `ornith-9b-q6`.
+        gguf_rel: "Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf",
         // `deepreinforce-ai/Ornith-1.0-9B-GGUF` (the design doc's guess)
         // redirects here — the org was renamed, not an unofficial re-upload.
         hf_repo: "ornith-ai/Ornith-1.0-9B-GGUF",
-        hf_file: "ornith-1.0-9b-Q6_K.gguf",
+        hf_file: "ornith-1.0-9b-Q4_K_M.gguf",
         // The model card recommends ctx up to 256k; 8192 is a sane default
         // for single-GPU chat use, and (issue #3) now actually takes effect
         // as requested rather than being clamped to a hardcoded 4096 — see
@@ -87,15 +92,14 @@ pub const REGISTRY: &[ModelSpec] = &[
         thinking_default: true,
     },
     ModelSpec {
-        name: "ornith-9b-q4",
+        name: "ornith-9b-q6",
         family: ModelFamily::Qwen35Hybrid,
-        gguf_rel: "Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf",
+        gguf_rel: "Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf",
         hf_repo: "ornith-ai/Ornith-1.0-9B-GGUF",
-        hf_file: "ornith-1.0-9b-Q4_K_M.gguf",
-        // Speed variant: ~2x decode vs Q6_K on this engine (the q6_k gemv is
-        // ALU-bound, see issue #7) and 1.7 GB more VRAM headroom for KV.
-        // Q6_K stays the default `ornith-9b` until the #15 agentic eval
-        // rules on Q4_K_M's tool-calling quality.
+        hf_file: "ornith-1.0-9b-Q6_K.gguf",
+        // Quality-reference variant (the #15 eval's fp16-KV baseline was
+        // recorded on this quant); slower — the q6_k gemv is ALU-bound,
+        // see issue #7.
         default_ctx: 8192,
         sampling: SamplingParams {
             temperature: 0.6,

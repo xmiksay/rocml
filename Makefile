@@ -83,12 +83,12 @@ bench:
 # re-scoring already-graded scenarios.
 eval:
 	cargo run --release -p rocml-cli -- eval \
-		--model ornith-9b --ctx 16384 \
+		--model ornith-9b-q6 --ctx 16384 \
 		--label ornith-q6k-fp16kv \
 		--out bench/eval/results/ornith-q6k-fp16kv.json \
 		--resume
 	cargo run --release -p rocml-cli -- eval \
-		--model ornith-9b-q4 --ctx 16384 \
+		--model ornith-9b --ctx 16384 \
 		--label ornith-q4km-fp16kv \
 		--out bench/eval/results/ornith-q4km-fp16kv.json \
 		--resume
