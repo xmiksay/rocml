@@ -215,13 +215,36 @@ impl QuantKernels {
     ///
     /// Dispatches to the WMMA matrix-core kernel
     /// (`gemm_xwt_quant_wmma.hip`, issue #6's follow-up) whenever the shape
-    /// can fill at least one full tile cleanly — `rows >= TILE_ROWS` and `m`/
-    /// `n` both multiples of 16 (WMMA's native fragment width) — and falls
-    /// back to the scalar-FMA kernel above otherwise (a short last
-    /// chunked-prefill chunk, or a shape WMMA can't tile at all). `n` is
-    /// already a multiple of 16 for every dtype this dispatches to
-    /// (Q8_0/Q4_K/Q5_K/Q6_K block widths are 32/256/256/256), so the check
-    /// below only ever turns on the fallback for `rows`/`m`.
+    /// can fill at least one full tile cleanly — `rows >= TILE_ROWS`, `m >=
+    /// TILE_M`, and `m`/`n` both multiples of 16 (WMMA's native fragment
+    /// width) — and falls back to the scalar-FMA kernel above otherwise (a
+    /// short last chunked-prefill chunk, a shape WMMA can't tile at all, or
+    /// an `m` narrower than one `TILE_M`-wide output tile). `n` is already a
+    /// multiple of 16 for every dtype this dispatches to (Q8_0/Q4_K/Q5_K/
+    /// Q6_K block widths are 32/256/256/256), so the check below only ever
+    /// turns on the fallback for `rows`/`m`.
+    ///
+    /// **The `m >= TILE_M` clause** (prefill-cleanup round, issue #6):
+    /// without it, a real narrow-output projection — Ornith's GDN
+    /// per-head alpha/beta gates, `m = num_v_heads = 32 < TILE_M(64)` —
+    /// still passed the old `m.is_multiple_of(16)` check and dispatched to
+    /// WMMA, whose grid is `(m.div_ceil(TILE_M), rows.div_ceil(TILE_ROWS))`:
+    /// at `m=32` that's a **single** `grid.x` column, so the whole launch
+    /// runs as one workgroup regardless of `rows` — one CU busy, the other
+    /// 59 idle, serializing every `K_STAGE`-sized reduction step with none
+    /// of WMMA's usual latency-hiding from concurrent tiles. The scalar
+    /// kernel's grid is `(m, rows.div_ceil(GEMM_QUANT_TILE_ROWS))` instead —
+    /// `m` itself is a grid dimension, so `m=32` still yields 32 (or 64 at
+    /// `rows=128`) independent blocks — full occupancy despite lower
+    /// per-FLOP throughput. Measured on ornith-9b @ depth 2048: these two
+    /// projections alone cost ~294ms of a ~4.6s prefill (found by
+    /// temporarily splitting the bundled `gdn-conv` profiler scope into its
+    /// constituent kernels — the *conv1d* kernel itself, this round's other
+    /// fix, was never the bottleneck the aggregate label suggested; see
+    /// `.claude/CLAUDE.md`'s "Chunked prefill" section for the honest
+    /// before/after numbers). This clause routes `m < TILE_M` shapes to
+    /// scalar unconditionally — it does not special-case just this one
+    /// tensor, so any future narrow projection gets the same fix for free.
     ///
     /// Known numeric consequence (measured, not a bug — see the kernel
     /// source's module doc and issue #6's synthetic correctness tests for
@@ -255,7 +278,11 @@ impl QuantKernels {
         m: u32,
         n: u32,
     ) -> Result<(), RocmlError> {
-        if rows >= GEMM_WMMA_TILE_ROWS && m.is_multiple_of(16) && n.is_multiple_of(16) {
+        if rows >= GEMM_WMMA_TILE_ROWS
+            && m >= GEMM_WMMA_TILE_M
+            && m.is_multiple_of(16)
+            && n.is_multiple_of(16)
+        {
             self.gemm_wmma(dtype, x, w, out, rows, m, n)
         } else {
             self.gemm_scalar(dtype, x, w, out, rows, m, n)
