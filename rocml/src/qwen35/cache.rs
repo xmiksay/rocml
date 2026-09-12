@@ -13,10 +13,12 @@
 use half::f16;
 use rocml_hip::DeviceBuffer;
 
+use super::cache_mixed::MixedAttnPlane;
 use super::config::{GdnConfig, LayerKind, Qwen35Config};
 use crate::cache::KvDtype;
 use crate::error::RocmlError;
 use crate::forward::kernels::{offset, DevPtr, Kernels};
+use crate::load_opts::KvCacheMode;
 
 pub struct GdnLayerState {
     /// `[conv_dim, kernel-1]` row-major: per-channel history, oldest first.
@@ -152,21 +154,57 @@ impl AttnPlane {
     }
 }
 
+/// One full-attention layer's KV cache: either the dense per-layer plane
+/// (`AttnPlane`, f16 or f32) or the KIVI-style quantized mixed layout
+/// (`MixedAttnPlane`, issue #2). Which one a given layer gets is decided
+/// once at `HybridCache::new` time — see that function's doc comment for
+/// the boundary-layer-skip rule.
+pub enum AttnLayerCache {
+    Dense(AttnPlane),
+    Mixed(MixedAttnPlane),
+}
+
 pub struct HybridCache {
     max_seq: u32,
     gdn: Vec<Option<GdnLayerState>>,
-    attn: Vec<Option<AttnPlane>>,
+    attn: Vec<Option<AttnLayerCache>>,
+    has_mixed_layers: bool,
 }
 
 impl HybridCache {
     /// `ctx` is the caller's already-budgeted context length (see
     /// `crate::registry::clamp_ctx`) — clamped once more here against the
     /// model's own declared `context_length` as a final sanity bound.
-    pub fn new(cfg: &Qwen35Config, ctx: usize, dtype: KvDtype) -> Result<Self, RocmlError> {
+    ///
+    /// Boundary-layer skip (issue #2): when `mode` is quantized, the
+    /// *first* and *last* full-attention layers (by position among this
+    /// architecture's full-attention layers specifically, not raw layer
+    /// index) always get a dense fp16 plane regardless of `mode` — only
+    /// the layers strictly between them get the mixed quantized layout. A
+    /// model with only one full-attention layer has no mixed layers at all
+    /// (that one layer is simultaneously first and last).
+    pub fn new(cfg: &Qwen35Config, ctx: usize, mode: KvCacheMode) -> Result<Self, RocmlError> {
         let max_seq = ctx.min(cfg.context_length as usize).max(1) as u32;
+        let attn_indices: Vec<usize> = cfg
+            .layer_kinds
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| **k == LayerKind::FullAttention)
+            .map(|(i, _)| i)
+            .collect();
+        let (first_boundary, last_boundary) =
+            (attn_indices.first().copied(), attn_indices.last().copied());
+
+        let dense_dtype = mode.dense_dtype();
+        let v_bits: u8 = match mode {
+            KvCacheMode::Q4Mixed => 4,
+            _ => 8,
+        };
+
         let mut gdn = Vec::with_capacity(cfg.layer_kinds.len());
         let mut attn = Vec::with_capacity(cfg.layer_kinds.len());
-        for &kind in &cfg.layer_kinds {
+        let mut has_mixed_layers = false;
+        for (idx, &kind) in cfg.layer_kinds.iter().enumerate() {
             match kind {
                 LayerKind::LinearAttention => {
                     gdn.push(Some(GdnLayerState::new(&cfg.gdn)?));
@@ -174,20 +212,45 @@ impl HybridCache {
                 }
                 LayerKind::FullAttention => {
                     gdn.push(None);
-                    attn.push(Some(AttnPlane::new(
-                        cfg.head_count_kv,
-                        max_seq,
-                        cfg.head_dim,
-                        dtype,
-                    )?));
+                    let is_boundary = Some(idx) == first_boundary || Some(idx) == last_boundary;
+                    let layer_cache = if mode.is_quantized() && !is_boundary {
+                        has_mixed_layers = true;
+                        AttnLayerCache::Mixed(MixedAttnPlane::new(
+                            cfg.head_count_kv,
+                            cfg.head_dim,
+                            max_seq,
+                            v_bits,
+                        )?)
+                    } else {
+                        AttnLayerCache::Dense(AttnPlane::new(
+                            cfg.head_count_kv,
+                            max_seq,
+                            cfg.head_dim,
+                            dense_dtype,
+                        )?)
+                    };
+                    attn.push(Some(layer_cache));
                 }
             }
         }
-        Ok(Self { max_seq, gdn, attn })
+        Ok(Self {
+            max_seq,
+            gdn,
+            attn,
+            has_mixed_layers,
+        })
     }
 
     pub fn max_seq(&self) -> u32 {
         self.max_seq
+    }
+
+    /// Whether any layer uses the mixed quantized layout — `Model::forward_prompt`
+    /// uses this to fall back to token-serial prefill (issue #6's chunked
+    /// path doesn't support the mixed cache yet, see that function's doc
+    /// comment).
+    pub fn has_mixed_layers(&self) -> bool {
+        self.has_mixed_layers
     }
 
     /// Zeroes every GDN layer's conv/recurrence state for a fresh sequence.
@@ -205,12 +268,30 @@ impl HybridCache {
             .ok_or_else(|| RocmlError::Config(format!("cache: layer {layer_idx} has no GDN state")))
     }
 
-    pub fn attn_mut(&mut self, layer_idx: usize) -> Result<&mut AttnPlane, RocmlError> {
+    /// Decode-path accessor: either variant. See `qwen35::forward::attention::attention_step`.
+    pub fn attn_mut(&mut self, layer_idx: usize) -> Result<&mut AttnLayerCache, RocmlError> {
         self.attn
             .get_mut(layer_idx)
             .and_then(Option::as_mut)
             .ok_or_else(|| {
                 RocmlError::Config(format!("cache: layer {layer_idx} has no attention plane"))
             })
+    }
+
+    /// Chunked-prefill-path accessor: errors if this layer turned out to be
+    /// `Mixed` — the chunked path (issue #6) doesn't support the mixed
+    /// cache, so `Model::forward_prompt` only ever calls it when
+    /// `has_mixed_layers()` is false, making this branch unreachable in
+    /// practice; it's a clear error rather than a panic in case that
+    /// invariant is ever violated.
+    pub fn attn_dense_mut(&mut self, layer_idx: usize) -> Result<&mut AttnPlane, RocmlError> {
+        match self.attn_mut(layer_idx)? {
+            AttnLayerCache::Dense(plane) => Ok(plane),
+            AttnLayerCache::Mixed(_) => Err(RocmlError::Config(format!(
+                "cache: layer {layer_idx} uses the mixed KV cache, which chunked prefill \
+                 doesn't support (internal bug: forward_prompt should have fallen back to \
+                 token-serial prefill)"
+            ))),
+        }
     }
 }

@@ -97,9 +97,9 @@ pub fn resolve(name_or_path: &str, download: bool) -> Result<ResolvedModel, Rocm
 pub fn clamp_ctx(
     requested: usize,
     gguf_path: &Path,
-    kv_dtype: crate::cache::KvDtype,
+    kv_cache: crate::load_opts::KvCacheMode,
 ) -> Result<usize, RocmlError> {
-    let (budget, model_ctx_cap) = crate::budget::estimate_from_gguf(gguf_path, kv_dtype)?;
+    let (budget, model_ctx_cap) = crate::budget::estimate_from_gguf(gguf_path, kv_cache)?;
     let cap = budget.max_ctx().min(model_ctx_cap).max(1);
     if requested > cap {
         eprintln!(
@@ -282,7 +282,7 @@ mod tests {
             return;
         };
         assert_eq!(
-            clamp_ctx(64, &path, crate::cache::KvDtype::F16).expect("clamp_ctx"),
+            clamp_ctx(64, &path, crate::load_opts::KvCacheMode::Fp16).expect("clamp_ctx"),
             64
         );
     }
@@ -295,7 +295,8 @@ mod tests {
         // A request far beyond any plausible VRAM budget or the model's own
         // declared context_length must come back clamped, not passed
         // through untouched.
-        let clamped = clamp_ctx(10_000_000, &path, crate::cache::KvDtype::F16).expect("clamp_ctx");
+        let clamped =
+            clamp_ctx(10_000_000, &path, crate::load_opts::KvCacheMode::Fp16).expect("clamp_ctx");
         assert!(clamped > 0);
         assert!(clamped < 10_000_000);
     }

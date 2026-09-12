@@ -13,6 +13,7 @@ mod ffn_chunk;
 mod gdn;
 mod gdn_chunk;
 mod kernels;
+pub(crate) mod kernels_mixed;
 mod scratch;
 
 use std::path::Path;
@@ -20,6 +21,7 @@ use std::path::Path;
 use chunk_kernels::ChunkKernels;
 use chunk_scratch::ChunkScratch;
 use kernels::HybridKernels;
+use kernels_mixed::MixedKernels;
 use rocml_core::gguf::GgufFile;
 use rocml_hip::{Device, MemoryInfo};
 use scratch::Scratch;
@@ -27,7 +29,7 @@ use scratch::Scratch;
 use super::cache::HybridCache;
 use super::config::{LayerKind, Qwen35Config};
 use super::weights::{LayerWeights, ModelWeights};
-use crate::budget::{kv_bytes_per_token, Budget, HIGH_USAGE_WARN_FRACTION};
+use crate::budget::{mixed_kv_bytes_per_token, Budget, HIGH_USAGE_WARN_FRACTION};
 use crate::error::RocmlError;
 use crate::forward::kernels::{offset, Kernels};
 use crate::load_opts::LoadOptions;
@@ -40,6 +42,11 @@ pub struct Model {
     cache: HybridCache,
     kernels: Kernels,
     hybrid: HybridKernels,
+    /// KIVI-style mixed KV cache kernels (issue #2) — loaded unconditionally
+    /// like every other kernel set, even when `opts.kv_cache` is dense-only,
+    /// since it's cheap and keeps `Model` shape independent of the chosen
+    /// mode.
+    mixed_kernels: MixedKernels,
     scratch: Scratch,
     /// Chunked-prefill-only kernels/scratch (issue #6) — see
     /// `chunk_forward::forward_chunk`. Loaded unconditionally at model load
@@ -54,30 +61,48 @@ impl Model {
     /// See `crate::forward::Model::load`'s doc comment — mirrors that
     /// budget-check-then-allocate flow, with `n_cache_layers` counting only
     /// this architecture's full-attention layers (GDN layers' state is O(1)
-    /// in context length, see `HybridCache`).
+    /// in context length, see `HybridCache`). Issue #2's quantized modes
+    /// (`Q8`/`Q4Mixed`) are only implemented for this hybrid architecture,
+    /// not the dense one — see `HybridCache::new`'s doc comment for the
+    /// boundary-layer-skip rule this budget calculation must also account
+    /// for (`mixed_kv_bytes_per_token` takes the boundary-layer count).
     pub fn load(gguf_path: impl AsRef<Path>, opts: LoadOptions) -> Result<Self, RocmlError> {
-        if opts.kv_cache.is_quantized() {
-            return Err(RocmlError::Config(format!(
-                "kv-cache mode {:?} is not yet implemented (issue #2 in progress)",
-                opts.kv_cache
-            )));
-        }
         let device = Device::new(0)?;
         let gguf = GgufFile::open(gguf_path)?;
         let config = Qwen35Config::from_gguf(&gguf)?;
         let weights = ModelWeights::load(&gguf, &config)?;
 
-        let dtype = opts.kv_cache.dense_dtype();
-        let n_cache_layers = config
+        let n_attn_layers = config
             .layer_kinds
             .iter()
             .filter(|k| **k == LayerKind::FullAttention)
             .count() as u32;
-        let per_token =
-            kv_bytes_per_token(n_cache_layers, config.head_count_kv, config.head_dim, dtype);
+        // Boundary layers (first + last full-attention layer) always stay
+        // dense fp16 regardless of mode — see HybridCache::new. A
+        // single-attention-layer model has zero mixed layers (that layer is
+        // both boundary positions at once).
+        let n_boundary_layers = n_attn_layers.min(2);
+        let n_mixed_layers = n_attn_layers.saturating_sub(n_boundary_layers);
+        let v_bits: u8 = match opts.kv_cache {
+            crate::load_opts::KvCacheMode::Q4Mixed => 4,
+            _ => 8,
+        };
+        let (per_token, fixed_overhead) = mixed_kv_bytes_per_token(
+            opts.kv_cache,
+            n_boundary_layers,
+            n_mixed_layers,
+            config.head_count_kv,
+            config.head_dim,
+            v_bits,
+        );
         let ctx = opts.ctx.min(config.context_length as usize).max(1);
         let mem = device.memory_info()?;
-        let budget = Budget::for_loaded_weights(mem.total as u64, mem.free as u64, per_token);
+        let budget = Budget::for_loaded_weights_with_overhead(
+            mem.total as u64,
+            mem.free as u64,
+            per_token,
+            fixed_overhead,
+        );
         if !budget.fits(ctx) {
             return Err(RocmlError::VramBudget {
                 requested_ctx: ctx,
@@ -93,9 +118,10 @@ impl Model {
             );
         }
 
-        let cache = HybridCache::new(&config, ctx, dtype)?;
+        let cache = HybridCache::new(&config, ctx, opts.kv_cache)?;
         let kernels = Kernels::load_all()?;
         let hybrid = HybridKernels::load_all()?;
+        let mixed_kernels = MixedKernels::load_all()?;
         let scratch = Scratch::new(&config)?;
         let chunk_kernels = ChunkKernels::load_all()?;
         let chunk_scratch = ChunkScratch::new(&config)?;
@@ -107,6 +133,7 @@ impl Model {
             cache,
             kernels,
             hybrid,
+            mixed_kernels,
             scratch,
             chunk_kernels,
             chunk_scratch,
@@ -264,6 +291,7 @@ impl Model {
                                 attention::attention_step(
                                     &self.kernels,
                                     &self.hybrid,
+                                    &self.mixed_kernels,
                                     &self.config,
                                     attn_weights,
                                     plane,
@@ -290,6 +318,7 @@ impl Model {
                         attention::attention_step(
                             &self.kernels,
                             &self.hybrid,
+                            &self.mixed_kernels,
                             &self.config,
                             attn_weights,
                             plane,
@@ -365,5 +394,34 @@ impl Model {
 
         self.pos += 1;
         Ok(logits)
+    }
+
+    /// Processes a whole prompt and returns its last token's logits — the
+    /// hybrid architecture's public prompt-processing entry point (see
+    /// `crate::model::Model::forward_prompt`). Issue #6's batched chunked
+    /// path (`forward_prompt_chunked`, defined in `chunk_forward.rs`)
+    /// doesn't support the mixed KV cache (issue #2) yet — quantize-on-evict
+    /// and the fused mixed-KV read are only wired into the decode-style
+    /// attention step (`attention::attention_step`), not the chunked one
+    /// (`attention_chunk::attention_chunk_step`) — so a cache with any
+    /// mixed layer falls back to the token-serial loop every architecture
+    /// already has via `forward_token`, at a prefill-throughput cost this
+    /// is a documented, deliberate scope cut for (decode is where issue #2's
+    /// bandwidth win actually matters — see that issue's own review comment
+    /// on why quantized KV speeds decode, not just capacity).
+    pub fn forward_prompt(
+        &mut self,
+        prompt_ids: &[u32],
+        prof: Option<&Profiler>,
+    ) -> Result<Vec<f32>, RocmlError> {
+        if self.cache.has_mixed_layers() {
+            let mut logits = Vec::new();
+            for &id in prompt_ids {
+                logits = self.forward_token_profiled(id, prof)?;
+            }
+            Ok(logits)
+        } else {
+            self.forward_prompt_chunked(prompt_ids, prof)
+        }
     }
 }

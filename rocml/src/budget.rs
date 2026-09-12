@@ -20,6 +20,8 @@ use rocml_core::gguf::GgufFile;
 use crate::cache::KvDtype;
 use crate::config::ModelConfig;
 use crate::error::RocmlError;
+use crate::kv_quant::{SINK_LEN, WINDOW_LEN};
+use crate::load_opts::KvCacheMode;
 use crate::qwen35::config::{LayerKind, Qwen35Config};
 
 /// Fixed scratch/activation headroom reserved on top of weights + KV bytes.
@@ -57,6 +59,48 @@ pub fn kv_bytes_per_token(
     2 * n_cache_layers as u64 * n_kv_heads as u64 * head_dim as u64 * bytes_per_elem
 }
 
+/// VRAM accounting for the KIVI-style mixed KV cache (issue #2):
+/// `n_boundary_layers` full-attention layers stay dense fp16 (the plain
+/// [`kv_bytes_per_token`] formula); `n_mixed_layers` split into a per-token
+/// bulk cost (K per-channel Q8 code + its amortized per-block scale; V
+/// per-token Q8/Q4 code + its per-token scale) plus a fixed, ctx-independent
+/// overhead (the sink + recent-window fp16 buffers, sized once regardless of
+/// context length). Returns `(bytes_per_token, fixed_overhead_bytes)` — feed
+/// both into [`Budget::for_loaded_weights_with_overhead`] /
+/// [`Budget::for_estimated_weights_with_overhead`].
+pub fn mixed_kv_bytes_per_token(
+    _mode: KvCacheMode,
+    n_boundary_layers: u32,
+    n_mixed_layers: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    v_bits: u8,
+) -> (u64, u64) {
+    let boundary_per_token =
+        kv_bytes_per_token(n_boundary_layers, n_kv_heads, head_dim, KvDtype::F16);
+
+    let v_code_bytes: u64 = if v_bits == 8 {
+        head_dim as u64
+    } else {
+        (head_dim as u64).div_ceil(2)
+    };
+    // K's per-channel scale (f32, one per (kv_head, channel) per evicted
+    // block) amortized over that block's WINDOW_LEN tokens; V's per-token
+    // scale (f32) is exact, not amortized.
+    let k_scale_amortized_per_token = (head_dim as u64 * 4).div_ceil(WINDOW_LEN as u64);
+    let mixed_bulk_per_layer =
+        n_kv_heads as u64 * (head_dim as u64 + k_scale_amortized_per_token + v_code_bytes + 4);
+    let mixed_per_token = n_mixed_layers as u64 * mixed_bulk_per_layer;
+
+    // Sink + recent-window fp16 K/V buffers: fixed capacity regardless of
+    // ctx, so this is a one-time cost per mixed layer, not per token.
+    let sink_window_bytes_per_layer =
+        n_kv_heads as u64 * (SINK_LEN as u64 + WINDOW_LEN as u64) * head_dim as u64 * 2 * 2;
+    let fixed_overhead = n_mixed_layers as u64 * sink_window_bytes_per_layer;
+
+    (boundary_per_token + mixed_per_token, fixed_overhead)
+}
+
 /// A VRAM budget snapshot: how much is free (net of weights, however they
 /// were accounted for — see the two constructors), how much weights take
 /// (for display only), how much one token of KV costs, and the fixed
@@ -75,6 +119,10 @@ pub struct Budget {
     /// folded into `free_bytes`, never subtracted again.
     pub weights_bytes: u64,
     pub kv_bytes_per_token: u64,
+    /// Fixed KV-cache bytes independent of `ctx` — e.g. issue #2's mixed
+    /// layout's sink + recent-window buffers (sized once, not per token).
+    /// 0 for the plain dense cache (see `kv_bytes_per_token`'s callers).
+    pub fixed_overhead_bytes: u64,
 }
 
 impl Budget {
@@ -89,11 +137,30 @@ impl Budget {
         weights_bytes: u64,
         kv_bytes_per_token: u64,
     ) -> Self {
+        Self::for_estimated_weights_with_overhead(
+            total_bytes,
+            free_bytes_before_weights,
+            weights_bytes,
+            kv_bytes_per_token,
+            0,
+        )
+    }
+
+    /// Like [`Self::for_estimated_weights`], plus a fixed ctx-independent KV
+    /// overhead (issue #2's mixed layout — see `mixed_kv_bytes_per_token`).
+    pub fn for_estimated_weights_with_overhead(
+        total_bytes: u64,
+        free_bytes_before_weights: u64,
+        weights_bytes: u64,
+        kv_bytes_per_token: u64,
+        fixed_overhead_bytes: u64,
+    ) -> Self {
         Self {
             total_bytes,
             free_bytes: free_bytes_before_weights.saturating_sub(weights_bytes),
             weights_bytes,
             kv_bytes_per_token,
+            fixed_overhead_bytes,
         }
     }
 
@@ -102,11 +169,23 @@ impl Budget {
     /// them — `weights_bytes` is derived (`total - free`) purely for the
     /// breakdown's display.
     pub fn for_loaded_weights(total_bytes: u64, free_bytes: u64, kv_bytes_per_token: u64) -> Self {
+        Self::for_loaded_weights_with_overhead(total_bytes, free_bytes, kv_bytes_per_token, 0)
+    }
+
+    /// Like [`Self::for_loaded_weights`], plus a fixed ctx-independent KV
+    /// overhead (issue #2's mixed layout — see `mixed_kv_bytes_per_token`).
+    pub fn for_loaded_weights_with_overhead(
+        total_bytes: u64,
+        free_bytes: u64,
+        kv_bytes_per_token: u64,
+        fixed_overhead_bytes: u64,
+    ) -> Self {
         Self {
             total_bytes,
             free_bytes,
             weights_bytes: total_bytes.saturating_sub(free_bytes),
             kv_bytes_per_token,
+            fixed_overhead_bytes,
         }
     }
 
@@ -114,16 +193,20 @@ impl Budget {
         self.free_bytes.saturating_sub(ACTIVATION_HEADROOM_BYTES)
     }
 
-    /// Largest context length whose KV cache fits in `usable_bytes`.
+    /// Largest context length whose KV cache (including the fixed overhead)
+    /// fits in `usable_bytes`.
     pub fn max_ctx(&self) -> usize {
         if self.kv_bytes_per_token == 0 {
             return usize::MAX;
         }
-        (self.usable_bytes() / self.kv_bytes_per_token) as usize
+        let usable = self
+            .usable_bytes()
+            .saturating_sub(self.fixed_overhead_bytes);
+        (usable / self.kv_bytes_per_token) as usize
     }
 
     pub fn kv_bytes(&self, ctx: usize) -> u64 {
-        self.kv_bytes_per_token * ctx as u64
+        self.kv_bytes_per_token * ctx as u64 + self.fixed_overhead_bytes
     }
 
     pub fn fits(&self, ctx: usize) -> bool {
@@ -190,17 +273,30 @@ fn gib(bytes: u64) -> f64 {
 ///
 /// Returns the estimated budget plus the model's own declared
 /// `context_length` (a second, independent cap `clamp_ctx` also applies).
+///
+/// `mode`'s quantized variants (issue #2) only affect the estimate for the
+/// `qwen35` hybrid architecture (the only one that implements them —
+/// `forward::Model::load` rejects a quantized mode for the dense `qwen3`
+/// architecture with a clear error at actual load time); this pre-load
+/// estimate simply treats a dense `qwen3` GGUF as `mode.dense_dtype()`
+/// regardless, since the real error surfaces there anyway.
 pub fn estimate_from_gguf(
     gguf_path: &Path,
-    kv_dtype: KvDtype,
+    mode: KvCacheMode,
 ) -> Result<(Budget, usize), RocmlError> {
     let file_bytes = std::fs::metadata(gguf_path).map(|m| m.len()).unwrap_or(0);
     let gguf = GgufFile::open(gguf_path)?;
     let arch = gguf.get_str("general.architecture")?;
-    let (n_cache_layers, n_kv_heads, head_dim, model_ctx_cap) = match arch {
+    let (per_token, fixed_overhead, model_ctx_cap) = match arch {
         "qwen3" => {
             let c = ModelConfig::from_gguf(&gguf)?;
-            (c.block_count, c.head_count_kv, c.head_dim, c.context_length)
+            let per_token = kv_bytes_per_token(
+                c.block_count,
+                c.head_count_kv,
+                c.head_dim,
+                mode.dense_dtype(),
+            );
+            (per_token, 0, c.context_length)
         }
         "qwen35" => {
             let c = Qwen35Config::from_gguf(&gguf)?;
@@ -209,7 +305,25 @@ pub fn estimate_from_gguf(
                 .iter()
                 .filter(|k| **k == LayerKind::FullAttention)
                 .count() as u32;
-            (n_attn, c.head_count_kv, c.head_dim, c.context_length)
+            let (per_token, fixed_overhead) = if mode.is_quantized() {
+                let n_boundary = n_attn.min(2);
+                let n_mixed = n_attn.saturating_sub(n_boundary);
+                let v_bits: u8 = if mode == KvCacheMode::Q4Mixed { 4 } else { 8 };
+                mixed_kv_bytes_per_token(
+                    mode,
+                    n_boundary,
+                    n_mixed,
+                    c.head_count_kv,
+                    c.head_dim,
+                    v_bits,
+                )
+            } else {
+                (
+                    kv_bytes_per_token(n_attn, c.head_count_kv, c.head_dim, mode.dense_dtype()),
+                    0,
+                )
+            };
+            (per_token, fixed_overhead, c.context_length)
         }
         other => {
             return Err(RocmlError::UnsupportedArchitecture {
@@ -217,11 +331,15 @@ pub fn estimate_from_gguf(
             })
         }
     };
-    let per_token = kv_bytes_per_token(n_cache_layers, n_kv_heads, head_dim, kv_dtype);
     let device = rocml_hip::Device::new(0)?;
     let mem = device.memory_info()?;
-    let budget =
-        Budget::for_estimated_weights(mem.total as u64, mem.free as u64, file_bytes, per_token);
+    let budget = Budget::for_estimated_weights_with_overhead(
+        mem.total as u64,
+        mem.free as u64,
+        file_bytes,
+        per_token,
+        fixed_overhead,
+    );
     Ok((budget, model_ctx_cap as usize))
 }
 

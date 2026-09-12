@@ -70,7 +70,7 @@ pub fn resolve_ctx(
     kv_cache: KvCacheMode,
 ) -> Result<usize, RocmlError> {
     let requested = explicit.unwrap_or_else(|| spec.map_or(default_ctx, |s| s.default_ctx));
-    rocml::registry::clamp_ctx(requested, gguf_path, kv_cache.dense_dtype())
+    rocml::registry::clamp_ctx(requested, gguf_path, kv_cache)
 }
 
 /// Sampling flags shared by `chat` and `generate`. `bench` doesn't take

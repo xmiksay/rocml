@@ -97,7 +97,7 @@ async fn run(args: Args) -> Result<(), String> {
     let requested_ctx = args
         .ctx
         .unwrap_or_else(|| spec.map_or(DEFAULT_CTX, |s| s.default_ctx));
-    let ctx = rocml::registry::clamp_ctx(requested_ctx, &resolved.path, kv_cache.dense_dtype())
+    let ctx = rocml::registry::clamp_ctx(requested_ctx, &resolved.path, kv_cache)
         .map_err(|e| e.to_string())?;
     // `--no-think` can only force reasoning off, not force it on over a
     // preset that defaults it off — matching the CLI's existing one-way

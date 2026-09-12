@@ -136,7 +136,12 @@ impl Model {
                     )?;
                 }
                 (LayerWeights::Attention(attn_weights), LayerKind::FullAttention) => {
-                    let plane = self.cache.attn_mut(layer_idx)?;
+                    // Chunked prefill only ever runs when the cache has no
+                    // mixed layers (see `Model::forward_prompt`'s doc
+                    // comment) — attn_dense_mut errors clearly if that
+                    // invariant is ever violated instead of silently
+                    // misinterpreting a quantized plane as dense.
+                    let plane = self.cache.attn_dense_mut(layer_idx)?;
                     attention_chunk_step(
                         &self.kernels,
                         &self.hybrid,

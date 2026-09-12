@@ -4,12 +4,13 @@
 //! (crane-core/src/models/qwen3_5/modeling.rs) for a single timestep.
 
 use super::kernels::HybridKernels;
+use super::kernels_mixed::MixedKernels;
 use super::scratch::Scratch;
 use crate::cache::KvDtype;
 use crate::error::RocmlError;
 use crate::forward::kernels::{attn_decode_splits, offset, Kernels};
 use crate::profile::{self, OpKind, Profiler};
-use crate::qwen35::cache::AttnPlane;
+use crate::qwen35::cache::AttnLayerCache;
 use crate::qwen35::config::Qwen35Config;
 use crate::qwen35::weights::AttnLayerWeights;
 
@@ -17,9 +18,10 @@ use crate::qwen35::weights::AttnLayerWeights;
 pub(crate) fn attention_step(
     kernels: &Kernels,
     hybrid: &HybridKernels,
+    mixed: &MixedKernels,
     config: &Qwen35Config,
     layer: &AttnLayerWeights,
-    plane: &mut AttnPlane,
+    plane: &mut AttnLayerCache,
     max_seq: u32,
     scratch: &mut Scratch,
     pos: u32,
@@ -167,38 +169,83 @@ pub(crate) fn attention_step(
         OpKind::AttnDecode,
         attn_bytes,
         attn_flops,
-        || {
-            plane.append(
-                kernels,
-                pos,
-                max_seq,
-                n_kv_heads,
-                head_dim,
-                &scratch.attn_k,
-                &scratch.attn_v,
-            )?;
+        || match plane {
+            AttnLayerCache::Dense(plane) => {
+                plane.append(
+                    kernels,
+                    pos,
+                    max_seq,
+                    n_kv_heads,
+                    head_dim,
+                    &scratch.attn_k,
+                    &scratch.attn_v,
+                )?;
 
-            let scale = 1.0f32 / (head_dim as f32).sqrt();
-            let decode = match plane.dtype() {
-                KvDtype::F16 => Kernels::attn_decode_f16,
-                KvDtype::F32 => Kernels::attn_decode,
-            };
-            decode(
-                kernels,
-                offset(&scratch.attn_q, 0),
-                plane.k_ptr(),
-                plane.v_ptr(),
-                offset(&scratch.attn_concat, 0),
-                offset(&scratch.attn_partial_out, 0),
-                offset(&scratch.attn_partial_m, 0),
-                offset(&scratch.attn_partial_l, 0),
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                max_seq,
-                cur_len,
-                scale,
-            )
+                let scale = 1.0f32 / (head_dim as f32).sqrt();
+                let decode = match plane.dtype() {
+                    KvDtype::F16 => Kernels::attn_decode_f16,
+                    KvDtype::F32 => Kernels::attn_decode,
+                };
+                decode(
+                    kernels,
+                    offset(&scratch.attn_q, 0),
+                    plane.k_ptr(),
+                    plane.v_ptr(),
+                    offset(&scratch.attn_concat, 0),
+                    offset(&scratch.attn_partial_out, 0),
+                    offset(&scratch.attn_partial_m, 0),
+                    offset(&scratch.attn_partial_l, 0),
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_seq,
+                    cur_len,
+                    scale,
+                )
+            }
+            AttnLayerCache::Mixed(plane) => {
+                plane.append(kernels, mixed, pos, &scratch.attn_k, &scratch.attn_v)?;
+
+                let scale = 1.0f32 / (head_dim as f32).sqrt();
+                let ptrs = plane.ptrs();
+                let (n_splits, split_len) = attn_decode_splits(n_kv_heads, cur_len);
+                mixed.attn_decode_partial_mixed(
+                    ptrs.v_bits,
+                    offset(&scratch.attn_q, 0),
+                    ptrs.sink_k,
+                    ptrs.sink_v,
+                    ptrs.window_k,
+                    ptrs.window_v,
+                    ptrs.bulk_k_codes,
+                    ptrs.bulk_k_scales,
+                    ptrs.bulk_v_codes,
+                    ptrs.bulk_v_scales,
+                    offset(&scratch.attn_partial_out, 0),
+                    offset(&scratch.attn_partial_m, 0),
+                    offset(&scratch.attn_partial_l, 0),
+                    n_kv_heads,
+                    n_heads / n_kv_heads,
+                    head_dim,
+                    ptrs.sink_len,
+                    ptrs.window_len,
+                    ptrs.window_base,
+                    ptrs.bulk_cap,
+                    ptrs.num_blocks_total,
+                    cur_len,
+                    split_len,
+                    n_splits,
+                    scale,
+                )?;
+                kernels.attn_decode_reduce(
+                    offset(&scratch.attn_partial_out, 0),
+                    offset(&scratch.attn_partial_m, 0),
+                    offset(&scratch.attn_partial_l, 0),
+                    offset(&scratch.attn_concat, 0),
+                    n_heads,
+                    head_dim,
+                    n_splits,
+                )
+            }
         },
     )?;
 

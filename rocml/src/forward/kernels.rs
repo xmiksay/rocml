@@ -438,6 +438,35 @@ impl Kernels {
                 .launch(&partial_cfg, &mut partial_params, None)
         }?;
 
+        self.attn_decode_reduce(
+            partial_out,
+            partial_m,
+            partial_l,
+            out,
+            n_heads,
+            head_dim,
+            n_splits,
+        )
+    }
+
+    /// `attn_decode_reduce_f32`: merges per-split online-softmax partials
+    /// into the final per-head output. Dtype-independent (only ever reads
+    /// the f32 partial scratch buffers, never the cache itself) — shared by
+    /// every KV storage scheme's partial kernel: [`Self::attn_decode`],
+    /// [`Self::attn_decode_f16`], and the mixed-KV cache's
+    /// `MixedKernels::attn_decode_partial_mixed` (issue #2), which calls
+    /// this directly since it has no dtype-specific reduce pass of its own.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_reduce(
+        &self,
+        partial_out: DevPtr,
+        partial_m: DevPtr,
+        partial_l: DevPtr,
+        out: DevPtr,
+        n_heads: u32,
+        head_dim: u32,
+        n_splits: u32,
+    ) -> Result<(), RocmlError> {
         let reduce_cfg = LaunchConfig {
             grid: (n_heads, 1, 1),
             block: (head_dim, 1, 1),
@@ -624,20 +653,15 @@ impl Kernels {
             scale,
         )?;
 
-        let reduce_cfg = LaunchConfig {
-            grid: (n_heads, 1, 1),
-            block: (head_dim, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut reduce_params =
-            kernel_params!(partial_out, partial_m, partial_l, out, head_dim, n_splits);
-        // SAFETY: same reduce kernel/contract as `attn_decode`'s reduce
-        // pass — see that method's SAFETY comment.
-        unsafe {
-            self.attn_decode_reduce_fn
-                .launch(&reduce_cfg, &mut reduce_params, None)
-        }
-        .map_err(Into::into)
+        self.attn_decode_reduce(
+            partial_out,
+            partial_m,
+            partial_l,
+            out,
+            n_heads,
+            head_dim,
+            n_splits,
+        )
     }
 
     /// f16-KV-cache sibling of [`Self::attn_prefill`] (issue #3's default

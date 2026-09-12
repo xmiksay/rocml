@@ -69,10 +69,12 @@ impl Model {
     /// Processes a whole (non-empty) prompt and returns the logits for its
     /// last token. The hybrid (qwen35) architecture processes `prompt_ids`
     /// in batched chunks (issue #6 — see
-    /// `qwen35::forward::Model::forward_prompt_chunked`); the dense
-    /// architecture doesn't yet have a chunked forward pass, so it falls
-    /// back to the original token-serial loop (out of scope for issue #6,
-    /// which targets the hybrid models `bench`/the parity suites cover).
+    /// `qwen35::forward::Model::forward_prompt`, which itself falls back to
+    /// token-serial prefill when the cache has any mixed/quantized layer —
+    /// issue #2's chunked-prefill support is a documented follow-up); the
+    /// dense architecture doesn't yet have a chunked forward pass, so it
+    /// falls back to the original token-serial loop (out of scope for issue
+    /// #6, which targets the hybrid models `bench`/the parity suites cover).
     pub fn forward_prompt(
         &mut self,
         prompt_ids: &[u32],
@@ -86,7 +88,7 @@ impl Model {
                 }
                 Ok(logits)
             }
-            Self::Hybrid(m) => m.forward_prompt_chunked(prompt_ids, prof),
+            Self::Hybrid(m) => m.forward_prompt(prompt_ids, prof),
         }
     }
 

@@ -5,6 +5,7 @@
 //! one level down, under this module.
 
 pub mod cache;
+pub(crate) mod cache_mixed;
 pub mod config;
 pub mod forward;
 pub mod weights;
