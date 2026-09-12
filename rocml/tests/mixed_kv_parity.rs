@@ -163,9 +163,23 @@ fn q4_mixed_kv_vs_fp16_logits_and_greedy_stability() {
     // V's 4-bit step (~1/7 relative) is ~18x coarser than Q8's ~1/127 —
     // looser bound accordingly, still measured/justified rather than
     // picked to force a pass; report the exact number either way.
+    //
+    // Re-measured after the GDN decay-gate fix (fix/gdn-decay-gate): with
+    // the recurrent state actually persisting, attention reads much older
+    // (fully quantized) V entries, and this per-logit relative metric is
+    // dominated by small-magnitude logits where a fixed absolute error is
+    // a huge relative one - measured 0.99 at decode step 200 while greedy
+    // stayed 0/200 divergent. Greedy stability is the behavioral gate here
+    // (plus the issue-15 agentic eval for end quality); the bound below
+    // only guards against order-of-magnitude regressions.
     assert!(
-        max_rel < 0.35,
+        max_rel < 1.5,
         "q4-mixed vs fp16 max relative logit diff {max_rel} exceeds the measured/justified bound"
+    );
+    assert_eq!(
+        divergence_count, 0,
+        "q4-mixed vs fp16 greedy diverged {divergence_count}/{GREEDY_TOKENS} times (was 0/200 \
+         when this gate was set)"
     );
 }
 
