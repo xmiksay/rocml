@@ -127,6 +127,75 @@ impl<T: Copy> DeviceBuffer<T> {
         })
     }
 
+    /// Copies `data.len()` elements starting at element `offset` in this
+    /// buffer out to `data` — the D2H counterpart of [`Self::copy_from_device`]'s
+    /// range-based addressing, used by the snapshot layer to read back only
+    /// a plane's *filled* prefix (`[0, N)`) instead of its whole allocated
+    /// capacity. Errors (rather than panics) if `[offset, offset+data.len())`
+    /// would run past this buffer.
+    pub fn copy_range_to_host(&self, offset: usize, data: &mut [T]) -> Result<(), HipError> {
+        let end = offset
+            .checked_add(data.len())
+            .ok_or(HipError::LengthMismatch {
+                expected: self.len,
+                actual: usize::MAX,
+            })?;
+        if end > self.len {
+            return Err(HipError::LengthMismatch {
+                expected: self.len,
+                actual: end,
+            });
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let elem_size = mem::size_of::<T>();
+        // SAFETY: bounds were just checked against this buffer's own live
+        // `hipMalloc` allocation; `data` is a distinct host slice sized to
+        // exactly the bytes being copied.
+        check(unsafe {
+            ffi::hipMemcpy(
+                data.as_mut_ptr() as *mut c_void,
+                (self.ptr as *const u8).add(offset * elem_size) as *const c_void,
+                mem::size_of_val(data),
+                ffi::hip_memcpy_device_to_host,
+            )
+        })
+    }
+
+    /// Writes `data` into this buffer starting at element `offset` — the H2D
+    /// counterpart of [`Self::copy_range_to_host`], used by snapshot restore
+    /// to write a captured plane's prefix back without requiring the host
+    /// slice to cover the buffer's whole capacity. Errors (rather than
+    /// panics) if `[offset, offset+data.len())` would run past this buffer.
+    pub fn copy_range_from_host(&mut self, offset: usize, data: &[T]) -> Result<(), HipError> {
+        let end = offset
+            .checked_add(data.len())
+            .ok_or(HipError::LengthMismatch {
+                expected: self.len,
+                actual: usize::MAX,
+            })?;
+        if end > self.len {
+            return Err(HipError::LengthMismatch {
+                expected: self.len,
+                actual: end,
+            });
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let elem_size = mem::size_of::<T>();
+        // SAFETY: symmetric to copy_range_to_host.
+        check(unsafe {
+            ffi::hipMemcpy(
+                (self.ptr as *mut u8).add(offset * elem_size) as *mut c_void,
+                data.as_ptr() as *const c_void,
+                mem::size_of_val(data),
+                ffi::hip_memcpy_host_to_device,
+            )
+        })
+    }
+
     /// Raw device pointer, valid for use as a kernel launch argument (via
     /// [`crate::kernel_params!`]) as long as `self` is not dropped and no
     /// concurrent host access races the kernel's device-side access.
@@ -251,6 +320,37 @@ mod tests {
         let mut dst = DeviceBuffer::<f32>::new(4).expect("hipMalloc dst failed");
         assert!(dst.copy_from_device(2, &src, 0, 4).is_err());
         assert!(dst.copy_from_device(0, &src, 2, 4).is_err());
+    }
+
+    #[test]
+    fn copy_range_roundtrips_a_prefix() {
+        let _device = Device::new(0).expect("failed to select device 0");
+        let mut buf = DeviceBuffer::<f32>::new(16).expect("hipMalloc failed");
+        buf.copy_from_host(&[0.0f32; 16]).expect("zero-fill failed");
+
+        let written: Vec<f32> = (0..6).map(|i| i as f32 + 100.0).collect();
+        buf.copy_range_from_host(4, &written)
+            .expect("copy_range_from_host failed");
+
+        let mut readback = vec![0.0f32; 6];
+        buf.copy_range_to_host(4, &mut readback)
+            .expect("copy_range_to_host failed");
+        assert_eq!(readback, written);
+
+        // Untouched region stays zero.
+        let mut before = vec![0.0f32; 4];
+        buf.copy_range_to_host(0, &mut before).unwrap();
+        assert!(before.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn copy_range_rejects_out_of_bounds() {
+        let _device = Device::new(0).expect("failed to select device 0");
+        let mut buf = DeviceBuffer::<f32>::new(8).expect("hipMalloc failed");
+        let data = vec![1.0f32; 4];
+        assert!(buf.copy_range_from_host(6, &data).is_err());
+        let mut out = vec![0.0f32; 4];
+        assert!(buf.copy_range_to_host(6, &mut out).is_err());
     }
 
     #[test]
