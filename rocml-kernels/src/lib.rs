@@ -272,6 +272,19 @@ pub const ATTN_DECODE_PARTIAL_MIXED_Q8_KERNEL: &str = "attn_decode_partial_mixed
 pub const ATTN_DECODE_PARTIAL_MIXED_Q4_HSACO: &[u8] = ATTN_DECODE_PARTIAL_MIXED_Q8_HSACO;
 pub const ATTN_DECODE_PARTIAL_MIXED_Q4_KERNEL: &str = "attn_decode_partial_mixed_q4";
 
+/// `kernels/attn_prefill_flash_mixed.hip`: chunked-prefill sibling of
+/// `attn_decode_partial_mixed_q8`/`_q4` above — same `BR`-row-tile x
+/// split-K design as `attn_prefill_flash_partial_f32`/`_f16`, reading K/V
+/// through the mixed cache's sink/bulk/window regions instead of a flat
+/// buffer. Shares `ATTN_PREFILL_FLASH_REDUCE_F32` (no separate reduce
+/// kernel needed — see the kernel source's module doc).
+pub const ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q8_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill_flash_mixed.hsaco"));
+pub const ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q8_KERNEL: &str = "attn_prefill_flash_partial_mixed_q8";
+pub const ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q4_HSACO: &[u8] =
+    ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q8_HSACO;
+pub const ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q4_KERNEL: &str = "attn_prefill_flash_partial_mixed_q4";
+
 /// `kernels/gdn_chunkwise.hip`: the chunkwise (blocked delta-rule)
 /// gated-delta-rule recurrence — replaces `gdn_recurrence_chunk_f32`'s
 /// token-serial-inside-chunk loop with O(chunk^2) parallel matmul-shaped

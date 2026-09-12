@@ -14,6 +14,10 @@
 //   physical index 0 right after an eviction, see `MixedLayout`'s doc
 //   comment, so no modulo/ring arithmetic is needed here).
 //
+// The per-position dispatch above (`load_mixed_kv`/`load_bulk_v`) lives in
+// `attn_common.h`, shared with `attn_prefill_flash_mixed.hip`'s
+// chunked-prefill sibling — one source of truth for both kernels.
+//
 // The dequantized value is never written back to any buffer — it only ever
 // exists in the same per-tile LDS staging array `attn_decode_partial_f16`
 // uses, for exactly as long as this tile's score/weighted-V accumulation
@@ -35,28 +39,10 @@
 
 // `V_BITS` is 8 (`attn_decode_partial_mixed_q8`) or 4
 // (`attn_decode_partial_mixed_q4`) — the only difference between the two
-// entry points below. `bulk_v_codes` is `const signed char*` for V_BITS==8
-// and `const unsigned char*` (packed) for V_BITS==4, passed through as
-// `const void*` since the two entry points' own signatures already carry
-// the right pointee type for their callers.
-template <int V_BITS>
-__device__ __forceinline__ float load_bulk_v(
-    const void* bulk_v_codes, const float* bulk_v_scale_row, unsigned bulk_pos, unsigned head_dim,
-    unsigned col) {
-    float scale = bulk_v_scale_row[bulk_pos];
-    if (V_BITS == 8) {
-        const signed char* codes = (const signed char*)bulk_v_codes;
-        return (float)codes[(size_t)bulk_pos * head_dim + col] * scale;
-    } else {
-        const unsigned char* codes = (const unsigned char*)bulk_v_codes;
-        unsigned half_dim = head_dim / 2;
-        unsigned char byte = codes[(size_t)bulk_pos * half_dim + col / 2];
-        int nibble = (col % 2 == 0) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
-        int signed_nibble = nibble >= 8 ? nibble - 16 : nibble;
-        return (float)signed_nibble * scale;
-    }
-}
-
+// entry points below. The per-position dequant dispatch itself
+// (`load_mixed_kv`/`load_bulk_v`) lives in `attn_common.h`, shared with
+// `attn_prefill_flash_mixed.hip`'s chunked-prefill sibling — see that
+// header's doc comment.
 template <int V_BITS>
 __device__ __forceinline__ void attn_decode_partial_mixed_impl(
     const float* q, const __half* sink_k, const __half* sink_v, const __half* window_k,
@@ -119,25 +105,10 @@ __device__ __forceinline__ void attn_decode_partial_mixed_impl(
             unsigned pos = tile_base + row;
 
             float kv_k, kv_v;
-            if (pos < sink_len) {
-                kv_k = __half2float(sink_k_h[(size_t)pos * head_dim + col]);
-                kv_v = __half2float(sink_v_h[(size_t)pos * head_dim + col]);
-            } else if (pos < window_base) {
-                unsigned rel = pos - sink_len;
-                unsigned block = rel / window_len;
-                unsigned offset = rel % window_len;
-                float kscale = bulk_k_scales_h[(size_t)block * head_dim + col];
-                signed char kcode =
-                    bulk_k_h[(size_t)block * window_len * head_dim + (size_t)offset * head_dim + col];
-                kv_k = (float)kcode * kscale;
-
-                unsigned bulk_pos = block * window_len + offset;
-                kv_v = load_bulk_v<V_BITS>(bulk_v_codes_h, bulk_v_scales_h, bulk_pos, head_dim, col);
-            } else {
-                unsigned widx = pos - window_base;
-                kv_k = __half2float(window_k_h[(size_t)widx * head_dim + col]);
-                kv_v = __half2float(window_v_h[(size_t)widx * head_dim + col]);
-            }
+            load_mixed_kv<V_BITS>(
+                sink_k_h, sink_v_h, window_k_h, window_v_h, bulk_k_h, bulk_k_scales_h,
+                bulk_v_codes_h, bulk_v_scales_h, pos, col, head_dim, sink_len, window_len,
+                window_base, &kv_k, &kv_v);
 
             k_tile[idx] = kv_k;
             v_tile[idx] = kv_v;
