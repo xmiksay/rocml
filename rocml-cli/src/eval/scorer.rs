@@ -22,7 +22,11 @@ impl Verdict {
         }
     }
 
-    fn fail(detail: impl Into<String>) -> Self {
+    /// `pub` (unlike [`Self::pass`]) because `runner` also builds fail
+    /// verdicts directly for outcomes this module never sees: a malformed
+    /// (unparseable) model reply, or a `multi_turn` scenario's turn 1
+    /// failing before turn 2 ever runs.
+    pub fn fail(detail: impl Into<String>) -> Self {
         Self {
             pass: false,
             detail: detail.into(),

@@ -45,7 +45,7 @@ pub fn run_scenario(
         } => {
             let messages = build_messages(system, user);
             let chat_tools = to_chat_tools(tools);
-            let turn = run_single_turn(
+            let attempt = run_single_turn(
                 loaded,
                 model_stamp,
                 kv_config,
@@ -53,10 +53,9 @@ pub fn run_scenario(
                 &messages,
                 &chat_tools,
             )?;
-            (
-                scorer::score_tool_choice(expected, &turn.output),
-                turn.raw_text,
-            )
+            score_attempt(attempt, |output| {
+                scorer::score_tool_choice(expected, output)
+            })
         }
         Scenario::NoTool {
             system,
@@ -66,7 +65,7 @@ pub fn run_scenario(
         } => {
             let messages = build_messages(system, user);
             let chat_tools = to_chat_tools(tools);
-            let turn = run_single_turn(
+            let attempt = run_single_turn(
                 loaded,
                 model_stamp,
                 kv_config,
@@ -74,7 +73,7 @@ pub fn run_scenario(
                 &messages,
                 &chat_tools,
             )?;
-            (scorer::score_no_tool(&turn.output), turn.raw_text)
+            score_attempt(attempt, scorer::score_no_tool)
         }
         Scenario::MultiTurn {
             system,
@@ -109,7 +108,7 @@ pub fn run_scenario(
             let context = filler::build_context(*seed, words, needle, *position_fraction);
             let user = format!("{context}\n\n{question}");
             let messages = vec![Message::user(user)];
-            let turn = run_single_turn(
+            let attempt = run_single_turn(
                 loaded,
                 model_stamp,
                 kv_config,
@@ -117,10 +116,9 @@ pub fn run_scenario(
                 &messages,
                 &[],
             )?;
-            (
-                scorer::score_long_context(expected_substring, &turn.output),
-                turn.raw_text,
-            )
+            score_attempt(attempt, |output| {
+                scorer::score_long_context(expected_substring, output)
+            })
         }
     };
 
@@ -150,7 +148,7 @@ fn run_multi_turn(
     let chat_tools = to_chat_tools(tools);
     let mut messages = build_messages(system, user);
 
-    let turn1 = run_single_turn(
+    let attempt1 = run_single_turn(
         loaded,
         model_stamp,
         kv_config,
@@ -158,14 +156,22 @@ fn run_multi_turn(
         &messages,
         &chat_tools,
     )?;
+    // A malformed (unparseable) turn 1 can't be turned into an assistant
+    // message for turn 2 to build on — the scenario fails outright, same as
+    // a well-formed-but-wrong tool call would, just with a different detail.
+    let turn1 = match attempt1 {
+        TurnAttempt::Parsed(turn) => turn,
+        TurnAttempt::Malformed { raw_text, reason } => {
+            return Ok((
+                Verdict::fail(format!("turn 1: malformed model output: {reason}")),
+                raw_text,
+            ));
+        }
+    };
     let verdict1 = scorer::score_tool_choice(expected_first, &turn1.output);
     if !verdict1.pass {
-        let detail = format!("turn 1: {}", verdict1.detail);
         return Ok((
-            Verdict {
-                pass: false,
-                detail,
-            },
+            Verdict::fail(format!("turn 1: {}", verdict1.detail)),
             turn1.raw_text,
         ));
     }
@@ -180,7 +186,7 @@ fn run_multi_turn(
     messages.push(assistant);
     messages.push(Message::tool_response(tool_result.to_string()));
 
-    let turn2 = run_single_turn(
+    let attempt2 = run_single_turn(
         loaded,
         model_stamp,
         kv_config,
@@ -188,11 +194,10 @@ fn run_multi_turn(
         &messages,
         &chat_tools,
     )?;
-    let verdict2 = scorer::score_second_turn(second_turn, &turn2.output);
-    let combined_raw = format!(
-        "[turn 1]\n{}\n\n[turn 2]\n{}",
-        turn1.raw_text, turn2.raw_text
-    );
+    let (verdict2, raw2) = score_attempt(attempt2, |output| {
+        scorer::score_second_turn(second_turn, output)
+    });
+    let combined_raw = format!("[turn 1]\n{}\n\n[turn 2]\n{}", turn1.raw_text, raw2);
     let detail = format!("turn 1: ok; turn 2: {}", verdict2.detail);
     Ok((
         Verdict {
@@ -208,6 +213,36 @@ struct TurnOutput {
     raw_text: String,
 }
 
+/// A model's raw decoded text either parses cleanly into structured pieces,
+/// or it doesn't — an unterminated `<tool_call>` block, a malformed
+/// `<parameter>` value, etc. The latter is a real, scoreable outcome (a
+/// smaller/quantized model failing to hold the tool-call protocol together,
+/// or hitting `max_gen_tokens` mid-block under a repetition loop that
+/// greedy decoding can fall into), not a harness bug — so it's threaded
+/// through as data instead of propagated as a `RocmlError` that would abort
+/// the whole eval run over one bad scenario.
+enum TurnAttempt {
+    Parsed(TurnOutput),
+    Malformed { raw_text: String, reason: String },
+}
+
+/// Scores a [`TurnAttempt`]: a parsed turn goes through `score`, a
+/// malformed one is an automatic fail with the parse error as the detail.
+/// Returns `(verdict, raw_text)` — the raw text always comes back so the
+/// caller can record it for post-mortem regardless of which branch ran.
+fn score_attempt(
+    attempt: TurnAttempt,
+    score: impl FnOnce(&AssistantOutput) -> Verdict,
+) -> (Verdict, String) {
+    match attempt {
+        TurnAttempt::Parsed(turn) => (score(&turn.output), turn.raw_text),
+        TurnAttempt::Malformed { raw_text, reason } => (
+            Verdict::fail(format!("malformed model output: {reason}")),
+            raw_text,
+        ),
+    }
+}
+
 fn run_single_turn(
     loaded: &mut Loaded,
     model_stamp: &ModelStamp,
@@ -215,7 +250,7 @@ fn run_single_turn(
     max_gen_tokens: usize,
     messages: &[Message],
     tools: &[Tool],
-) -> Result<TurnOutput, RocmlError> {
+) -> Result<TurnAttempt, RocmlError> {
     let prompt = rocml::chat::render(messages, tools, RENDER_OPTS)?;
     let prompt_ids = loaded.tokenizer.encode(&prompt);
 
@@ -238,8 +273,13 @@ fn run_single_turn(
         |chunk| raw_text.push_str(chunk),
     )?;
 
-    let output = parse_assistant_output(&raw_text)?;
-    Ok(TurnOutput { output, raw_text })
+    Ok(match parse_assistant_output(&raw_text) {
+        Ok(output) => TurnAttempt::Parsed(TurnOutput { output, raw_text }),
+        Err(reason) => TurnAttempt::Malformed {
+            raw_text,
+            reason: reason.to_string(),
+        },
+    })
 }
 
 fn build_messages(system: &Option<String>, user: &str) -> Vec<Message> {
