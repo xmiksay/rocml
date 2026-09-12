@@ -7,4 +7,4 @@
 pub mod layout;
 pub mod quant_math;
 
-pub use layout::{MixedLayout, Region, SINK_LEN, WINDOW_LEN};
+pub use layout::{ChunkWindowSegment, MixedLayout, Region, SINK_LEN, WINDOW_LEN};

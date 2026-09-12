@@ -16,6 +16,14 @@
 //! window buffer's physical index always restarts at 0 right after an
 //! eviction — no modulo/ring-index arithmetic needed anywhere, including in
 //! the fused attention kernel's read path.
+//!
+//! `chunk_plan` (child module, split out purely for the 400-line file cap)
+//! adds [`MixedLayout::plan_chunk_append`], the chunked-prefill sibling of
+//! [`MixedLayout::prepare_append`] below.
+
+mod chunk_plan;
+
+pub use chunk_plan::ChunkWindowSegment;
 
 /// First `SINK_LEN` positions of every mixed layer stay fp16 forever —
 /// attention sinks are exempt from eviction/quantization (issue #2).
