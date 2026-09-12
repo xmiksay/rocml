@@ -11,6 +11,8 @@ use rocml_hip::{kernel_params, Device, DeviceBuffer, LaunchConfig, Module};
 const TOL: f32 = 1e-4;
 /// Must match `TILE_T` in `kernels/attn_prefill.hip`.
 const TILE_T: u32 = 8;
+/// Must match `ROW_TILE` in `kernels/attn_prefill.hip`.
+const ROW_TILE: u32 = 4;
 
 fn assert_close(actual: &[f32], expected: &[f32], label: &str) {
     assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
@@ -132,12 +134,12 @@ fn run_attn_prefill(
         scale
     );
     let cfg = LaunchConfig {
-        grid: (n_kv_heads, chunk_len, 1),
-        block: (32, group, 1),
+        grid: (n_kv_heads, chunk_len.div_ceil(ROW_TILE), 1),
+        block: (32, group, ROW_TILE),
         shared_mem_bytes: 2 * TILE_T * head_dim * std::mem::size_of::<f32>() as u32,
     };
     // SAFETY: params matches attn_prefill_f32's parameter list (three const
-    // float*, float*, six unsigned, float) in order; block = (32, group, 1)
+    // float*, float*, six unsigned, float) in order; block = (32, group, ROW_TILE)
     // per the kernel's warp-per-q-head design; every buffer outlives this
     // launch.
     unsafe { function.launch(&cfg, &mut params, None) }.expect("kernel launch failed");
@@ -190,6 +192,22 @@ fn equal_head_counts_no_gqa_sharing() {
 #[test]
 fn large_chunk_deep_resume() {
     run_attn_prefill(16, 8, 128, 2048, 256, 1024);
+}
+
+#[test]
+fn chunk_len_not_multiple_of_row_tile() {
+    // ROW_TILE=4: chunk_len=13 leaves a partial last row-tile (rows 12 is
+    // alone in its tile), exercising the `n_rows < ROW_TILE` masking path.
+    run_attn_prefill(16, 4, 128, 32, 13, 0);
+}
+
+#[test]
+fn row_tile_spans_ornith_full_attention_shape() {
+    // Ornith's real full-attention head config (16 Q / 4 KV heads, head_dim
+    // 256) at a chunk length exercising several full ROW_TILE=4 groups plus
+    // a partial one, deep enough that within-tile causal bounds genuinely
+    // differ across every row in a tile.
+    run_attn_prefill(16, 4, 256, 4096, 130, 2000);
 }
 
 /// `attn_prefill_f16` (issue #3's default KV dtype): mirrors
@@ -265,13 +283,13 @@ fn run_attn_prefill_f16(
         scale
     );
     let cfg = LaunchConfig {
-        grid: (n_kv_heads, chunk_len, 1),
-        block: (32, group, 1),
+        grid: (n_kv_heads, chunk_len.div_ceil(ROW_TILE), 1),
+        block: (32, group, ROW_TILE),
         shared_mem_bytes: 2 * TILE_T * head_dim * std::mem::size_of::<f32>() as u32,
     };
     // SAFETY: params matches attn_prefill_f16's parameter list (const
     // float*, two const half*, float*, six unsigned, float) in order;
-    // block = (32, group, 1); every buffer outlives this launch.
+    // block = (32, group, ROW_TILE); every buffer outlives this launch.
     unsafe { function.launch(&cfg, &mut params, None) }.expect("kernel launch failed");
 
     let mut actual = vec![0.0f32; cl * nh * hd];

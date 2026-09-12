@@ -11,7 +11,7 @@ use std::mem::size_of;
 use rocml_core::quant::GgmlDType;
 use rocml_hip::{kernel_params, DeviceBuffer, LaunchConfig, Module};
 
-use super::kernels_kv::KvF16Kernels;
+use super::kernels_kv::{KvF16Kernels, ATTN_PREFILL_ROW_TILE};
 use super::kernels_quant::QuantKernels;
 use crate::error::RocmlError;
 
@@ -510,8 +510,8 @@ impl Kernels {
     ) -> Result<(), RocmlError> {
         let group = n_heads / n_kv_heads;
         let cfg = LaunchConfig {
-            grid: (n_kv_heads, chunk_len, 1),
-            block: (32, group, 1),
+            grid: (n_kv_heads, chunk_len.div_ceil(ATTN_PREFILL_ROW_TILE), 1),
+            block: (32, group, ATTN_PREFILL_ROW_TILE),
             shared_mem_bytes: 2 * ATTN_DECODE_TILE_T * head_dim * size_of::<f32>() as u32,
         };
         let mut params = kernel_params!(
@@ -519,10 +519,9 @@ impl Kernels {
             scale
         );
         // SAFETY: params matches attn_prefill_f32's signature (three const
-        // float*, float*, six unsigned, float); block = (32, group, 1)
-        // matches the kernel's warp-per-q-head design; shared_mem_bytes
-        // matches TILE_T(8) from the kernel source (kept in sync via the
-        // shared ATTN_DECODE_TILE_T constant).
+        // float*, float*, six unsigned, float); block = (32, group,
+        // ATTN_PREFILL_ROW_TILE) matches the kernel's row-tiled design;
+        // shared_mem_bytes matches TILE_T(8) (ATTN_DECODE_TILE_T).
         unsafe { self.attn_prefill_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 

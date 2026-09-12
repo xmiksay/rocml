@@ -15,6 +15,16 @@ use rocml_hip::{kernel_params, LaunchConfig, Module};
 use super::kernels::{load, DevPtr, ATTN_DECODE_TILE_T, LINEAR_BLOCK};
 use crate::error::RocmlError;
 
+/// Consecutive query rows sharing one `attn_prefill_*` workgroup's K/V-tile
+/// load — must match `ROW_TILE` in `kernels/attn_prefill.hip` exactly (a
+/// launch-shape constant, not something read from shared memory sizing, but
+/// the grid/block dims used by both `attn_prefill`/`attn_prefill_f16` are
+/// meaningless if it drifts from the kernel). See that kernel's module doc
+/// for the tuning rationale. Defined here rather than in `kernels.rs`
+/// (already over this workspace's 400-line file cap) even though
+/// `Kernels::attn_prefill`'s f32 launch also needs it.
+pub(super) const ATTN_PREFILL_ROW_TILE: u32 = 4;
+
 pub(crate) struct KvF16Kernels {
     _mod_cast: Module,
     cast_f32_f16_fn: rocml_hip::Function,
@@ -132,8 +142,8 @@ impl KvF16Kernels {
         scale: f32,
     ) -> Result<(), RocmlError> {
         let cfg = LaunchConfig {
-            grid: (n_kv_heads, chunk_len, 1),
-            block: (32, group, 1),
+            grid: (n_kv_heads, chunk_len.div_ceil(ATTN_PREFILL_ROW_TILE), 1),
+            block: (32, group, ATTN_PREFILL_ROW_TILE),
             shared_mem_bytes: 2 * ATTN_DECODE_TILE_T * head_dim * size_of::<f32>() as u32,
         };
         let mut params = kernel_params!(
@@ -142,7 +152,7 @@ impl KvF16Kernels {
         );
         // SAFETY: params matches attn_prefill_f16's signature (const float*,
         // two const half*, float*, six unsigned, float); block =
-        // (32, group, 1) as `attn_prefill`'s f32 sibling.
+        // (32, group, ATTN_PREFILL_ROW_TILE) as `attn_prefill`'s f32 sibling.
         unsafe { self.attn_prefill_f16_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 }
