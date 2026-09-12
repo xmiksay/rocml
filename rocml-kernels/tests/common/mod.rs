@@ -7,6 +7,7 @@
 
 use std::ffi::c_void;
 
+use half::f16;
 use rocml_core::quant::{dequantize, GgmlDType};
 use rocml_hip::{kernel_params, Device, DeviceBuffer, LaunchConfig, Module};
 
@@ -211,6 +212,101 @@ pub fn run_gemm_quant_kernel(
     // (const float*, const void*, float*, unsigned x3) in order, and all
     // device buffers outlive this launch. Block = (32, 8, 1) matches the
     // kernel's fixed warp-per-`ROWS_PER_WARP`-rows tiling.
+    unsafe { function.launch(&cfg, &mut params, None) }.expect("kernel launch failed");
+
+    let mut actual = vec![0.0f32; (rows * m) as usize];
+    buf_out.copy_to_host(&mut actual).expect("copy out failed");
+    actual
+}
+
+/// CPU reference for the WMMA `gemm_xwt_wmma_q*` kernels: like
+/// [`expected_gemm`], but rounds both the dequantized weight and the `x`
+/// operand through f16 before each product (f32 accumulation), matching
+/// what the WMMA matrix unit actually computes from f16 fragments — issue
+/// #6's accepted numerics (X and dequantized-W input rounding, full f32
+/// accumulate). Comparing against the *unrounded* f32 reference instead
+/// would only be valid to a couple of percent for the K-quants' synthetic
+/// test weights here (their scale bytes span the full signed-byte range, so
+/// dequantized magnitudes run into the thousands — real GGUF-calibrated
+/// scales don't, but this harness's RNG doesn't know that): a debug probe
+/// against real model data confirmed the WMMA kernel matches this
+/// f16-rounded reference to ~1e-6 relative, while the *unrounded* f32
+/// reference can differ by several units at these synthetic magnitudes from
+/// input rounding alone, not a kernel bug.
+pub fn expected_gemm_wmma(
+    dtype: GgmlDType,
+    w_bytes: &[u8],
+    x: &[f32],
+    rows: usize,
+    m: usize,
+    n: usize,
+) -> Vec<f32> {
+    let row_bytes = w_bytes.len() / m;
+    let deq_rows_f16: Vec<Vec<f32>> = (0..m)
+        .map(|row| {
+            let row_slice = &w_bytes[row * row_bytes..(row + 1) * row_bytes];
+            dequantize(dtype, row_slice)
+                .expect("cpu dequantize failed")
+                .iter()
+                .map(|&v| f16::from_f32(v).to_f32())
+                .collect()
+        })
+        .collect();
+    let x_f16: Vec<f32> = x.iter().map(|&v| f16::from_f32(v).to_f32()).collect();
+    let mut out = vec![0.0f32; rows * m];
+    for r in 0..rows {
+        let x_row = &x_f16[r * n..(r + 1) * n];
+        for (col, deq) in deq_rows_f16.iter().enumerate() {
+            out[r * m + col] = deq.iter().zip(x_row).map(|(a, b)| a * b).sum();
+        }
+    }
+    out
+}
+
+/// Uploads `w_bytes`/`x`, launches `gemm_xwt_wmma_<type>` (`kernel_name` from
+/// `hsaco`) with the fixed `TILE_ROWS=128`/`TILE_M=64`/`K_STAGE=16` tiling
+/// `gemm_xwt_quant_wmma.hip` requires (block=(32,16,1), grid=
+/// `(ceil(m/64), ceil(rows/128), 1)`, `(128+64)*16*sizeof(f16)` bytes of
+/// dynamic shared memory), and downloads `out` (`rows x m`).
+pub fn run_gemm_wmma_kernel(
+    hsaco: &[u8],
+    kernel_name: &str,
+    w_bytes: &[u8],
+    x: &[f32],
+    rows: u32,
+    m: u32,
+    n: u32,
+) -> Vec<f32> {
+    let _device = Device::new(0).expect("failed to select device 0");
+    let module = Module::load_from_bytes(hsaco).expect("module load failed");
+    let function = module
+        .get_function(kernel_name)
+        .expect("kernel lookup failed");
+
+    let mut buf_x = DeviceBuffer::<f32>::new(x.len()).expect("hipMalloc x failed");
+    let mut buf_w = DeviceBuffer::<u8>::new(w_bytes.len()).expect("hipMalloc w failed");
+    let buf_out = DeviceBuffer::<f32>::new((rows * m) as usize).expect("hipMalloc out failed");
+    buf_x.copy_from_host(x).expect("copy x failed");
+    buf_w.copy_from_host(w_bytes).expect("copy w failed");
+
+    let x_ptr: *mut c_void = buf_x.device_ptr();
+    let w_ptr: *mut c_void = buf_w.device_ptr();
+    let out_ptr: *mut c_void = buf_out.device_ptr();
+    let mut params = kernel_params!(x_ptr, w_ptr, out_ptr, rows, m, n);
+
+    const TILE_ROWS: u32 = 128;
+    const TILE_M: u32 = 64;
+    const K_STAGE: u32 = 16;
+    const WARPS_PER_BLOCK: u32 = 16;
+    let cfg = LaunchConfig {
+        grid: (m.div_ceil(TILE_M), rows.div_ceil(TILE_ROWS), 1),
+        block: (32, WARPS_PER_BLOCK, 1),
+        shared_mem_bytes: (TILE_ROWS + TILE_M) * K_STAGE * std::mem::size_of::<u16>() as u32,
+    };
+    // SAFETY: params matches every gemm_xwt_wmma_<type> kernel's parameter
+    // list (const float*, const void*, float*, unsigned x3) in order, and
+    // all device buffers outlive this launch. block/grid/shared_mem_bytes
+    // match the kernel's fixed TILE_ROWS/TILE_M/K_STAGE tiling.
     unsafe { function.launch(&cfg, &mut params, None) }.expect("kernel launch failed");
 
     let mut actual = vec![0.0f32; (rows * m) as usize];

@@ -149,6 +149,26 @@ pub const GEMM_XWT_Q5_K_KERNEL: &str = "gemm_xwt_q5_k";
 pub const GEMM_XWT_Q6_K_HSACO: &[u8] = GEMM_XWT_Q8_0_HSACO;
 pub const GEMM_XWT_Q6_K_KERNEL: &str = "gemm_xwt_q6_k";
 
+/// `kernels/gemm_xwt_quant_wmma.hip`: WMMA matrix-core version of
+/// `gemm_xwt_q*` (issue #6's follow-up) — same `out[rows,m] = X[rows,n] *
+/// dequant(W)^T` contract, but feeds gfx11's wave32 matrix unit instead of
+/// scalar FMA. Launch with block = (32, 8, 1) and `(TILE_ROWS + TILE_M) *
+/// K_STAGE * sizeof(f16)` bytes of dynamic shared memory (see the kernel
+/// source's module doc for the tile sizes and fragment layout); grid =
+/// `(ceil(m/TILE_M), ceil(rows/TILE_ROWS), 1)`. Requires `m` and `n`
+/// multiples of 16 and `rows >= 16` to be worth it — the scalar
+/// `gemm_xwt_q*` kernels above stay the dispatch fallback otherwise. All
+/// four dtypes share one code object.
+pub const GEMM_XWT_WMMA_Q8_0_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_xwt_quant_wmma.hsaco"));
+pub const GEMM_XWT_WMMA_Q8_0_KERNEL: &str = "gemm_xwt_wmma_q8_0";
+pub const GEMM_XWT_WMMA_Q4_K_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_HSACO;
+pub const GEMM_XWT_WMMA_Q4_K_KERNEL: &str = "gemm_xwt_wmma_q4_k";
+pub const GEMM_XWT_WMMA_Q5_K_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_HSACO;
+pub const GEMM_XWT_WMMA_Q5_K_KERNEL: &str = "gemm_xwt_wmma_q5_k";
+pub const GEMM_XWT_WMMA_Q6_K_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_HSACO;
+pub const GEMM_XWT_WMMA_Q6_K_KERNEL: &str = "gemm_xwt_wmma_q6_k";
+
 /// `kernels/chunk_reshape.hip`: small batched reshape/broadcast kernels the
 /// chunked-prefill forward pass needs (per-head extraction, batched KV-cache
 /// append, the GDN gate's per-token broadcast). All three share one code
