@@ -1,12 +1,15 @@
-//! `rocml-cli`: interactive chat REPL, a synthetic throughput benchmark, and
-//! a one-shot prompt-completion command, all driving the `rocml` engine.
+//! `rocml-cli`: interactive chat REPL, a synthetic throughput benchmark, a
+//! one-shot prompt-completion command, and an agentic quality-eval harness
+//! (issue #15), all driving the `rocml` engine.
 
 mod cmd_bench;
 mod cmd_bench_turns;
 mod cmd_chat;
+mod cmd_eval;
 mod cmd_generate;
 mod cmd_models;
 mod common;
+mod eval;
 
 use std::process::ExitCode;
 
@@ -29,6 +32,9 @@ enum Command {
     Generate(cmd_generate::GenerateArgs),
     /// List the compiled-in model registry and each entry's on-disk status.
     Models(cmd_models::ModelsArgs),
+    /// Agentic quality-eval harness (issue #15): tool-use scenarios scored
+    /// deterministically, plus a secondary perplexity signal.
+    Eval(cmd_eval::EvalArgs),
 }
 
 fn main() -> ExitCode {
@@ -38,6 +44,7 @@ fn main() -> ExitCode {
         Command::Bench(args) => cmd_bench::run(args),
         Command::Generate(args) => cmd_generate::run(args),
         Command::Models(args) => cmd_models::run(args),
+        Command::Eval(args) => cmd_eval::run(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

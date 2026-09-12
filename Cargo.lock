@@ -1004,6 +1004,7 @@ dependencies = [
  "clap",
  "rocml",
  "rocml-core",
+ "serde",
  "serde_json",
 ]
 

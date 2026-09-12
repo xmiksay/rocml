@@ -7,7 +7,7 @@ ROCML_CHECKPOINT_DIR ?= $(HOME)/checkpoints
 # Dev/test model (fast); override to point at a different checkpoint.
 QWEN_MODEL ?= $(ROCML_CHECKPOINT_DIR)/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf
 
-.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench
+.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench eval
 
 build:
 	cargo build --workspace
@@ -74,3 +74,21 @@ serve:
 # Synthetic prompt/decode throughput benchmark against the dev/test model.
 bench:
 	cargo run --release -p rocml-cli -- bench --model $(QWEN_MODEL) --json
+
+# Issue #15's agentic quality-eval harness: establishes the Q6_K fp16-KV
+# baseline and the Q4_K_M candidate, both at ctx 16384 (long-context
+# scenarios need ~8K tokens of filler plus thinking/answer headroom).
+# `--resume` is always passed so a run interrupted partway through (a long
+# eval, possibly split across several invocations) picks back up instead of
+# re-scoring already-graded scenarios.
+eval:
+	cargo run --release -p rocml-cli -- eval \
+		--model ornith-9b --ctx 16384 \
+		--label ornith-q6k-fp16kv \
+		--out bench/eval/results/ornith-q6k-fp16kv.json \
+		--resume
+	cargo run --release -p rocml-cli -- eval \
+		--model ornith-9b-q4 --ctx 16384 \
+		--label ornith-q4km-fp16kv \
+		--out bench/eval/results/ornith-q4km-fp16kv.json \
+		--resume

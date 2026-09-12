@@ -81,4 +81,19 @@ pub enum RocmlError {
 
     #[error("failed to launch `hf`: {0} (is the huggingface_hub CLI installed and on PATH?)")]
     HfLaunchFailed(String),
+
+    #[error(transparent)]
+    Chat(#[from] crate::chat::ChatError),
+
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+
+    /// Catch-all for the eval harness (issue #15): scenario-file schema
+    /// problems, resume-state mismatches, and similar caller-facing
+    /// conditions that don't warrant their own variant.
+    #[error("{0}")]
+    Eval(String),
 }
