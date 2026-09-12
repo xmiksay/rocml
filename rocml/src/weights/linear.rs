@@ -170,14 +170,18 @@ mod tests {
     }
 
     /// CPU reference: dequantize each of `w_bytes`'s `m` rows independently
-    /// (rocml-core's proven-correct dequant) and dot it against `x`.
+    /// (rocml-core's proven-correct dequant) and dot it against `x` with
+    /// exact f64 accumulation.
     fn expected_gemv(dtype: GgmlDType, w_bytes: &[u8], x: &[f32], m: usize) -> Vec<f32> {
         let row_bytes = w_bytes.len() / m;
         (0..m)
             .map(|row| {
                 let row_slice = &w_bytes[row * row_bytes..(row + 1) * row_bytes];
                 let deq = dequantize(dtype, row_slice).expect("cpu dequantize failed");
-                deq.iter().zip(x).map(|(a, b)| a * b).sum()
+                deq.iter()
+                    .zip(x)
+                    .map(|(a, b)| *a as f64 * *b as f64)
+                    .sum::<f64>() as f32
             })
             .collect()
     }
@@ -198,7 +202,8 @@ mod tests {
         let weight = LinearWeight::load(&gguf, tensor_name, m, n).expect("LinearWeight::load");
         let kernels = Kernels::load_all().expect("Kernels::load_all");
 
-        let x_host: Vec<f32> = (0..n).map(|i| ((i % 29) as f32) * 0.037 - 0.5).collect();
+        // Realistic activation magnitudes (rmsnorm output ranges to ~+-4).
+        let x_host: Vec<f32> = (0..n).map(|i| ((i % 29) as f32) * 0.29 - 4.0).collect();
         let mut x = DeviceBuffer::<f32>::new(n as usize).expect("hipMalloc x");
         x.copy_from_host(&x_host).expect("copy x");
         let y = DeviceBuffer::<f32>::new(m as usize).expect("hipMalloc y");
@@ -211,6 +216,14 @@ mod tests {
         y.copy_to_host(&mut actual).expect("copy y");
 
         let expected = expected_gemv(view.dtype(), view.data(), &x_host, m as usize);
+        let mut max_abs = 0f32;
+        let mut max_rel = 0f32;
+        for (got, want) in actual.iter().zip(&expected) {
+            let d = (got - want).abs();
+            max_abs = max_abs.max(d);
+            max_rel = max_rel.max(d / want.abs().max(1e-3));
+        }
+        println!("{tensor_name}: max_abs_err = {max_abs:.6e}, max_rel_err = {max_rel:.6e}");
         assert_close(&actual, &expected, tensor_name);
     }
 
@@ -232,6 +245,38 @@ mod tests {
             return;
         };
         spot_check(&path, "blk.0.attn_q.weight");
+    }
+
+    #[test]
+    fn ornith_q6k_lm_head_matvec_matches_cpu_reference() {
+        let Some(path) = checkpoint("Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf") else {
+            return;
+        };
+        spot_check(&path, "output.weight");
+    }
+
+    #[test]
+    fn ornith_q6k_qkv_matvec_matches_cpu_reference() {
+        let Some(path) = checkpoint("Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf") else {
+            return;
+        };
+        spot_check(&path, "blk.0.attn_qkv.weight");
+    }
+
+    #[test]
+    fn ornith_q6k_ffn_matvec_matches_cpu_reference() {
+        let Some(path) = checkpoint("Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf") else {
+            return;
+        };
+        spot_check(&path, "blk.0.ffn_down.weight");
+    }
+
+    #[test]
+    fn ornith_q4km_qkv_matvec_matches_cpu_reference() {
+        let Some(path) = checkpoint("Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf") else {
+            return;
+        };
+        spot_check(&path, "blk.0.attn_qkv.weight");
     }
 
     #[test]
