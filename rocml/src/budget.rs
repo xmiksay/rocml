@@ -172,16 +172,21 @@ fn gib(bytes: u64) -> f64 {
 /// KV-bytes-per-token formula needs (not the full architecture-specific
 /// `ModelConfig`/`Qwen35Config` validation `Model::load` performs), and uses
 /// the file's on-disk size as a generous proxy for on-device weight bytes.
-/// That proxy never under-estimates for the quant configs this registry
-/// serves: a raw-quant `LinearWeight` uploads byte-identical to its GGUF
-/// bytes, an f16/bf16 source tensor uploads at the same 2 bytes/element,
-/// and an f32 source tensor gets *halved* on upload (cast to f16) — so file
-/// size is always >= real weight bytes, making this estimate safe in the
-/// "clamp more than strictly necessary" direction. `Model::load`'s own
+/// This proxy is close but *not guaranteed* to be an over-estimate: most
+/// tensors upload byte-identical to their GGUF bytes (raw-quant) or at the
+/// same 2 bytes/element (f16/bf16 source) or *smaller* (an f32 source tensor
+/// gets halved on upload, cast to f16) — but `token_embd` is the one
+/// exception, always dequantized-and-f16-cast in VRAM regardless of its
+/// source dtype (`ModelWeights::load`'s doc comment: "the embedding lookup
+/// kernel only reads f16"), so a quantized embedding table's real VRAM
+/// footprint can *exceed* its on-disk bytes (measured on Ornith-1.0-9B's
+/// Q6_K checkpoint: pre-load estimate 6.85 GiB vs. 8.46 GiB actually
+/// resident — see the task report). This is exactly why `Model::load`'s own
 /// post-weights-load check (`Budget::for_loaded_weights`) is the
-/// authoritative one; this is only a fast, no-upload preview so
-/// `clamp_ctx` can act before spending seconds loading a model that won't
-/// fit anyway.
+/// *authoritative* one and always runs regardless of what this estimate
+/// said — this function is only a fast, no-upload preview so `clamp_ctx`
+/// can act before spending seconds loading a model that obviously won't
+/// fit, not a guarantee.
 ///
 /// Returns the estimated budget plus the model's own declared
 /// `context_length` (a second, independent cap `clamp_ctx` also applies).
