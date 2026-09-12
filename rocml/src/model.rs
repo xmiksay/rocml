@@ -11,6 +11,7 @@ use rocml_core::gguf::GgufFile;
 use rocml_hip::MemoryInfo;
 
 use crate::error::RocmlError;
+use crate::load_opts::LoadOptions;
 use crate::profile::Profiler;
 
 pub enum Model {
@@ -26,15 +27,17 @@ impl Model {
     /// then hands off to that architecture's own loader (which reopens the
     /// file itself — GGUF opens are a cheap mmap, not worth threading a
     /// shared handle through two unrelated loaders for).
-    pub fn load(gguf_path: impl AsRef<Path>) -> Result<Self, RocmlError> {
+    pub fn load(gguf_path: impl AsRef<Path>, opts: LoadOptions) -> Result<Self, RocmlError> {
         let path = gguf_path.as_ref();
         let arch = GgufFile::open(path)?
             .get_str("general.architecture")?
             .to_string();
         match arch.as_str() {
-            "qwen3" => Ok(Self::Dense(Box::new(crate::forward::Model::load(path)?))),
+            "qwen3" => Ok(Self::Dense(Box::new(crate::forward::Model::load(
+                path, opts,
+            )?))),
             "qwen35" => Ok(Self::Hybrid(Box::new(crate::qwen35::forward::Model::load(
-                path,
+                path, opts,
             )?))),
             other => Err(RocmlError::UnsupportedArchitecture {
                 found: other.to_string(),

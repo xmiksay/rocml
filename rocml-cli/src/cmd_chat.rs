@@ -13,7 +13,7 @@ use std::io::{self, BufRead, Write};
 use clap::Args;
 use rocml::chat::{Message, RenderOpts, ScanEvent, StreamScanner, ToolCall};
 use rocml::generate::generate_sampled;
-use rocml::RocmlError;
+use rocml::{LoadOptions, RocmlError};
 
 use crate::common::{self, ModelArgs, SamplingArgs};
 
@@ -38,8 +38,9 @@ pub struct ChatArgs {
     /// running into the model's own (harder to interpret) cache-capacity
     /// error partway through decoding. Unset falls back to the resolved
     /// model's registry preset, then [`DEFAULT_CTX`]; either way it's
-    /// clamped to the engine's current cache cap
-    /// (`rocml::registry::clamp_ctx`).
+    /// clamped to this checkpoint's estimated VRAM budget
+    /// (`rocml::registry::clamp_ctx`) and is what `Model::load` actually
+    /// allocates the KV cache for — not just a soft check.
     #[arg(long)]
     ctx: Option<usize>,
     #[command(flatten)]
@@ -49,8 +50,10 @@ pub struct ChatArgs {
 pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
     let resolved = args.model_args.resolve()?;
     let spec = resolved.spec;
-    eprintln!("loading {}...", args.model_args.model);
-    let mut loaded = common::load(&resolved.path)?;
+    let kv_cache: rocml::KvCacheMode = args.model_args.kv_cache.into();
+    let ctx = common::resolve_ctx(args.ctx, spec, DEFAULT_CTX, &resolved.path, kv_cache)?;
+    eprintln!("loading {}... (ctx {ctx})", args.model_args.model);
+    let mut loaded = common::load(&resolved.path, LoadOptions { ctx, kv_cache })?;
     eprintln!(
         "ready: {} layers, hidden={}, vocab={}. Type a message and press enter \
          (Ctrl+D or /exit to quit).",
@@ -68,10 +71,6 @@ pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
         },
     };
     let sampling = args.sampling.to_sampling_params(spec.map(|s| &s.sampling));
-    let ctx = rocml::registry::clamp_ctx(
-        args.ctx
-            .unwrap_or_else(|| spec.map_or(DEFAULT_CTX, |s| s.default_ctx)),
-    );
     let mut messages: Vec<Message> = Vec::new();
     let stdin = io::stdin();
     let mut line = String::new();

@@ -24,6 +24,7 @@
 // `[0, pos_base+i]` inclusive, i.e. `end = pos_base + i + 1` cached
 // positions — exactly `attn_decode`'s bound with `cur_len` replaced by a
 // per-row value.
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include "attn_common.h"
@@ -31,11 +32,22 @@
 #define MAX_LANE_ELEMS 8
 #define TILE_T 8
 
-// See `attn_decode.hip`'s identical seam: the one place a K/V element is
-// read off the cache plane, so a future quantized-KV cache only touches this
-// function.
-__device__ __forceinline__ float load_kv_f32(const float* plane, size_t idx) {
+// See `attn_decode.hip`'s identical templated seam: `T` is the cache's
+// on-device element type (`float` for the f32 parity-test path, `__half`
+// for the default f16 path — issue #3), widened to `float` here for the
+// online-softmax math. A future quantized-KV read (issue #2) would add
+// further specializations the same way.
+template <typename T>
+__device__ __forceinline__ float load_kv(const T* plane, size_t idx);
+
+template <>
+__device__ __forceinline__ float load_kv<float>(const float* plane, size_t idx) {
     return plane[idx];
+}
+
+template <>
+__device__ __forceinline__ float load_kv<__half>(const __half* plane, size_t idx) {
+    return __half2float(plane[idx]);
 }
 
 // One workgroup per (kv head, query row within the chunk). `q` is
@@ -43,8 +55,9 @@ __device__ __forceinline__ float load_kv_f32(const float* plane, size_t idx) {
 // `k_layer`/`v_layer` are one layer's whole KV-cache buffer, `[n_kv_heads,
 // max_seq, head_dim]`, already holding this chunk's appended K/V. `out` is
 // `[chunk_len, n_heads, head_dim]`.
-extern "C" __global__ void attn_prefill_f32(
-    const float* q, const float* k_layer, const float* v_layer, float* out, unsigned n_kv_heads,
+template <typename T>
+__device__ __forceinline__ void attn_prefill_impl(
+    const float* q, const T* k_layer, const T* v_layer, float* out, unsigned n_kv_heads,
     unsigned group, unsigned head_dim, unsigned max_seq, unsigned chunk_len, unsigned pos_base,
     float scale) {
     unsigned kvh = blockIdx.x;
@@ -66,8 +79,8 @@ extern "C" __global__ void attn_prefill_f32(
     float* v_tile = smem + (size_t)TILE_T * head_dim;
 
     const float* q_h = q + ((size_t)i * (n_kv_heads * group) + h) * head_dim;
-    const float* k_plane = k_layer + (size_t)kvh * max_seq * head_dim;
-    const float* v_plane = v_layer + (size_t)kvh * max_seq * head_dim;
+    const T* k_plane = k_layer + (size_t)kvh * max_seq * head_dim;
+    const T* v_plane = v_layer + (size_t)kvh * max_seq * head_dim;
 
     float q_reg[MAX_LANE_ELEMS];
     unsigned n_elems = 0;
@@ -89,8 +102,8 @@ extern "C" __global__ void attn_prefill_f32(
             unsigned row = idx / head_dim;
             unsigned col = idx % head_dim;
             size_t src = (size_t)(tile_base + row) * head_dim + col;
-            k_tile[idx] = load_kv_f32(k_plane, src);
-            v_tile[idx] = load_kv_f32(v_plane, src);
+            k_tile[idx] = load_kv(k_plane, src);
+            v_tile[idx] = load_kv(v_plane, src);
         }
         __syncthreads();
 
@@ -126,4 +139,25 @@ extern "C" __global__ void attn_prefill_f32(
     for (unsigned d = lane; d < head_dim; d += 32, ++e) {
         out_row[d] = acc[e] / l;
     }
+}
+
+// f32 KV storage: the parity-test reference path (see
+// `crate::model::LoadOptions`) — never selected by the CLI/server.
+extern "C" __global__ void attn_prefill_f32(
+    const float* q, const float* k_layer, const float* v_layer, float* out, unsigned n_kv_heads,
+    unsigned group, unsigned head_dim, unsigned max_seq, unsigned chunk_len, unsigned pos_base,
+    float scale) {
+    attn_prefill_impl<float>(
+        q, k_layer, v_layer, out, n_kv_heads, group, head_dim, max_seq, chunk_len, pos_base,
+        scale);
+}
+
+// f16 KV storage: the default path (issue #3).
+extern "C" __global__ void attn_prefill_f16(
+    const float* q, const __half* k_layer, const __half* v_layer, float* out, unsigned n_kv_heads,
+    unsigned group, unsigned head_dim, unsigned max_seq, unsigned chunk_len, unsigned pos_base,
+    float scale) {
+    attn_prefill_impl<__half>(
+        q, k_layer, v_layer, out, n_kv_heads, group, head_dim, max_seq, chunk_len, pos_base,
+        scale);
 }

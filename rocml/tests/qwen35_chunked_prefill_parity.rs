@@ -20,7 +20,7 @@
 //! itself if absent. Run via `make test-model` (`--release`: prompt lengths
 //! up to 2048 through the token-serial path are unbearably slow in debug).
 
-use rocml::Model;
+use rocml::{KvCacheMode, LoadOptions, Model};
 use rocml_core::testpaths::checkpoint;
 
 const GGUF_REL: &str = "Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
@@ -138,7 +138,14 @@ fn qwen35_2b_chunked_prefill_matches_token_serial() {
     let Some(path) = checkpoint(GGUF_REL) else {
         return;
     };
-    let mut model = Model::load(&path).expect("Model::load failed");
+    // f32 KV explicitly: this suite's "near-tie" escape hatch is calibrated
+    // against the pre-issue-#3 reference numerics, not the default f16
+    // cache's slightly different rounding.
+    let mut model = Model::load(
+        &path,
+        LoadOptions::new(4096).with_kv_cache(KvCacheMode::F32),
+    )
+    .expect("Model::load failed");
     let vocab_size = model.vocab_size();
 
     for &len in PROMPT_LENGTHS {

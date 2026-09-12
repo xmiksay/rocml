@@ -9,6 +9,7 @@
 use super::chunk_kernels::ChunkKernels;
 use super::chunk_scratch::ChunkScratch;
 use super::kernels::HybridKernels;
+use crate::cache::KvDtype;
 use crate::error::RocmlError;
 use crate::forward::kernels::{offset, Kernels};
 use crate::profile::{self, OpKind, Profiler};
@@ -172,23 +173,42 @@ pub(crate) fn attention_chunk_step(
         attn_bytes,
         attn_flops,
         || {
-            chunk.scatter_kv_chunk(
-                offset(&scratch.attn_k, 0),
-                offset(&scratch.attn_v, 0),
-                offset(plane.k_buffer(), 0),
-                offset(plane.v_buffer(), 0),
-                n_kv_heads,
-                head_dim,
-                max_seq,
-                chunk_len,
-                pos_base,
-            )?;
+            let (k_ptr, v_ptr) = (plane.k_ptr(), plane.v_ptr());
+            match plane.dtype() {
+                KvDtype::F32 => chunk.scatter_kv_chunk(
+                    offset(&scratch.attn_k, 0),
+                    offset(&scratch.attn_v, 0),
+                    k_ptr,
+                    v_ptr,
+                    n_kv_heads,
+                    head_dim,
+                    max_seq,
+                    chunk_len,
+                    pos_base,
+                ),
+                KvDtype::F16 => chunk.scatter_kv_chunk_f16(
+                    offset(&scratch.attn_k, 0),
+                    offset(&scratch.attn_v, 0),
+                    k_ptr,
+                    v_ptr,
+                    n_kv_heads,
+                    head_dim,
+                    max_seq,
+                    chunk_len,
+                    pos_base,
+                ),
+            }?;
 
             let scale = 1.0f32 / (head_dim as f32).sqrt();
-            kernels.attn_prefill(
+            let prefill = match plane.dtype() {
+                KvDtype::F16 => Kernels::attn_prefill_f16,
+                KvDtype::F32 => Kernels::attn_prefill,
+            };
+            prefill(
+                kernels,
                 offset(&scratch.attn_q, 0),
-                offset(plane.k_buffer(), 0),
-                offset(plane.v_buffer(), 0),
+                k_ptr,
+                v_ptr,
                 offset(&scratch.attn_concat, 0),
                 n_heads,
                 n_kv_heads,

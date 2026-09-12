@@ -249,8 +249,165 @@ fn equal_head_counts_no_gqa_sharing() {
 
 #[test]
 fn cache_headroom_beyond_cur_len() {
-    // max_seq > cur_len, the real cache's shape (preallocated to
-    // MAX_SEQ_CAP, cur_len grows into it): confirms the kernel never reads
+    // max_seq > cur_len, the real cache's shape (preallocated to the
+    // budgeted ctx, cur_len grows into it): confirms the kernel never reads
     // past position cur_len-1 regardless of the plane's total pitch.
     run_attn_decode(16, 8, 128, 4096, 100, 1);
+}
+
+/// `attn_decode_partial_f16` (issue #3's default KV dtype): identical
+/// coverage to `run_attn_decode` above, but K/V are uploaded as f16 and
+/// read back through the templated `load_kv<__half>` specialization —
+/// looser tolerance than the f32 path's `TOL` since f16 only carries ~3
+/// decimal digits of precision.
+fn run_attn_decode_f16(
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_seq: u32,
+    cur_len: u32,
+    n_splits: u32,
+) {
+    use half::f16;
+
+    const TOL_F16: f32 = 5e-3;
+    let _device = Device::new(0).expect("failed to select device 0");
+    let (_mp, partial_fn) = load(
+        rocml_kernels::ATTN_DECODE_PARTIAL_F16_HSACO,
+        rocml_kernels::ATTN_DECODE_PARTIAL_F16_KERNEL,
+    );
+    let (_mr, reduce_fn) = load(
+        rocml_kernels::ATTN_DECODE_REDUCE_F32_HSACO,
+        rocml_kernels::ATTN_DECODE_REDUCE_F32_KERNEL,
+    );
+
+    let group = n_heads / n_kv_heads;
+    let (nh, nkv, hd, ms) = (
+        n_heads as usize,
+        n_kv_heads as usize,
+        head_dim as usize,
+        max_seq as usize,
+    );
+
+    let q: Vec<f32> = (0..nh * hd)
+        .map(|i| ((i % 23) as f32) * 0.05 - 0.55)
+        .collect();
+    let k_f32: Vec<f32> = (0..nkv * ms * hd)
+        .map(|i| ((i % 19) as f32) * 0.04 - 0.38)
+        .collect();
+    let v_f32: Vec<f32> = (0..nkv * ms * hd)
+        .map(|i| ((i % 17) as f32) * 0.03 - 0.24)
+        .collect();
+    // CPU reference against the f16-rounded values (not the original f32
+    // ones) — the kernel is expected to reproduce exactly what the f16
+    // cache actually stores, not recover the pre-cast precision.
+    let k_f16: Vec<f16> = k_f32.iter().map(|&x| f16::from_f32(x)).collect();
+    let v_f16: Vec<f16> = v_f32.iter().map(|&x| f16::from_f32(x)).collect();
+    let k_roundtrip: Vec<f32> = k_f16.iter().map(|&x| x.to_f32()).collect();
+    let v_roundtrip: Vec<f32> = v_f16.iter().map(|&x| x.to_f32()).collect();
+
+    let expected = cpu_reference(
+        &q,
+        &k_roundtrip,
+        &v_roundtrip,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_seq,
+        cur_len,
+    );
+
+    let mut buf_q = DeviceBuffer::<f32>::new(q.len()).expect("hipMalloc q failed");
+    let mut buf_k = DeviceBuffer::<f16>::new(k_f16.len()).expect("hipMalloc k failed");
+    let mut buf_v = DeviceBuffer::<f16>::new(v_f16.len()).expect("hipMalloc v failed");
+    buf_q.copy_from_host(&q).expect("copy q failed");
+    buf_k.copy_from_host(&k_f16).expect("copy k failed");
+    buf_v.copy_from_host(&v_f16).expect("copy v failed");
+
+    let buf_out = DeviceBuffer::<f32>::new(nh * hd).expect("hipMalloc out failed");
+    let ns = n_splits as usize;
+    let buf_partial_out =
+        DeviceBuffer::<f32>::new(nh * ns * hd).expect("hipMalloc partial_out failed");
+    let buf_partial_m = DeviceBuffer::<f32>::new(nh * ns).expect("hipMalloc partial_m failed");
+    let buf_partial_l = DeviceBuffer::<f32>::new(nh * ns).expect("hipMalloc partial_l failed");
+
+    let split_len = cur_len.div_ceil(n_splits);
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q_ptr: *mut c_void = buf_q.device_ptr();
+    let k_ptr: *mut c_void = buf_k.device_ptr();
+    let v_ptr: *mut c_void = buf_v.device_ptr();
+    let out_ptr: *mut c_void = buf_out.device_ptr();
+    let partial_out_ptr: *mut c_void = buf_partial_out.device_ptr();
+    let partial_m_ptr: *mut c_void = buf_partial_m.device_ptr();
+    let partial_l_ptr: *mut c_void = buf_partial_l.device_ptr();
+
+    let mut partial_params = kernel_params!(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        partial_out_ptr,
+        partial_m_ptr,
+        partial_l_ptr,
+        n_kv_heads,
+        group,
+        head_dim,
+        max_seq,
+        cur_len,
+        split_len,
+        n_splits,
+        scale
+    );
+    let partial_cfg = LaunchConfig {
+        grid: (n_kv_heads, n_splits, 1),
+        block: (32, group, 1),
+        shared_mem_bytes: 2 * TILE_T * head_dim * std::mem::size_of::<f32>() as u32,
+    };
+    // SAFETY: params matches attn_decode_partial_f16's parameter list (const
+    // float*, two const half*, three float*, seven unsigned, float); block =
+    // (32, group, 1); every buffer outlives this launch.
+    unsafe { partial_fn.launch(&partial_cfg, &mut partial_params, None) }
+        .expect("partial kernel launch failed");
+
+    let mut reduce_params = kernel_params!(
+        partial_out_ptr,
+        partial_m_ptr,
+        partial_l_ptr,
+        out_ptr,
+        head_dim,
+        n_splits
+    );
+    let reduce_cfg = LaunchConfig {
+        grid: (n_heads, 1, 1),
+        block: (head_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe { reduce_fn.launch(&reduce_cfg, &mut reduce_params, None) }
+        .expect("reduce kernel launch failed");
+
+    let mut actual = vec![0.0f32; nh * hd];
+    buf_out.copy_to_host(&mut actual).expect("copy out failed");
+    for (i, (got, want)) in actual.iter().zip(&expected).enumerate() {
+        let diff = (got - want).abs();
+        let tol = TOL_F16 * want.abs().max(1.0);
+        assert!(
+            diff <= tol,
+            "attn_decode f16 out[{i}]: got {got}, want {want} (diff {diff}, tol {tol})"
+        );
+    }
+}
+
+#[test]
+fn f16_kv_shallow_decode_matches_f16_rounded_reference() {
+    run_attn_decode_f16(16, 8, 128, 64, 33, 1);
+}
+
+#[test]
+fn f16_kv_deep_decode_multi_split_matches_f16_rounded_reference() {
+    run_attn_decode_f16(16, 8, 128, 2048, 2048, 8);
+}
+
+#[test]
+fn f16_kv_gqa_head_dim_256_matches_f16_rounded_reference() {
+    run_attn_decode_f16(8, 2, 256, 400, 400, 1);
 }

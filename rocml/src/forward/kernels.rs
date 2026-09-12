@@ -11,6 +11,7 @@ use std::mem::size_of;
 use rocml_core::quant::GgmlDType;
 use rocml_hip::{kernel_params, DeviceBuffer, LaunchConfig, Module};
 
+use super::kernels_kv::KvF16Kernels;
 use super::kernels_quant::QuantKernels;
 use crate::error::RocmlError;
 
@@ -46,12 +47,12 @@ pub fn offset<T: Copy>(buf: &DeviceBuffer<T>, elem_offset: usize) -> DevPtr {
 pub(super) const REDUCE_BLOCK: u32 = 128;
 /// Block size for plain elementwise/grid-stride kernels with no
 /// power-of-two constraint.
-const LINEAR_BLOCK: u32 = 256;
+pub(super) const LINEAR_BLOCK: u32 = 256;
 
 /// Rows of K/V staged into LDS at a time by `attn_decode_partial_f32` — must
 /// match `TILE_T` in `kernels/attn_decode.hip` exactly, since this constant
 /// is what sizes the dynamic shared memory the launch requests.
-const ATTN_DECODE_TILE_T: u32 = 8;
+pub(super) const ATTN_DECODE_TILE_T: u32 = 8;
 /// Below this many cached positions, decode attention runs as a single
 /// split (`n_splits == 1`): the whole point of splitting the sequence axis
 /// is to manufacture enough independent workgroups to fill gfx1101's 60 CUs
@@ -118,6 +119,7 @@ pub struct Kernels {
     _mod_attn_prefill: Module,
     attn_prefill_fn: rocml_hip::Function,
     quant: QuantKernels,
+    kv_f16: KvF16Kernels,
 }
 
 pub(crate) fn load(hsaco: &[u8], name: &str) -> Result<(Module, rocml_hip::Function), RocmlError> {
@@ -181,6 +183,7 @@ impl Kernels {
             rocml_kernels::ATTN_PREFILL_F32_KERNEL,
         )?;
         let quant = QuantKernels::load_all()?;
+        let kv_f16 = KvF16Kernels::load_all()?;
 
         Ok(Self {
             _mod_embedding,
@@ -210,6 +213,7 @@ impl Kernels {
             _mod_attn_prefill,
             attn_prefill_fn,
             quant,
+            kv_f16,
         })
     }
 
@@ -568,5 +572,95 @@ impl Kernels {
         // SAFETY: params matches add_inplace_f32's signature (float*, const
         // float*, unsigned); no block-size constraint.
         unsafe { self.add_inplace_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
+    }
+
+    /// `cast_f32_f16(in, out, n)`: elementwise f32 -> f16, used by the
+    /// default-dtype KV cache (issue #3) to cast a decode/prefill step's
+    /// freshly projected f32 K/V into the cache's f16 storage — see
+    /// [`KvF16Kernels`] (kept in its own small file; `kernels.rs` already
+    /// sits at the workspace's 400-line file cap).
+    pub fn cast_f32_f16(&self, input: DevPtr, out: DevPtr, n: u32) -> Result<(), RocmlError> {
+        self.kv_f16.cast_f32_f16(input, out, n)
+    }
+
+    /// f16-KV-cache sibling of [`Self::attn_decode`] (issue #3's default
+    /// dtype) — identical launch shape, dispatching to
+    /// `attn_decode_partial_f16` instead; the reduce pass is shared
+    /// unchanged (it never touches the cache, only the f32 partial scratch
+    /// buffers).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_f16(
+        &self,
+        q: DevPtr,
+        k_layer: DevPtr,
+        v_layer: DevPtr,
+        out: DevPtr,
+        partial_out: DevPtr,
+        partial_m: DevPtr,
+        partial_l: DevPtr,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_seq: u32,
+        cur_len: u32,
+        scale: f32,
+    ) -> Result<(), RocmlError> {
+        let group = n_heads / n_kv_heads;
+        let (n_splits, split_len) = attn_decode_splits(n_kv_heads, cur_len);
+        self.kv_f16.attn_decode_partial_f16(
+            q,
+            k_layer,
+            v_layer,
+            partial_out,
+            partial_m,
+            partial_l,
+            n_kv_heads,
+            group,
+            head_dim,
+            max_seq,
+            cur_len,
+            split_len,
+            n_splits,
+            scale,
+        )?;
+
+        let reduce_cfg = LaunchConfig {
+            grid: (n_heads, 1, 1),
+            block: (head_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut reduce_params =
+            kernel_params!(partial_out, partial_m, partial_l, out, head_dim, n_splits);
+        // SAFETY: same reduce kernel/contract as `attn_decode`'s reduce
+        // pass — see that method's SAFETY comment.
+        unsafe {
+            self.attn_decode_reduce_fn
+                .launch(&reduce_cfg, &mut reduce_params, None)
+        }
+        .map_err(Into::into)
+    }
+
+    /// f16-KV-cache sibling of [`Self::attn_prefill`] (issue #3's default
+    /// dtype).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_f16(
+        &self,
+        q: DevPtr,
+        k_layer: DevPtr,
+        v_layer: DevPtr,
+        out: DevPtr,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_seq: u32,
+        chunk_len: u32,
+        pos_base: u32,
+        scale: f32,
+    ) -> Result<(), RocmlError> {
+        let group = n_heads / n_kv_heads;
+        self.kv_f16.attn_prefill_f16(
+            q, k_layer, v_layer, out, n_kv_heads, group, head_dim, max_seq, chunk_len, pos_base,
+            scale,
+        )
     }
 }

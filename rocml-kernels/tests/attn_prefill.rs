@@ -191,3 +191,107 @@ fn equal_head_counts_no_gqa_sharing() {
 fn large_chunk_deep_resume() {
     run_attn_prefill(16, 8, 128, 2048, 256, 1024);
 }
+
+/// `attn_prefill_f16` (issue #3's default KV dtype): mirrors
+/// `run_attn_prefill` above but K/V are uploaded as f16 and the CPU
+/// reference is computed against the f16-rounded values, since the kernel
+/// is expected to reproduce exactly what the f16 cache stores.
+fn run_attn_prefill_f16(
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_seq: u32,
+    chunk_len: u32,
+    pos_base: u32,
+) {
+    use half::f16;
+
+    const TOL_F16: f32 = 5e-3;
+    let _device = Device::new(0).expect("failed to select device 0");
+    let module =
+        Module::load_from_bytes(rocml_kernels::ATTN_PREFILL_F16_HSACO).expect("module load failed");
+    let function = module
+        .get_function(rocml_kernels::ATTN_PREFILL_F16_KERNEL)
+        .expect("kernel lookup failed");
+
+    let group = n_heads / n_kv_heads;
+    let (nh, nkv, hd, ms, cl) = (
+        n_heads as usize,
+        n_kv_heads as usize,
+        head_dim as usize,
+        max_seq as usize,
+        chunk_len as usize,
+    );
+
+    let q: Vec<f32> = (0..cl * nh * hd)
+        .map(|i| ((i % 23) as f32) * 0.05 - 0.55)
+        .collect();
+    let k_f16: Vec<f16> = (0..nkv * ms * hd)
+        .map(|i| f16::from_f32(((i % 19) as f32) * 0.04 - 0.38))
+        .collect();
+    let v_f16: Vec<f16> = (0..nkv * ms * hd)
+        .map(|i| f16::from_f32(((i % 17) as f32) * 0.03 - 0.24))
+        .collect();
+    let k_roundtrip: Vec<f32> = k_f16.iter().map(|&x| x.to_f32()).collect();
+    let v_roundtrip: Vec<f32> = v_f16.iter().map(|&x| x.to_f32()).collect();
+
+    let expected = cpu_reference(
+        &q,
+        &k_roundtrip,
+        &v_roundtrip,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_seq,
+        chunk_len,
+        pos_base,
+    );
+
+    let mut buf_q = DeviceBuffer::<f32>::new(q.len()).expect("hipMalloc q failed");
+    let mut buf_k = DeviceBuffer::<f16>::new(k_f16.len()).expect("hipMalloc k failed");
+    let mut buf_v = DeviceBuffer::<f16>::new(v_f16.len()).expect("hipMalloc v failed");
+    buf_q.copy_from_host(&q).expect("copy q failed");
+    buf_k.copy_from_host(&k_f16).expect("copy k failed");
+    buf_v.copy_from_host(&v_f16).expect("copy v failed");
+    let buf_out = DeviceBuffer::<f32>::new(cl * nh * hd).expect("hipMalloc out failed");
+
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let q_ptr: *mut c_void = buf_q.device_ptr();
+    let k_ptr: *mut c_void = buf_k.device_ptr();
+    let v_ptr: *mut c_void = buf_v.device_ptr();
+    let out_ptr: *mut c_void = buf_out.device_ptr();
+    let mut params = kernel_params!(
+        q_ptr, k_ptr, v_ptr, out_ptr, n_kv_heads, group, head_dim, max_seq, chunk_len, pos_base,
+        scale
+    );
+    let cfg = LaunchConfig {
+        grid: (n_kv_heads, chunk_len, 1),
+        block: (32, group, 1),
+        shared_mem_bytes: 2 * TILE_T * head_dim * std::mem::size_of::<f32>() as u32,
+    };
+    // SAFETY: params matches attn_prefill_f16's parameter list (const
+    // float*, two const half*, float*, six unsigned, float) in order;
+    // block = (32, group, 1); every buffer outlives this launch.
+    unsafe { function.launch(&cfg, &mut params, None) }.expect("kernel launch failed");
+
+    let mut actual = vec![0.0f32; cl * nh * hd];
+    buf_out.copy_to_host(&mut actual).expect("copy out failed");
+    for (i, (got, want)) in actual.iter().zip(&expected).enumerate() {
+        let diff = (got - want).abs();
+        let tol = TOL_F16 * want.abs().max(1.0);
+        assert!(
+            diff <= tol,
+            "attn_prefill f16 out[{i}]: got {got}, want {want} (diff {diff}, tol {tol})"
+        );
+    }
+}
+
+#[test]
+fn f16_kv_chunk_from_fresh_start_matches_f16_rounded_reference() {
+    run_attn_prefill_f16(8, 2, 256, 300, 64, 0);
+}
+
+#[test]
+fn f16_kv_chunk_resumes_after_existing_prefix_matches_f16_rounded_reference() {
+    run_attn_prefill_f16(8, 2, 256, 512, 64, 200);
+}

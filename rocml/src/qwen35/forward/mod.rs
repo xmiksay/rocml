@@ -27,8 +27,10 @@ use scratch::Scratch;
 use super::cache::HybridCache;
 use super::config::{LayerKind, Qwen35Config};
 use super::weights::{LayerWeights, ModelWeights};
+use crate::budget::{kv_bytes_per_token, Budget, HIGH_USAGE_WARN_FRACTION};
 use crate::error::RocmlError;
 use crate::forward::kernels::{offset, Kernels};
+use crate::load_opts::LoadOptions;
 use crate::profile::{self, OpKind, Phase, Profiler};
 
 pub struct Model {
@@ -49,12 +51,49 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn load(gguf_path: impl AsRef<Path>) -> Result<Self, RocmlError> {
+    /// See `crate::forward::Model::load`'s doc comment — mirrors that
+    /// budget-check-then-allocate flow, with `n_cache_layers` counting only
+    /// this architecture's full-attention layers (GDN layers' state is O(1)
+    /// in context length, see `HybridCache`).
+    pub fn load(gguf_path: impl AsRef<Path>, opts: LoadOptions) -> Result<Self, RocmlError> {
+        if opts.kv_cache.is_quantized() {
+            return Err(RocmlError::Config(format!(
+                "kv-cache mode {:?} is not yet implemented (issue #2 in progress)",
+                opts.kv_cache
+            )));
+        }
         let device = Device::new(0)?;
         let gguf = GgufFile::open(gguf_path)?;
         let config = Qwen35Config::from_gguf(&gguf)?;
         let weights = ModelWeights::load(&gguf, &config)?;
-        let cache = HybridCache::new(&config)?;
+
+        let dtype = opts.kv_cache.dense_dtype();
+        let n_cache_layers = config
+            .layer_kinds
+            .iter()
+            .filter(|k| **k == LayerKind::FullAttention)
+            .count() as u32;
+        let per_token =
+            kv_bytes_per_token(n_cache_layers, config.head_count_kv, config.head_dim, dtype);
+        let ctx = opts.ctx.min(config.context_length as usize).max(1);
+        let mem = device.memory_info()?;
+        let budget = Budget::for_loaded_weights(mem.total as u64, mem.free as u64, per_token);
+        if !budget.fits(ctx) {
+            return Err(RocmlError::VramBudget {
+                requested_ctx: ctx,
+                suggested_max_ctx: budget.max_ctx(),
+                breakdown: budget.breakdown(ctx),
+            });
+        }
+        if budget.usage_fraction(ctx) > HIGH_USAGE_WARN_FRACTION {
+            eprintln!(
+                "warning: ctx {ctx} predicts {:.1}% VRAM usage ({})",
+                budget.usage_fraction(ctx) * 100.0,
+                budget.breakdown(ctx)
+            );
+        }
+
+        let cache = HybridCache::new(&config, ctx, dtype)?;
         let kernels = Kernels::load_all()?;
         let hybrid = HybridKernels::load_all()?;
         let scratch = Scratch::new(&config)?;

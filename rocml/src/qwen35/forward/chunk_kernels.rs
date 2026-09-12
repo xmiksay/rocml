@@ -25,6 +25,8 @@ pub struct ChunkKernels {
     extract_heads_fn: rocml_hip::Function,
     _mod_scatter_kv: Module,
     scatter_kv_fn: rocml_hip::Function,
+    _mod_scatter_kv_f16: Module,
+    scatter_kv_f16_fn: rocml_hip::Function,
     _mod_gate_chunk: Module,
     gate_chunk_fn: rocml_hip::Function,
 }
@@ -47,6 +49,10 @@ impl ChunkKernels {
             rocml_kernels::SCATTER_KV_CHUNK_F32_HSACO,
             rocml_kernels::SCATTER_KV_CHUNK_F32_KERNEL,
         )?;
+        let (_mod_scatter_kv_f16, scatter_kv_f16_fn) = load(
+            rocml_kernels::SCATTER_KV_CHUNK_F16_HSACO,
+            rocml_kernels::SCATTER_KV_CHUNK_F16_KERNEL,
+        )?;
         let (_mod_gate_chunk, gate_chunk_fn) = load(
             rocml_kernels::GDN_GATE_CHUNK_F32_HSACO,
             rocml_kernels::GDN_GATE_CHUNK_F32_KERNEL,
@@ -61,6 +67,8 @@ impl ChunkKernels {
             extract_heads_fn,
             _mod_scatter_kv,
             scatter_kv_fn,
+            _mod_scatter_kv_f16,
+            scatter_kv_f16_fn,
             _mod_gate_chunk,
             gate_chunk_fn,
         })
@@ -201,6 +209,35 @@ impl ChunkKernels {
         // SAFETY: params matches scatter_kv_chunk_f32's signature (four
         // const/mut float*, unsigned x5).
         unsafe { self.scatter_kv_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
+    }
+
+    /// f16-cache sibling of [`Self::scatter_kv_chunk`] (issue #3's default
+    /// KV dtype) — same launch shape, dispatching to `scatter_kv_chunk_f16`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scatter_kv_chunk_f16(
+        &self,
+        k_src: DevPtr,
+        v_src: DevPtr,
+        k_dst: DevPtr,
+        v_dst: DevPtr,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_seq: u32,
+        chunk_len: u32,
+        pos_base: u32,
+    ) -> Result<(), RocmlError> {
+        let total = chunk_len * n_kv_heads * head_dim;
+        let cfg = LaunchConfig {
+            grid: (total.div_ceil(LINEAR_BLOCK), 1, 1),
+            block: (LINEAR_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut params = kernel_params!(
+            k_src, v_src, k_dst, v_dst, n_kv_heads, head_dim, max_seq, chunk_len, pos_base
+        );
+        // SAFETY: params matches scatter_kv_chunk_f16's signature (two
+        // const float*, two half*, unsigned x5).
+        unsafe { self.scatter_kv_f16_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 
     /// `gdn_gate_chunk_f32`: batched sibling of `HybridKernels::gdn_gate`

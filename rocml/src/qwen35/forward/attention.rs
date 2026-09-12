@@ -5,6 +5,7 @@
 
 use super::kernels::HybridKernels;
 use super::scratch::Scratch;
+use crate::cache::KvDtype;
 use crate::error::RocmlError;
 use crate::forward::kernels::{attn_decode_splits, offset, Kernels};
 use crate::profile::{self, OpKind, Profiler};
@@ -168,6 +169,7 @@ pub(crate) fn attention_step(
         attn_flops,
         || {
             plane.append(
+                kernels,
                 pos,
                 max_seq,
                 n_kv_heads,
@@ -177,10 +179,15 @@ pub(crate) fn attention_step(
             )?;
 
             let scale = 1.0f32 / (head_dim as f32).sqrt();
-            kernels.attn_decode(
+            let decode = match plane.dtype() {
+                KvDtype::F16 => Kernels::attn_decode_f16,
+                KvDtype::F32 => Kernels::attn_decode,
+            };
+            decode(
+                kernels,
                 offset(&scratch.attn_q, 0),
-                offset(plane.k_buffer(), 0),
-                offset(plane.v_buffer(), 0),
+                plane.k_ptr(),
+                plane.v_ptr(),
                 offset(&scratch.attn_concat, 0),
                 offset(&scratch.attn_partial_out, 0),
                 offset(&scratch.attn_partial_m, 0),

@@ -158,6 +158,10 @@ pub const EXTRACT_HEADS_F32_HSACO: &[u8] =
 pub const EXTRACT_HEADS_F32_KERNEL: &str = "extract_heads_f32";
 pub const SCATTER_KV_CHUNK_F32_HSACO: &[u8] = EXTRACT_HEADS_F32_HSACO;
 pub const SCATTER_KV_CHUNK_F32_KERNEL: &str = "scatter_kv_chunk_f32";
+/// f16-cache sibling of `scatter_kv_chunk_f32` (issue #3's default KV
+/// dtype) — same code object, different entry point.
+pub const SCATTER_KV_CHUNK_F16_HSACO: &[u8] = EXTRACT_HEADS_F32_HSACO;
+pub const SCATTER_KV_CHUNK_F16_KERNEL: &str = "scatter_kv_chunk_f16";
 pub const GDN_GATE_CHUNK_F32_HSACO: &[u8] = EXTRACT_HEADS_F32_HSACO;
 pub const GDN_GATE_CHUNK_F32_KERNEL: &str = "gdn_gate_chunk_f32";
 
@@ -172,6 +176,12 @@ pub const ATTN_DECODE_PARTIAL_F32_HSACO: &[u8] =
 pub const ATTN_DECODE_PARTIAL_F32_KERNEL: &str = "attn_decode_partial_f32";
 pub const ATTN_DECODE_REDUCE_F32_HSACO: &[u8] = ATTN_DECODE_PARTIAL_F32_HSACO;
 pub const ATTN_DECODE_REDUCE_F32_KERNEL: &str = "attn_decode_reduce_f32";
+/// f16-KV-cache sibling of `attn_decode_partial_f32` (issue #3's default KV
+/// dtype) — same code object, different entry point; the reduce kernel is
+/// shared unchanged (it only ever reads the f32 partial buffers, never the
+/// cache itself).
+pub const ATTN_DECODE_PARTIAL_F16_HSACO: &[u8] = ATTN_DECODE_PARTIAL_F32_HSACO;
+pub const ATTN_DECODE_PARTIAL_F16_KERNEL: &str = "attn_decode_partial_f16";
 
 /// `kernels/attn_prefill.hip`: batched causal attention for a prefill chunk
 /// of `chunk_len` new query rows against the KV cache (which already holds
@@ -183,3 +193,6 @@ pub const ATTN_DECODE_REDUCE_F32_KERNEL: &str = "attn_decode_reduce_f32";
 pub const ATTN_PREFILL_F32_HSACO: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill.hsaco"));
 pub const ATTN_PREFILL_F32_KERNEL: &str = "attn_prefill_f32";
+/// f16-KV-cache sibling of `attn_prefill_f32` (issue #3's default KV dtype).
+pub const ATTN_PREFILL_F16_HSACO: &[u8] = ATTN_PREFILL_F32_HSACO;
+pub const ATTN_PREFILL_F16_KERNEL: &str = "attn_prefill_f16";

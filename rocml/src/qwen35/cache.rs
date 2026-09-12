@@ -1,16 +1,22 @@
 //! Per-layer decode state for the hybrid model: GDN layers carry a causal
 //! conv1d ring buffer plus the gated-delta-rule recurrence state (both must
-//! be zeroed between unrelated generations); full-attention layers carry a
-//! `[kv_head][max_seq][head_dim]` K/V plane, the same layout
-//! `crate::cache::KvCache` uses for the dense model (never explicitly reset —
-//! stale bytes past the current position are never read, see
-//! `crate::forward::Model::reset`'s doc comment).
+//! be zeroed between unrelated generations, and are O(1) in context length —
+//! unaffected by issue #3/#2's long-context work); full-attention layers
+//! carry a `[kv_head][max_seq][head_dim]` K/V plane, the same layout and
+//! `KvDtype` choice `crate::cache::KvCache` uses for the dense model (never
+//! explicitly reset — stale bytes past the current position are never read,
+//! see `crate::forward::Model::reset`'s doc comment).
+//!
+//! No hardcoded cap on `max_seq` any more — see `crate::cache`'s module doc
+//! for the issue #3 budgeting story this mirrors.
 
+use half::f16;
 use rocml_hip::DeviceBuffer;
 
 use super::config::{GdnConfig, LayerKind, Qwen35Config};
-use crate::cache::MAX_SEQ_CAP;
+use crate::cache::KvDtype;
 use crate::error::RocmlError;
+use crate::forward::kernels::{offset, DevPtr, Kernels};
 
 pub struct GdnLayerState {
     /// `[conv_dim, kernel-1]` row-major: per-channel history, oldest first.
@@ -46,39 +52,83 @@ impl GdnLayerState {
     }
 }
 
+enum PlaneStorage {
+    F16 {
+        k: DeviceBuffer<f16>,
+        v: DeviceBuffer<f16>,
+    },
+    F32 {
+        k: DeviceBuffer<f32>,
+        v: DeviceBuffer<f32>,
+    },
+}
+
 pub struct AttnPlane {
-    k: DeviceBuffer<f32>,
-    v: DeviceBuffer<f32>,
+    storage: PlaneStorage,
 }
 
 impl AttnPlane {
-    fn new(n_kv_heads: u32, max_seq: u32, head_dim: u32) -> Result<Self, RocmlError> {
+    fn new(
+        n_kv_heads: u32,
+        max_seq: u32,
+        head_dim: u32,
+        dtype: KvDtype,
+    ) -> Result<Self, RocmlError> {
         let plane_len = (n_kv_heads as usize) * (max_seq as usize) * (head_dim as usize);
-        Ok(Self {
-            k: DeviceBuffer::new(plane_len)?,
-            v: DeviceBuffer::new(plane_len)?,
-        })
+        let storage = match dtype {
+            KvDtype::F16 => PlaneStorage::F16 {
+                k: DeviceBuffer::new(plane_len)?,
+                v: DeviceBuffer::new(plane_len)?,
+            },
+            KvDtype::F32 => PlaneStorage::F32 {
+                k: DeviceBuffer::new(plane_len)?,
+                v: DeviceBuffer::new(plane_len)?,
+            },
+        };
+        Ok(Self { storage })
     }
 
-    /// Appends this step's `[n_kv_heads, head_dim]` k/v vectors at `pos`.
+    pub fn dtype(&self) -> KvDtype {
+        match &self.storage {
+            PlaneStorage::F16 { .. } => KvDtype::F16,
+            PlaneStorage::F32 { .. } => KvDtype::F32,
+        }
+    }
+
+    /// Appends this decode step's `[n_kv_heads, head_dim]` k/v vectors at
+    /// `pos` — see `crate::cache::KvCache::append`'s doc comment for the
+    /// f16-vs-f32 storage split (identical logic, duplicated because the
+    /// dense and hybrid caches otherwise share no code).
+    #[allow(clippy::too_many_arguments)]
     pub fn append(
         &mut self,
+        kernels: &Kernels,
         pos: u32,
         max_seq: u32,
         n_kv_heads: u32,
         head_dim: u32,
-        k: &DeviceBuffer<f32>,
-        v: &DeviceBuffer<f32>,
+        k_src: &DeviceBuffer<f32>,
+        v_src: &DeviceBuffer<f32>,
     ) -> Result<(), RocmlError> {
-        let head_dim = head_dim as usize;
-        let max_seq = max_seq as usize;
-        for h in 0..n_kv_heads as usize {
-            let dst_offset = h * max_seq * head_dim + pos as usize * head_dim;
-            let src_offset = h * head_dim;
-            self.k
-                .copy_from_device(dst_offset, k, src_offset, head_dim)?;
-            self.v
-                .copy_from_device(dst_offset, v, src_offset, head_dim)?;
+        let head_dim_u = head_dim as usize;
+        let max_seq_u = max_seq as usize;
+        match &mut self.storage {
+            PlaneStorage::F32 { k, v } => {
+                for h in 0..n_kv_heads as usize {
+                    let dst = h * max_seq_u * head_dim_u + pos as usize * head_dim_u;
+                    let src = h * head_dim_u;
+                    k.copy_from_device(dst, k_src, src, head_dim_u)?;
+                    v.copy_from_device(dst, v_src, src, head_dim_u)?;
+                }
+            }
+            PlaneStorage::F16 { k, v } => {
+                for h in 0..n_kv_heads as usize {
+                    let dst = h * max_seq_u * head_dim_u + pos as usize * head_dim_u;
+                    let src = h * head_dim_u;
+                    kernels.cast_f32_f16(offset(k_src, src), offset(k, dst), head_dim)?;
+                    kernels.cast_f32_f16(offset(v_src, src), offset(v, dst), head_dim)?;
+                }
+            }
         }
         Ok(())
     }
@@ -87,12 +137,18 @@ impl AttnPlane {
         kvh as usize * max_seq as usize * head_dim as usize
     }
 
-    pub fn k_buffer(&self) -> &DeviceBuffer<f32> {
-        &self.k
+    pub fn k_ptr(&self) -> DevPtr {
+        match &self.storage {
+            PlaneStorage::F16 { k, .. } => offset(k, 0),
+            PlaneStorage::F32 { k, .. } => offset(k, 0),
+        }
     }
 
-    pub fn v_buffer(&self) -> &DeviceBuffer<f32> {
-        &self.v
+    pub fn v_ptr(&self) -> DevPtr {
+        match &self.storage {
+            PlaneStorage::F16 { v, .. } => offset(v, 0),
+            PlaneStorage::F32 { v, .. } => offset(v, 0),
+        }
     }
 }
 
@@ -103,8 +159,11 @@ pub struct HybridCache {
 }
 
 impl HybridCache {
-    pub fn new(cfg: &Qwen35Config) -> Result<Self, RocmlError> {
-        let max_seq = cfg.context_length.min(MAX_SEQ_CAP);
+    /// `ctx` is the caller's already-budgeted context length (see
+    /// `crate::registry::clamp_ctx`) — clamped once more here against the
+    /// model's own declared `context_length` as a final sanity bound.
+    pub fn new(cfg: &Qwen35Config, ctx: usize, dtype: KvDtype) -> Result<Self, RocmlError> {
+        let max_seq = ctx.min(cfg.context_length as usize).max(1) as u32;
         let mut gdn = Vec::with_capacity(cfg.layer_kinds.len());
         let mut attn = Vec::with_capacity(cfg.layer_kinds.len());
         for &kind in &cfg.layer_kinds {
@@ -119,6 +178,7 @@ impl HybridCache {
                         cfg.head_count_kv,
                         max_seq,
                         cfg.head_dim,
+                        dtype,
                     )?));
                 }
             }

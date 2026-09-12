@@ -5,7 +5,7 @@
 
 use clap::Args;
 use rocml::generate::generate_sampled_profiled;
-use rocml::{Profiler, RocmlError, SamplingParams};
+use rocml::{LoadOptions, Profiler, RocmlError, SamplingParams};
 use serde_json::json;
 
 use crate::common::{self, ModelArgs};
@@ -27,6 +27,13 @@ pub struct BenchArgs {
     /// the subsequent decode rate are reported.
     #[arg(long)]
     depth: Option<usize>,
+    /// KV cache context length to allocate. Unset defaults to whatever
+    /// `--depth`/`--decode-tokens` needs (so `bench --depth 16384` just
+    /// works without also specifying `--ctx`), clamped to this
+    /// checkpoint's estimated VRAM budget (issue #3) same as every other
+    /// command.
+    #[arg(long)]
+    ctx: Option<usize>,
     #[arg(long)]
     json: bool,
     /// Collect per-op/per-layer roofline instrumentation and print a report
@@ -43,8 +50,16 @@ pub fn run(args: &BenchArgs) -> Result<(), RocmlError> {
         return Err(RocmlError::Config("--runs must be at least 1".to_string()));
     }
     let resolved = args.model_args.resolve()?;
-    eprintln!("loading {}...", args.model_args.model);
-    let mut loaded = common::load(&resolved.path)?;
+    let kv_cache: rocml::KvCacheMode = args.model_args.kv_cache.into();
+    // Bench's own ctx default (unlike chat/generate's registry-preset
+    // fallback): big enough for whatever --depth/--decode-tokens asks for,
+    // since a throughput probe shouldn't require a separate --ctx just to
+    // reach the depth it was asked to measure at.
+    let needed = args.depth.unwrap_or(0) + args.decode_tokens;
+    let ctx_request = args.ctx.unwrap_or(needed).max(needed).max(1);
+    let ctx = rocml::registry::clamp_ctx(ctx_request, &resolved.path, kv_cache.dense_dtype())?;
+    eprintln!("loading {}... (ctx {ctx})", args.model_args.model);
+    let mut loaded = common::load(&resolved.path, LoadOptions { ctx, kv_cache })?;
     let prompt_len = args.depth.unwrap_or(args.prompt_tokens);
     let prompt_ids = synthetic_prompt(&loaded, prompt_len);
     eprintln!(

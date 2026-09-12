@@ -46,6 +46,7 @@
 // attends to every one of the `cur_len` cached positions — no masking
 // beyond the loop bound `[0, cur_len)` (unlike prefill's varying valid_len
 // per row, decode's "valid_len" is just `cur_len` for every head).
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include "attn_common.h"
@@ -59,25 +60,41 @@
 // rocml/src/forward/kernels.rs) — see the module doc's LDS budget math.
 #define TILE_T 8
 
-// The single K/V read seam: a future quantized KV cache (issue #2) slots a
-// dequant step in here without touching the tiling/online-softmax logic
-// around it. Reads f32 today, one element at a time (the tile-load loop
-// below is what amortizes this across a whole GQA group).
-__device__ __forceinline__ float load_kv_f32(const float* plane, size_t idx) {
+// The single K/V read seam: issue #3's f16 KV cache and a future quantized
+// KV cache (issue #2) both slot in here without touching the
+// tiling/online-softmax logic around it — `T` is the cache's on-device
+// element type (`float` for the f32 parity-test path, `__half` for the
+// default f16 path), always widened to `float` for the online-softmax math.
+// The tile-load loop below is what amortizes this per-element dequant cost
+// across a whole GQA group's worth of reads.
+template <typename T>
+__device__ __forceinline__ float load_kv(const T* plane, size_t idx);
+
+template <>
+__device__ __forceinline__ float load_kv<float>(const float* plane, size_t idx) {
     return plane[idx];
+}
+
+template <>
+__device__ __forceinline__ float load_kv<__half>(const __half* plane, size_t idx) {
+    return __half2float(plane[idx]);
 }
 
 // One workgroup per (kv head, sequence split). Produces the split's
 // unnormalized weighted-V accumulator plus its running (max, sum) for every
 // q head in this kv head's GQA group; `attn_decode_reduce_f32` combines
-// splits afterward. `partial_out`/`partial_m`/`partial_l` are `[n_heads,
-// n_splits, ...]`-shaped (a q head's own index `h`, not its kv head's,
-// indexes them — see the Rust launcher), so this kernel and the reduce
-// kernel agree on layout with no extra bookkeeping.
-extern "C" __global__ void attn_decode_partial_f32(
-    const float* q, const float* k_layer, const float* v_layer, float* partial_out,
-    float* partial_m, float* partial_l, unsigned n_kv_heads, unsigned group, unsigned head_dim,
-    unsigned max_seq, unsigned cur_len, unsigned split_len, unsigned n_splits, float scale) {
+// splits afterward (dtype-independent — it only ever reads the f32 partial
+// buffers this kernel writes, never the cache itself, so there is exactly
+// one reduce kernel regardless of KV storage dtype). `partial_out`/
+// `partial_m`/`partial_l` are `[n_heads, n_splits, ...]`-shaped (a q head's
+// own index `h`, not its kv head's, indexes them — see the Rust launcher),
+// so this kernel and the reduce kernel agree on layout with no extra
+// bookkeeping.
+template <typename T>
+__device__ __forceinline__ void attn_decode_partial_impl(
+    const float* q, const T* k_layer, const T* v_layer, float* partial_out, float* partial_m,
+    float* partial_l, unsigned n_kv_heads, unsigned group, unsigned head_dim, unsigned max_seq,
+    unsigned cur_len, unsigned split_len, unsigned n_splits, float scale) {
     unsigned kvh = blockIdx.x;
     unsigned s = blockIdx.y;
     if (kvh >= n_kv_heads || s >= n_splits) {
@@ -103,8 +120,8 @@ extern "C" __global__ void attn_decode_partial_f32(
     float* v_tile = smem + (size_t)TILE_T * head_dim;
 
     const float* q_h = q + (size_t)h * head_dim;
-    const float* k_plane = k_layer + (size_t)kvh * max_seq * head_dim;
-    const float* v_plane = v_layer + (size_t)kvh * max_seq * head_dim;
+    const T* k_plane = k_layer + (size_t)kvh * max_seq * head_dim;
+    const T* v_plane = v_layer + (size_t)kvh * max_seq * head_dim;
 
     float q_reg[MAX_LANE_ELEMS];
     unsigned n_elems = 0;
@@ -126,8 +143,8 @@ extern "C" __global__ void attn_decode_partial_f32(
             unsigned row = idx / head_dim;
             unsigned col = idx % head_dim;
             size_t src = (size_t)(tile_base + row) * head_dim + col;
-            k_tile[idx] = load_kv_f32(k_plane, src);
-            v_tile[idx] = load_kv_f32(v_plane, src);
+            k_tile[idx] = load_kv(k_plane, src);
+            v_tile[idx] = load_kv(v_plane, src);
         }
         __syncthreads();
 
@@ -168,6 +185,29 @@ extern "C" __global__ void attn_decode_partial_f32(
     for (unsigned d = lane; d < head_dim; d += 32, ++i) {
         out_row[d] = acc[i];
     }
+}
+
+// f32 KV storage: the parity-test reference path (see
+// `crate::model::LoadOptions`) — never selected by the CLI/server.
+extern "C" __global__ void attn_decode_partial_f32(
+    const float* q, const float* k_layer, const float* v_layer, float* partial_out,
+    float* partial_m, float* partial_l, unsigned n_kv_heads, unsigned group, unsigned head_dim,
+    unsigned max_seq, unsigned cur_len, unsigned split_len, unsigned n_splits, float scale) {
+    attn_decode_partial_impl<float>(
+        q, k_layer, v_layer, partial_out, partial_m, partial_l, n_kv_heads, group, head_dim,
+        max_seq, cur_len, split_len, n_splits, scale);
+}
+
+// f16 KV storage: the default path (issue #3) — halves KV bandwidth/VRAM
+// vs f32 with the dequant folded into this same tile-load loop, never
+// materialized back to f32 in memory.
+extern "C" __global__ void attn_decode_partial_f16(
+    const float* q, const __half* k_layer, const __half* v_layer, float* partial_out,
+    float* partial_m, float* partial_l, unsigned n_kv_heads, unsigned group, unsigned head_dim,
+    unsigned max_seq, unsigned cur_len, unsigned split_len, unsigned n_splits, float scale) {
+    attn_decode_partial_impl<__half>(
+        q, k_layer, v_layer, partial_out, partial_m, partial_l, n_kv_heads, group, head_dim,
+        max_seq, cur_len, split_len, n_splits, scale);
 }
 
 // Merges one q head's per-split partials with the log-sum-exp rule. One

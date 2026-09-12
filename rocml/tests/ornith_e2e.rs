@@ -12,7 +12,7 @@
 //! 24-token decode loop, twice, is unbearably slow unoptimized). Skips
 //! itself if the checkpoint isn't present on this machine.
 
-use rocml::Model;
+use rocml::{LoadOptions, Model};
 use rocml_core::gguf::GgufFile;
 use rocml_core::testpaths::checkpoint;
 use rocml_core::tokenizer::BpeTokenizer;
@@ -69,11 +69,14 @@ fn ornith_9b_greedy_decode_is_well_formed_and_deterministic() {
     let prompt_ids = tokenizer.encode(PROMPT);
     assert!(!prompt_ids.is_empty(), "prompt tokenized to zero ids");
 
-    let mut model_a = Model::load(&gguf_path).expect("load model (first run)");
+    // Production default (f16 KV, issue #3) — this test has no independent
+    // reference to pin against, only internal well-formedness/determinism.
+    let opts = LoadOptions::new(4096);
+    let mut model_a = Model::load(&gguf_path, opts).expect("load model (first run)");
     let ids_a = greedy_generate(&mut model_a, &prompt_ids, NUM_TOKENS);
     drop(model_a); // free VRAM before the second load
 
-    let mut model_b = Model::load(&gguf_path).expect("load model (second run)");
+    let mut model_b = Model::load(&gguf_path, opts).expect("load model (second run)");
     let ids_b = greedy_generate(&mut model_b, &prompt_ids, NUM_TOKENS);
 
     assert_eq!(

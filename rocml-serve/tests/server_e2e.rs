@@ -50,6 +50,7 @@ async fn spawn_test_server(model_path: PathBuf) -> TestServer {
     let (app, worker_thread) = build(ServerConfig {
         model_path,
         ctx: 4096,
+        kv_cache: rocml::KvCacheMode::Fp16,
         max_tokens_default: 128,
         no_think: true,
         default_sampling: rocml::SamplingParams::default(),

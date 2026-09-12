@@ -14,7 +14,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
 use rocml::generate::generate_sampled_with_stop;
-use rocml::{GenerateStats, Model, SamplingParams};
+use rocml::{GenerateStats, LoadOptions, Model, SamplingParams};
 use rocml_core::tokenizer::BpeTokenizer;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -46,6 +46,7 @@ pub enum WorkerEvent {
 /// "pure virtual method called" rather than exiting cleanly.
 pub fn spawn(
     model_path: PathBuf,
+    load_opts: LoadOptions,
     tokenizer: Arc<BpeTokenizer>,
 ) -> Result<(Sender<Job>, std::thread::JoinHandle<()>), String> {
     let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
@@ -53,7 +54,7 @@ pub fn spawn(
 
     let handle = std::thread::Builder::new()
         .name("rocml-worker".to_string())
-        .spawn(move || worker_loop(model_path, tokenizer, job_rx, ready_tx))
+        .spawn(move || worker_loop(model_path, load_opts, tokenizer, job_rx, ready_tx))
         .map_err(|e| format!("failed to spawn worker thread: {e}"))?;
 
     ready_rx
@@ -64,11 +65,12 @@ pub fn spawn(
 
 fn worker_loop(
     model_path: PathBuf,
+    load_opts: LoadOptions,
     tokenizer: Arc<BpeTokenizer>,
     job_rx: Receiver<Job>,
     ready_tx: Sender<Result<(), String>>,
 ) {
-    let mut model = match Model::load(&model_path) {
+    let mut model = match Model::load(&model_path, load_opts) {
         Ok(m) => m,
         Err(e) => {
             let _ = ready_tx.send(Err(e.to_string()));

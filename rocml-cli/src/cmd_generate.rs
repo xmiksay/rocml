@@ -8,9 +8,13 @@ use std::io::Write;
 use clap::Args;
 use rocml::chat::{Message, RenderOpts};
 use rocml::generate::generate_sampled_profiled;
-use rocml::{Profiler, RocmlError};
+use rocml::{LoadOptions, Profiler, RocmlError};
 
 use crate::common::{self, ModelArgs, SamplingArgs};
+
+/// Fallback context budget when neither `--ctx` nor a resolved registry
+/// preset supplies one — this command's pre-registry default.
+const DEFAULT_CTX: usize = 4096;
 
 #[derive(Args, Debug)]
 pub struct GenerateArgs {
@@ -31,6 +35,11 @@ pub struct GenerateArgs {
     no_think: bool,
     #[arg(short = 'n', long = "max-tokens", default_value_t = 64)]
     n: usize,
+    /// Context length to allocate the KV cache for. Unset falls back to the
+    /// resolved model's registry preset, then [`DEFAULT_CTX`]; either way
+    /// clamped to this checkpoint's estimated VRAM budget (issue #3).
+    #[arg(long)]
+    ctx: Option<usize>,
     #[command(flatten)]
     sampling: SamplingArgs,
     /// Collect per-op/per-layer roofline instrumentation and print a report
@@ -42,8 +51,10 @@ pub struct GenerateArgs {
 pub fn run(args: &GenerateArgs) -> Result<(), RocmlError> {
     let resolved = args.model_args.resolve()?;
     let spec = resolved.spec;
-    eprintln!("loading {}...", args.model_args.model);
-    let mut loaded = common::load(&resolved.path)?;
+    let kv_cache: rocml::KvCacheMode = args.model_args.kv_cache.into();
+    let ctx = common::resolve_ctx(args.ctx, spec, DEFAULT_CTX, &resolved.path, kv_cache)?;
+    eprintln!("loading {}... (ctx {ctx})", args.model_args.model);
+    let mut loaded = common::load(&resolved.path, LoadOptions { ctx, kv_cache })?;
     let mem = loaded.model.memory_info()?;
     eprintln!(
         "loaded: {} layers, hidden={}, vocab={}; VRAM free {:.0} MiB / total {:.0} MiB",

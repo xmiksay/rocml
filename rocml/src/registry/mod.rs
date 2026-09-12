@@ -83,21 +83,33 @@ pub fn resolve(name_or_path: &str, download: bool) -> Result<ResolvedModel, Rocm
     })
 }
 
-/// Clamps a requested context budget to the engine's current hard cap
-/// (`crate::cache::MAX_SEQ_CAP`), warning on stderr when it does. Shared by
-/// every caller that turns a preset's `default_ctx` (or a user's `--ctx`)
-/// into the value actually handed to the engine, since a preset like
-/// `ornith-9b`'s (8192) can legitimately exceed today's cap.
-pub fn clamp_ctx(requested: usize) -> usize {
-    let cap = crate::cache::MAX_SEQ_CAP as usize;
+/// Clamps a requested context budget to this checkpoint's actual VRAM
+/// budget (issue #3 — see `crate::budget`), warning on stderr when it does.
+/// Shared by every caller that turns a preset's `default_ctx` (or a user's
+/// `--ctx`) into the value actually handed to `Model::load`: a preset like
+/// `ornith-9b`'s (8192) now genuinely fits at the default fp16 KV dtype
+/// (previously clamped to a hardcoded 4096 regardless of VRAM).
+///
+/// This is a *pre-load* estimate (see `budget::estimate_from_gguf`'s doc
+/// comment on why it's necessarily approximate) — `Model::load` still
+/// performs the authoritative post-weights-load check and can still error
+/// if reality doesn't match this estimate closely enough.
+pub fn clamp_ctx(
+    requested: usize,
+    gguf_path: &Path,
+    kv_dtype: crate::cache::KvDtype,
+) -> Result<usize, RocmlError> {
+    let (budget, model_ctx_cap) = crate::budget::estimate_from_gguf(gguf_path, kv_dtype)?;
+    let cap = budget.max_ctx().min(model_ctx_cap).max(1);
     if requested > cap {
         eprintln!(
-            "warning: requested context {requested} exceeds this engine's current cache cap of \
-             {cap} tokens (see issue #3); clamping to {cap}"
+            "warning: requested context {requested} exceeds the estimated VRAM budget for this \
+             checkpoint; clamping to {cap} ({})",
+            budget.breakdown(cap)
         );
-        cap
+        Ok(cap)
     } else {
-        requested
+        Ok(requested)
     }
 }
 
@@ -259,13 +271,32 @@ mod tests {
         assert_eq!(resolved.path, PathBuf::from("./some/model.gguf"));
     }
 
+    // Real hardware + real checkpoint required (clamp_ctx now queries
+    // hipMemGetInfo and opens the GGUF) — skip-if-missing, same convention
+    // as `weights::linear`'s per-layer spot checks.
+    const QWEN3_GGUF_REL: &str = "Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
+
     #[test]
     fn clamp_ctx_leaves_small_values_untouched() {
-        assert_eq!(clamp_ctx(2048), 2048);
+        let Some(path) = rocml_core::testpaths::checkpoint(QWEN3_GGUF_REL) else {
+            return;
+        };
+        assert_eq!(
+            clamp_ctx(64, &path, crate::cache::KvDtype::F16).expect("clamp_ctx"),
+            64
+        );
     }
 
     #[test]
-    fn clamp_ctx_caps_at_max_seq_cap() {
-        assert_eq!(clamp_ctx(8192), crate::cache::MAX_SEQ_CAP as usize);
+    fn clamp_ctx_caps_to_the_budgeted_max_when_requested_exceeds_it() {
+        let Some(path) = rocml_core::testpaths::checkpoint(QWEN3_GGUF_REL) else {
+            return;
+        };
+        // A request far beyond any plausible VRAM budget or the model's own
+        // declared context_length must come back clamped, not passed
+        // through untouched.
+        let clamped = clamp_ctx(10_000_000, &path, crate::cache::KvDtype::F16).expect("clamp_ctx");
+        assert!(clamped > 0);
+        assert!(clamped < 10_000_000);
     }
 }

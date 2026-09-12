@@ -43,6 +43,16 @@ pub enum RocmlError {
     #[error("sequence length {requested} exceeds this model's cache capacity of {max_seq} tokens")]
     ContextOverflow { requested: u32, max_seq: u32 },
 
+    #[error(
+        "requested context {requested_ctx} doesn't fit in available VRAM ({breakdown}); try \
+         --ctx {suggested_max_ctx} or smaller, or a quantized --kv-cache mode (q8/q4-mixed)"
+    )]
+    VramBudget {
+        requested_ctx: usize,
+        suggested_max_ctx: usize,
+        breakdown: String,
+    },
+
     #[error("tokenizer has no eos_token_id (tokenizer.ggml.eos_token_id missing from GGUF)")]
     MissingEosToken,
 

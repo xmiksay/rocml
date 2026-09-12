@@ -4,6 +4,7 @@
 // see `qwen35::forward::attention::attention_step` and `AttnPlane::append`
 // — but a T-token chunk needs it batched into one launch, not T*heads tiny
 // copies per layer).
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 // Extracts one `head_dim`-wide field (Q or the output gate) out of a fused
@@ -49,6 +50,27 @@ extern "C" __global__ void scatter_kv_chunk_f32(
     size_t dst_idx = (size_t)h * max_seq * head_dim + (size_t)(pos_base + t) * head_dim + d;
     k_dst[dst_idx] = k_src[src_idx];
     v_dst[dst_idx] = v_src[src_idx];
+}
+
+// f16-cache sibling of `scatter_kv_chunk_f32` (issue #3's default KV dtype):
+// identical index math, casting each element on the way in instead of a
+// same-dtype store.
+extern "C" __global__ void scatter_kv_chunk_f16(
+    const float* k_src, const float* v_src, __half* k_dst, __half* v_dst, unsigned n_kv_heads,
+    unsigned head_dim, unsigned max_seq, unsigned chunk_len, unsigned pos_base) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned total = chunk_len * n_kv_heads * head_dim;
+    if (idx >= total) {
+        return;
+    }
+    unsigned d = idx % head_dim;
+    unsigned tmp = idx / head_dim;
+    unsigned h = tmp % n_kv_heads;
+    unsigned t = tmp / n_kv_heads;
+    size_t src_idx = (size_t)t * n_kv_heads * head_dim + (size_t)h * head_dim + d;
+    size_t dst_idx = (size_t)h * max_seq * head_dim + (size_t)(pos_base + t) * head_dim + d;
+    k_dst[dst_idx] = __float2half(k_src[src_idx]);
+    v_dst[dst_idx] = __float2half(v_src[src_idx]);
 }
 
 // Batched sibling of `gdn_gate_f32` (see that kernel's doc comment for the

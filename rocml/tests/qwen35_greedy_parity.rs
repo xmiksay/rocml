@@ -27,7 +27,7 @@
 //! isolates "does the hybrid GPU forward pass match Crane" — the thing this
 //! test exists to check — from the unrelated tokenizer question.
 
-use rocml::Model;
+use rocml::{KvCacheMode, LoadOptions, Model};
 use rocml_core::gguf::GgufFile;
 use rocml_core::testpaths::checkpoint;
 use rocml_core::tokenizer::BpeTokenizer;
@@ -101,7 +101,13 @@ fn qwen35_2b_hybrid_greedy_matches_crane_gpu_reference() {
     let tokenizer = BpeTokenizer::from_gguf(&gguf).expect("build tokenizer");
     drop(gguf);
 
-    let mut model = Model::load(&gguf_path).expect("load model");
+    // f32 KV explicitly so this suite pins the exact pre-issue-#3 reference
+    // numerics Crane's independent GPU implementation was compared against.
+    let mut model = Model::load(
+        &gguf_path,
+        LoadOptions::new(4096).with_kv_cache(KvCacheMode::F32),
+    )
+    .expect("load model");
 
     for case in &fixtures.cases {
         let own_ids = tokenizer.encode(&case.prompt);

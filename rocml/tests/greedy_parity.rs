@@ -10,7 +10,7 @@
 //! unoptimized. Skips itself if the checkpoint isn't present on this
 //! machine.
 
-use rocml::Model;
+use rocml::{KvCacheMode, LoadOptions, Model};
 use rocml_core::gguf::GgufFile;
 use rocml_core::testpaths::checkpoint;
 use rocml_core::tokenizer::BpeTokenizer;
@@ -117,7 +117,14 @@ fn dense_qwen3_0_6b_greedy_matches_candle_cpu_reference() {
     let tokenizer = BpeTokenizer::from_gguf(&gguf).expect("build tokenizer");
     drop(gguf); // Model::load mmaps its own handle; no need to hold two.
 
-    let mut model = Model::load(&gguf_path).expect("load model");
+    // f32 KV explicitly (not the default f16) so this suite pins the exact
+    // pre-issue-#3 reference numerics candle's CPU f32 implementation was
+    // compared against — see `rocml::LoadOptions`'s doc comment.
+    let mut model = Model::load(
+        &gguf_path,
+        LoadOptions::new(4096).with_kv_cache(KvCacheMode::F32),
+    )
+    .expect("load model");
 
     for case in &fixtures.cases {
         model.reset().expect("reset failed");

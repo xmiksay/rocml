@@ -6,6 +6,7 @@
 mod attention;
 mod ffn;
 pub(crate) mod kernels;
+pub(crate) mod kernels_kv;
 pub(crate) mod kernels_quant;
 mod scratch;
 
@@ -16,9 +17,11 @@ use rocml_core::gguf::GgufFile;
 use rocml_hip::{Device, MemoryInfo};
 use scratch::Scratch;
 
+use crate::budget::{kv_bytes_per_token, Budget, HIGH_USAGE_WARN_FRACTION};
 use crate::cache::KvCache;
 use crate::config::ModelConfig;
 use crate::error::RocmlError;
+use crate::load_opts::LoadOptions;
 use crate::profile::{self, OpKind, Phase, Profiler};
 use crate::weights::ModelWeights;
 
@@ -37,14 +40,52 @@ pub struct Model {
 
 impl Model {
     /// Loads a dense Qwen3 GGUF onto the GPU: opens/mmaps the file, reads
-    /// config, dequantizes and uploads every weight, allocates the KV cache
-    /// and scratch buffers, and loads every kernel this forward pass needs.
-    pub fn load(gguf_path: impl AsRef<Path>) -> Result<Self, RocmlError> {
+    /// config, dequantizes and uploads every weight, runs the authoritative
+    /// post-weights-load VRAM budget check (issue #3 — see `crate::budget`),
+    /// then allocates the KV cache and scratch buffers and loads every
+    /// kernel this forward pass needs.
+    pub fn load(gguf_path: impl AsRef<Path>, opts: LoadOptions) -> Result<Self, RocmlError> {
+        if opts.kv_cache.is_quantized() {
+            return Err(RocmlError::Config(format!(
+                "kv-cache mode {:?} is not yet implemented for the dense qwen3 architecture \
+                 (issue #2 targets the qwen3.5 hybrid architecture's full-attention layers)",
+                opts.kv_cache
+            )));
+        }
         let device = Device::new(0)?;
         let gguf = GgufFile::open(gguf_path)?;
         let config = ModelConfig::from_gguf(&gguf)?;
         let weights = ModelWeights::load(&gguf, &config)?;
-        let cache = KvCache::new(&config)?;
+
+        // Authoritative check: real hipMemGetInfo numbers now that weights
+        // are actually resident, unlike registry::clamp_ctx's necessarily
+        // approximate pre-load (file-size-proxied) estimate.
+        let dtype = opts.kv_cache.dense_dtype();
+        let per_token = kv_bytes_per_token(
+            config.block_count,
+            config.head_count_kv,
+            config.head_dim,
+            dtype,
+        );
+        let ctx = opts.ctx.min(config.context_length as usize).max(1);
+        let mem = device.memory_info()?;
+        let budget = Budget::for_loaded_weights(mem.total as u64, mem.free as u64, per_token);
+        if !budget.fits(ctx) {
+            return Err(RocmlError::VramBudget {
+                requested_ctx: ctx,
+                suggested_max_ctx: budget.max_ctx(),
+                breakdown: budget.breakdown(ctx),
+            });
+        }
+        if budget.usage_fraction(ctx) > HIGH_USAGE_WARN_FRACTION {
+            eprintln!(
+                "warning: ctx {ctx} predicts {:.1}% VRAM usage ({})",
+                budget.usage_fraction(ctx) * 100.0,
+                budget.breakdown(ctx)
+            );
+        }
+
+        let cache = KvCache::new(&config, ctx, dtype)?;
         let kernels = Kernels::load_all()?;
         let scratch = Scratch::new(&config)?;
 

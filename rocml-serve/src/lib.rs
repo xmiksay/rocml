@@ -12,13 +12,16 @@ pub mod worker;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rocml::SamplingParams;
+use rocml::{KvCacheMode, SamplingParams};
 use rocml_core::gguf::GgufFile;
 use rocml_core::tokenizer::BpeTokenizer;
 
 pub struct ServerConfig {
     pub model_path: PathBuf,
     pub ctx: usize,
+    /// KV cache storage/quantization policy (issue #2/#3) — see
+    /// `rocml::KvCacheMode`.
+    pub kv_cache: KvCacheMode,
     pub max_tokens_default: usize,
     pub no_think: bool,
     /// Sampling defaults for requests that omit a field — from the resolved
@@ -52,7 +55,12 @@ pub fn build(config: ServerConfig) -> Result<(axum::Router, std::thread::JoinHan
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "model".to_string())
     });
-    let (job_tx, worker_handle) = worker::spawn(config.model_path.clone(), tokenizer.clone())?;
+    let load_opts = rocml::LoadOptions {
+        ctx: config.ctx,
+        kv_cache: config.kv_cache,
+    };
+    let (job_tx, worker_handle) =
+        worker::spawn(config.model_path.clone(), load_opts, tokenizer.clone())?;
 
     let state = Arc::new(state::AppState {
         job_tx,

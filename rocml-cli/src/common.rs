@@ -4,13 +4,36 @@
 
 use std::path::Path;
 
-use clap::Args;
-use rocml::{Model, ResolvedModel, RocmlError, SamplingParams};
+use clap::{Args, ValueEnum};
+use rocml::{
+    KvCacheMode, LoadOptions, Model, ModelSpec, ResolvedModel, RocmlError, SamplingParams,
+};
 use rocml_core::gguf::GgufFile;
 use rocml_core::tokenizer::BpeTokenizer;
 
-/// `--model`/`--no-download` flags shared by every subcommand that loads a
-/// model.
+/// `--kv-cache` flag spelling, mapped to `rocml::KvCacheMode` — `F32` is
+/// deliberately not exposed here (parity-test-only, see `KvCacheMode`'s doc
+/// comment); quantized modes stay opt-in until issue #15's eval exists.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum KvCacheArg {
+    Fp16,
+    Q8,
+    #[value(name = "q4-mixed")]
+    Q4Mixed,
+}
+
+impl From<KvCacheArg> for KvCacheMode {
+    fn from(arg: KvCacheArg) -> Self {
+        match arg {
+            KvCacheArg::Fp16 => KvCacheMode::Fp16,
+            KvCacheArg::Q8 => KvCacheMode::Q8,
+            KvCacheArg::Q4Mixed => KvCacheMode::Q4Mixed,
+        }
+    }
+}
+
+/// `--model`/`--no-download`/`--kv-cache` flags shared by every subcommand
+/// that loads a model.
 #[derive(Args, Debug, Clone)]
 pub struct ModelArgs {
     /// Registry name (e.g. `qwen3.5-2b`) or a path to a `.gguf` file.
@@ -20,12 +43,34 @@ pub struct ModelArgs {
     /// downloading it via `hf` (the default).
     #[arg(long)]
     pub no_download: bool,
+    /// KV cache storage/quantization policy (issue #2/#3). Default `fp16`
+    /// halves cache vs the old f32-only cache; `q8`/`q4-mixed` further
+    /// shrink it (KIVI-style: fp16 attention sinks + recent window,
+    /// quantized bulk, boundary attention layers left fp16) at the cost of
+    /// a small, opt-in accuracy tradeoff.
+    #[arg(long, value_enum, default_value = "fp16")]
+    pub kv_cache: KvCacheArg,
 }
 
 impl ModelArgs {
     pub fn resolve(&self) -> Result<ResolvedModel, RocmlError> {
         rocml::resolve(&self.model, !self.no_download)
     }
+}
+
+/// Resolves the final context length for a load: an explicit `--ctx`, else
+/// the resolved model's registry preset, else `default_ctx` — then clamped
+/// to this checkpoint's estimated VRAM budget (`rocml::registry::clamp_ctx`,
+/// issue #3) at the requested KV dtype.
+pub fn resolve_ctx(
+    explicit: Option<usize>,
+    spec: Option<&ModelSpec>,
+    default_ctx: usize,
+    gguf_path: &Path,
+    kv_cache: KvCacheMode,
+) -> Result<usize, RocmlError> {
+    let requested = explicit.unwrap_or_else(|| spec.map_or(default_ctx, |s| s.default_ctx));
+    rocml::registry::clamp_ctx(requested, gguf_path, kv_cache.dense_dtype())
 }
 
 /// Sampling flags shared by `chat` and `generate`. `bench` doesn't take
@@ -78,12 +123,12 @@ pub struct Loaded {
 /// `Model::load` (which reopens the file itself — see `Model::load`'s own
 /// doc comment on why that's cheap and not worth threading a shared handle
 /// through).
-pub fn load(model_path: impl AsRef<Path>) -> Result<Loaded, RocmlError> {
+pub fn load(model_path: impl AsRef<Path>, opts: LoadOptions) -> Result<Loaded, RocmlError> {
     let path = model_path.as_ref();
     let gguf = GgufFile::open(path)?;
     let tokenizer = BpeTokenizer::from_gguf(&gguf)?;
     drop(gguf);
-    let model = Model::load(path)?;
+    let model = Model::load(path, opts)?;
     Ok(Loaded { tokenizer, model })
 }
 

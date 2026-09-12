@@ -7,7 +7,7 @@
 //! gets this kernel's win for free.
 
 use super::kernels::{attn_decode_splits, offset, Kernels};
-use crate::cache::KvCache;
+use crate::cache::{KvCache, KvDtype};
 use crate::config::ModelConfig;
 use crate::error::RocmlError;
 use crate::profile::{self, OpKind, Profiler};
@@ -139,14 +139,23 @@ pub(crate) fn attention_step(
         attn_bytes,
         attn_flops,
         || {
-            cache.append(layer_idx as usize, pos, &scratch.k, &scratch.v)?;
+            cache.append(kernels, layer_idx as usize, pos, &scratch.k, &scratch.v)?;
 
             let max_seq = cache.max_seq();
             let scale = 1.0f32 / (head_dim as f32).sqrt();
-            kernels.attn_decode(
+            let (k_ptr, v_ptr) = (
+                cache.k_ptr(layer_idx as usize)?,
+                cache.v_ptr(layer_idx as usize)?,
+            );
+            let decode = match cache.dtype() {
+                KvDtype::F16 => Kernels::attn_decode_f16,
+                KvDtype::F32 => Kernels::attn_decode,
+            };
+            decode(
+                kernels,
                 offset(&scratch.q, 0),
-                offset(cache.k_buffer(layer_idx as usize)?, 0),
-                offset(cache.v_buffer(layer_idx as usize)?, 0),
+                k_ptr,
+                v_ptr,
                 offset(&scratch.attn_concat, 0),
                 offset(&scratch.attn_partial_out, 0),
                 offset(&scratch.attn_partial_m, 0),

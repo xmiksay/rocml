@@ -71,9 +71,10 @@ pub const REGISTRY: &[ModelSpec] = &[
         hf_repo: "ornith-ai/Ornith-1.0-9B-GGUF",
         hf_file: "ornith-1.0-9b-Q6_K.gguf",
         // The model card recommends ctx up to 256k; 8192 is a sane default
-        // for single-GPU chat use. The engine's KV cache hard-caps at
-        // `crate::cache::MAX_SEQ_CAP` (4096) today, so `resolve`'s callers
-        // clamp this down with a warning via `clamp_ctx` — see issue #3.
+        // for single-GPU chat use, and (issue #3) now actually takes effect
+        // as requested rather than being clamped to a hardcoded 4096 — see
+        // `registry::clamp_ctx`, which still clamps to this checkpoint's
+        // real VRAM budget if that's ever smaller.
         default_ctx: 8192,
         sampling: SamplingParams {
             temperature: 0.6,
