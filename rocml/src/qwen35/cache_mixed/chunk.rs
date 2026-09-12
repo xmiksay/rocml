@@ -37,9 +37,10 @@ impl MixedAttnPlane {
     /// buffers, the same layout `ChunkKernels::scatter_kv_chunk_f16` already
     /// expects for the dense cache. `pos_base` must be this plane's current
     /// append cursor: `chunk_len` sequential `append(pos_base+i, ...)`
-    /// calls (`i` in `0..chunk_len`) are the equivalence this method is
-    /// tested against, both at the kernel level
-    /// (`rocml-kernels/tests/kv_quant_chunk.rs`) and the model level
+    /// calls (`i` in `0..chunk_len`) are the equivalence this batches: the
+    /// underlying per-element arithmetic is checked at the pure-Rust
+    /// bookkeeping level by `plan_chunk_append`'s own tests
+    /// (`layout/chunk_plan.rs`), and end-to-end by the model-level gate
     /// (`mixed_kv_chunked_prefill_parity.rs`).
     pub fn append_chunk(
         &mut self,
@@ -78,10 +79,13 @@ impl MixedAttnPlane {
             // guard against something that "shouldn't happen"): it fires
             // whenever a chunk's own `pos_base` lands exactly on a
             // window-just-became-full boundary — e.g. a snapshot restore at
-            // position `SINK_LEN + WINDOW_LEN` (see
-            // `mixed_kv_chunked_prefill_parity.rs`'s split-boundary
-            // coverage, and `snapshot_equivalence.rs`'s mixed-cache
-            // scenario, which is what caught this) — where the *previous*
+            // position `SINK_LEN + WINDOW_LEN` (`snapshot_equivalence.rs`'s
+            // pre-existing mixed-cache split scenario is what caught this;
+            // a fresh `forward_prompt` from position 0 never hits it, since
+            // chunk boundaries and eviction boundaries have different
+            // residues mod `PREFILL_CHUNK_SIZE` — see this module's
+            // `.claude/CLAUDE.md` writeup for the full argument) — where the
+            // *previous*
             // append already filled the window completely without
             // triggering the eviction (per `prepare_append`'s own
             // semantics, eviction only fires on the position that would
