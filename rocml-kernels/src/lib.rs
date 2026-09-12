@@ -210,3 +210,17 @@ pub const QUANTIZE_EVICT_V_Q8_HSACO: &[u8] = QUANTIZE_EVICT_K_Q8_HSACO;
 pub const QUANTIZE_EVICT_V_Q8_KERNEL: &str = "quantize_evict_v_f16_to_q8";
 pub const QUANTIZE_EVICT_V_Q4_HSACO: &[u8] = QUANTIZE_EVICT_K_Q8_HSACO;
 pub const QUANTIZE_EVICT_V_Q4_KERNEL: &str = "quantize_evict_v_f16_to_q4";
+
+/// `kernels/attn_decode_mixed.hip`: fused decode attention for a KIVI-style
+/// mixed KV layer (issue #2) — extends `attn_decode_partial_f16`'s
+/// online-softmax split-K design with a per-position dequant-on-load that
+/// reads from whichever of the sink/bulk/window regions a position
+/// currently lives in (see the kernel source's module doc). `_q8`/`_q4`
+/// differ only in V's bit width; K is always per-channel Q8. Same launch
+/// shape as `attn_decode_partial_f16`; shares the same
+/// `attn_decode_reduce_f32` reduce pass.
+pub const ATTN_DECODE_PARTIAL_MIXED_Q8_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_decode_mixed.hsaco"));
+pub const ATTN_DECODE_PARTIAL_MIXED_Q8_KERNEL: &str = "attn_decode_partial_mixed_q8";
+pub const ATTN_DECODE_PARTIAL_MIXED_Q4_HSACO: &[u8] = ATTN_DECODE_PARTIAL_MIXED_Q8_HSACO;
+pub const ATTN_DECODE_PARTIAL_MIXED_Q4_KERNEL: &str = "attn_decode_partial_mixed_q4";
