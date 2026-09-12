@@ -86,6 +86,27 @@ pub const REGISTRY: &[ModelSpec] = &[
         thinking_default: true,
     },
     ModelSpec {
+        name: "ornith-9b-q4",
+        family: ModelFamily::Qwen35Hybrid,
+        gguf_rel: "Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf",
+        hf_repo: "ornith-ai/Ornith-1.0-9B-GGUF",
+        hf_file: "ornith-1.0-9b-Q4_K_M.gguf",
+        // Speed variant: ~2x decode vs Q6_K on this engine (the q6_k gemv is
+        // ALU-bound, see issue #7) and 1.7 GB more VRAM headroom for KV.
+        // Q6_K stays the default `ornith-9b` until the #15 agentic eval
+        // rules on Q4_K_M's tool-calling quality.
+        default_ctx: 8192,
+        sampling: SamplingParams {
+            temperature: 0.6,
+            top_k: Some(20),
+            top_p: Some(0.95),
+            seed: 0,
+            repeat_penalty: None,
+            repeat_penalty_window: 64,
+        },
+        thinking_default: true,
+    },
+    ModelSpec {
         name: "qwen3.5-2b",
         family: ModelFamily::Qwen35Hybrid,
         gguf_rel: "Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf",
