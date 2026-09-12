@@ -115,6 +115,8 @@ pub struct Kernels {
     attn_decode_partial_fn: rocml_hip::Function,
     _mod_attn_decode_reduce: Module,
     attn_decode_reduce_fn: rocml_hip::Function,
+    _mod_attn_prefill: Module,
+    attn_prefill_fn: rocml_hip::Function,
     quant: QuantKernels,
 }
 
@@ -174,6 +176,10 @@ impl Kernels {
             rocml_kernels::ATTN_DECODE_REDUCE_F32_HSACO,
             rocml_kernels::ATTN_DECODE_REDUCE_F32_KERNEL,
         )?;
+        let (_mod_attn_prefill, attn_prefill_fn) = load(
+            rocml_kernels::ATTN_PREFILL_F32_HSACO,
+            rocml_kernels::ATTN_PREFILL_F32_KERNEL,
+        )?;
         let quant = QuantKernels::load_all()?;
 
         Ok(Self {
@@ -201,6 +207,8 @@ impl Kernels {
             attn_decode_partial_fn,
             _mod_attn_decode_reduce,
             attn_decode_reduce_fn,
+            _mod_attn_prefill,
+            attn_prefill_fn,
             quant,
         })
     }
@@ -442,6 +450,47 @@ impl Kernels {
                 .launch(&reduce_cfg, &mut reduce_params, None)
         }
         .map_err(Into::into)
+    }
+
+    /// Batched causal attention for a prefill chunk (`kernels/attn_prefill.hip`):
+    /// `chunk_len` new query rows (positions `pos_base..pos_base+chunk_len`)
+    /// against the KV cache, which must already hold this chunk's own
+    /// appended K/V (batch-append before calling this). `q`/`out` are
+    /// `[chunk_len, n_heads, head_dim]`; `k_layer`/`v_layer` are one layer's
+    /// whole KV-cache buffer, `[n_kv_heads, max_seq, head_dim]` — same
+    /// layout and cache buffers `attn_decode` uses, so a layer can freely mix
+    /// prefill chunks and decode steps against the same cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill(
+        &self,
+        q: DevPtr,
+        k_layer: DevPtr,
+        v_layer: DevPtr,
+        out: DevPtr,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_seq: u32,
+        chunk_len: u32,
+        pos_base: u32,
+        scale: f32,
+    ) -> Result<(), RocmlError> {
+        let group = n_heads / n_kv_heads;
+        let cfg = LaunchConfig {
+            grid: (n_kv_heads, chunk_len, 1),
+            block: (32, group, 1),
+            shared_mem_bytes: 2 * ATTN_DECODE_TILE_T * head_dim * size_of::<f32>() as u32,
+        };
+        let mut params = kernel_params!(
+            q, k_layer, v_layer, out, n_kv_heads, group, head_dim, max_seq, chunk_len, pos_base,
+            scale
+        );
+        // SAFETY: params matches attn_prefill_f32's signature (three const
+        // float*, float*, six unsigned, float); block = (32, group, 1)
+        // matches the kernel's warp-per-q-head design; shared_mem_bytes
+        // matches TILE_T(8) from the kernel source (kept in sync via the
+        // shared ATTN_DECODE_TILE_T constant).
+        unsafe { self.attn_prefill_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 
     /// In-place NEOX rope over `x` viewed as `[tokens, heads, head_dim]`.

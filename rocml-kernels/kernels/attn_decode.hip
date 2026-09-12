@@ -48,6 +48,8 @@
 // per row, decode's "valid_len" is just `cur_len` for every head).
 #include <hip/hip_runtime.h>
 
+#include "attn_common.h"
+
 // head_dim <= 256 / warp size 32 = 8 elements/lane at most (see the module
 // doc's occupancy note). A head_dim above 256 would need a bigger array —
 // not a shape this codebase uses today (dense Qwen3 128, qwen35 256).
@@ -63,18 +65,6 @@
 // below is what amortizes this across a whole GQA group).
 __device__ __forceinline__ float load_kv_f32(const float* plane, size_t idx) {
     return plane[idx];
-}
-
-// Butterfly (XOR) reduction across one 32-lane wavefront: after the full
-// 5-step exchange every lane holds the total, so callers need no separate
-// broadcast. gfx1101 is wave32, so 5 halving steps (16,8,4,2,1) cover the
-// whole wavefront.
-__device__ __forceinline__ float warp_reduce_sum(float v) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_xor(v, offset, 32);
-    }
-    return v;
 }
 
 // One workgroup per (kv head, sequence split). Produces the split's

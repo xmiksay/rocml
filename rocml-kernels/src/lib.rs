@@ -149,3 +149,14 @@ pub const ATTN_DECODE_PARTIAL_F32_HSACO: &[u8] =
 pub const ATTN_DECODE_PARTIAL_F32_KERNEL: &str = "attn_decode_partial_f32";
 pub const ATTN_DECODE_REDUCE_F32_HSACO: &[u8] = ATTN_DECODE_PARTIAL_F32_HSACO;
 pub const ATTN_DECODE_REDUCE_F32_KERNEL: &str = "attn_decode_reduce_f32";
+
+/// `kernels/attn_prefill.hip`: batched causal attention for a prefill chunk
+/// of `chunk_len` new query rows against the KV cache (which already holds
+/// this chunk's own appended K/V). One workgroup per (kv head, query row);
+/// launch with block = `[32, group]` and `2 * TILE_T(8) * head_dim *
+/// sizeof(f32)` bytes of dynamic shared memory (same K/V tile size as
+/// `attn_decode`). No split-K/reduce pass needed — see the kernel source's
+/// module doc.
+pub const ATTN_PREFILL_F32_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill.hsaco"));
+pub const ATTN_PREFILL_F32_KERNEL: &str = "attn_prefill_f32";
