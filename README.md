@@ -5,7 +5,7 @@ rocml is a standalone Rust inference engine for Qwen3.5-hybrid/Ornith and dense 
 ## Crates
 
 - `rocml` — the engine (GGUF loading, GPU forward passes, sampling, chat templating).
-- `rocml-cli` — `chat` (interactive REPL), `bench` (throughput harness), `generate` (one-shot completion), `models` (list the model registry).
+- `rocml-cli` — `chat` (interactive REPL), `bench` (throughput harness), `generate` (one-shot completion), `models` (list the model registry), `eval` (agentic quality-eval harness, issue #15).
 - `rocml-serve` — `POST /v1/chat/completions` (streaming and non-streaming, tool calls) and `GET /v1/models`.
 
 ## Build requirements
@@ -26,6 +26,7 @@ rocml is a standalone Rust inference engine for Qwen3.5-hybrid/Ornith and dense 
 - `make clean` — `cargo clean`
 - `make serve` — run `rocml-serve` against `QWEN_MODEL` (defaults to the Qwen3.5-2B dev/test checkpoint; override with `QWEN_MODEL=/path/to.gguf make serve`)
 - `make bench` — run `rocml-cli bench` against `QWEN_MODEL`, JSON output
+- `make eval` — run the agentic quality-eval harness (issue #15) for both `ornith-9b` (Q6_K) and `ornith-9b-q4` (Q4_K_M) at ctx 16384, writing `bench/eval/results/*.json`
 
 All cargo invocations are run with `CARGO_BUILD_JOBS=4` to avoid overloading the build machine.
 
@@ -66,6 +67,25 @@ rocml-cli models
 `bench --depth N` pre-fills N synthetic tokens of context through the normal prefill path, then measures decode throughput starting from that depth instead of from an empty cache — the head-to-head metric vs. llama.cpp's own "decode t/s at depth D" numbers, since decode cost (attention/GDN-recurrence bytes read) grows with how much context already exists. Both the prefill-to-depth rate and the post-depth decode rate are reported.
 
 See [Observability](#observability) below for `--profile`.
+
+## Agentic eval (issue #15)
+
+```
+rocml-cli eval --model <name-or-gguf> --label <label> --out <path.json> [--scenarios bench/eval/scenarios.json] [--corpus bench/eval/corpus.txt] [--ctx 16384] [--max-gen-tokens 2048] [--resume]
+```
+
+A small, deterministic (greedy argmax, fixed everything) quality harness measuring quantization loss on real tool-use tasks rather than wikitext PPL — the answer to "can Q4_K_M replace Q6_K as the default `ornith-9b` registry entry". Runs entirely in-process (no `rocml-serve`), loading the model the same way `chat`/`generate` do and driving it through the real chat protocol (`rocml::chat::render`/`parse_assistant_output`) with thinking mode on (Ornith's own default).
+
+`bench/eval/scenarios.json` (checked in, hand-authored, 20 scenarios) has four kinds, each scored deterministically:
+
+- `tool_choice` — a request that must trigger exactly one tool call with the expected function name and arguments.
+- `no_tool` — tools are available but the request must not trigger a call (a plain factual question).
+- `multi_turn` — turn 1 must produce an expected tool call; the harness feeds back a canned tool result, then turn 2 is graded against either another expected tool call or a final answer containing an expected substring.
+- `long_context` — a retrieval needle buried in ~4000 or ~8000 tokens of deterministically-generated filler (`rocml-cli/src/eval/filler.rs` — only the needle, its position fraction, and the target length are stored, not the filler itself); passes if the final answer contains the needle's fact.
+
+`bench/eval/corpus.txt` (a small public-domain text excerpt) feeds a secondary, informational signal: teacher-forced perplexity over the decode path (one forward pass per token). The pass/fail call is the agentic score, not PPL.
+
+Every scored scenario is written to `--out` immediately, so a run interrupted partway through (a 30-60 minute eval killed by, e.g., a wrapping timeout) can be resumed with `--resume`, which skips any scenario id already present in that file (and skips recomputing PPL if it's already recorded). `make eval` runs both the `ornith-9b` (Q6_K) baseline and the `ornith-9b-q4` (Q4_K_M) candidate at ctx 16384, `--resume` always on.
 
 ## Observability
 
