@@ -31,6 +31,12 @@ pub struct ServerConfig {
     /// Overrides the served model id (normally the GGUF file's stem) with
     /// the registry name, when `--model` resolved through the registry.
     pub model_id_override: Option<String>,
+    /// Conversation-state snapshot layer (issue #1), qwen35-hybrid-only —
+    /// see `rocml::snapshot`. `snapshot_ram_mb == 0` disables the RAM tier
+    /// entirely; `snapshot_dir: None` leaves the optional NVMe tier off.
+    pub snapshot_ram_mb: usize,
+    pub snapshot_dir: Option<PathBuf>,
+    pub snapshot_disk_mb: u64,
 }
 
 /// Loads the tokenizer, spawns the model-owning worker thread (see
@@ -59,8 +65,17 @@ pub fn build(config: ServerConfig) -> Result<(axum::Router, std::thread::JoinHan
         ctx: config.ctx,
         kv_cache: config.kv_cache,
     };
-    let (job_tx, worker_handle) =
-        worker::spawn(config.model_path.clone(), load_opts, tokenizer.clone())?;
+    let snapshot_config = worker::SnapshotConfig {
+        ram_mb: config.snapshot_ram_mb,
+        dir: config.snapshot_dir,
+        disk_mb: config.snapshot_disk_mb,
+    };
+    let (job_tx, worker_handle) = worker::spawn(
+        config.model_path.clone(),
+        load_opts,
+        tokenizer.clone(),
+        snapshot_config,
+    )?;
 
     let state = Arc::new(state::AppState {
         job_tx,

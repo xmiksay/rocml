@@ -1,21 +1,25 @@
 //! `rocml-cli chat`: interactive REPL over `rocml::chat`.
 //!
-//! Deliberately re-renders and re-processes the *entire* conversation from
-//! `Model::reset()` on every turn rather than trying to reuse the KV cache
-//! incrementally: incremental reuse would need the freshly re-tokenized
-//! transcript prefix to exactly match what's already resident in the cache
-//! turn after turn, and BPE re-tokenization of model-decoded text isn't
-//! guaranteed to round-trip byte-for-byte forever. A REPL session is short
-//! enough that full reprocessing is cheap, so KISS wins over that fragility.
+//! Every turn still re-renders the *entire* conversation transcript through
+//! the chat template (BPE re-tokenization of model-decoded text isn't
+//! guaranteed to round-trip byte-for-byte forever, so there's no cheaper way
+//! to get an authoritative prompt-token sequence) and calls
+//! `rocml::snapshot::turn::run_turn`, which does the actual KV/GDN-state
+//! reuse (issue #1): a snapshot from the previous turn is restored whenever
+//! its token ids are an exact prefix of the freshly re-rendered prompt, so
+//! only the new suffix is re-prefilled — see `run_turn`'s doc comment. For a
+//! dense `qwen3` model (no hybrid snapshot support) this reduces to exactly
+//! the old always-full-reprocess behavior.
 
 use std::io::{self, BufRead, Write};
 
 use clap::Args;
 use rocml::chat::{Message, RenderOpts, ScanEvent, StreamScanner, ToolCall};
-use rocml::generate::generate_sampled;
+use rocml::snapshot::turn::run_turn;
+use rocml::snapshot::KvConfigStamp;
 use rocml::{LoadOptions, RocmlError};
 
-use crate::common::{self, ModelArgs, SamplingArgs};
+use crate::common::{self, ModelArgs, SamplingArgs, SnapshotArgs};
 
 /// Fallback soft context budget when neither `--ctx` nor a resolved
 /// registry preset supplies one (i.e. a path-based `--model` with no
@@ -45,6 +49,8 @@ pub struct ChatArgs {
     ctx: Option<usize>,
     #[command(flatten)]
     sampling: SamplingArgs,
+    #[command(flatten)]
+    snapshots: SnapshotArgs,
 }
 
 pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
@@ -74,6 +80,15 @@ pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
     let mut messages: Vec<Message> = Vec::new();
     let stdin = io::stdin();
     let mut line = String::new();
+
+    // Multi-turn REPL reuse (issue #1, qwen35-hybrid-only — a no-op for a
+    // dense `qwen3` model since `Model::as_hybrid` is `None` there).
+    let mut snapshot_store = args.snapshots.build_store()?;
+    let model_stamp = common::model_stamp(&resolved.path)?;
+    let kv_config = KvConfigStamp {
+        mode: kv_cache,
+        ctx,
+    };
 
     loop {
         print!("\n> ");
@@ -110,7 +125,6 @@ pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
             continue;
         }
 
-        loaded.model.reset()?;
         // The primed generation-prompt tail already opened `<think>\n`
         // unless `--no-think` closed it, so the scanner must start
         // already-in-thinking to match (see `StreamScanner::
@@ -123,13 +137,17 @@ pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
         let mut content = String::new();
         let mut thinking = String::new();
         let mut tool_calls = Vec::new();
-        let stats = generate_sampled(
+        let outcome = run_turn(
             &mut loaded.model,
             &loaded.tokenizer,
+            snapshot_store.as_mut(),
+            &model_stamp,
+            &kv_config,
             &prompt_ids,
             args.max_tokens,
             true,
             &sampling,
+            &[], // no OpenAI stop strings in the REPL
             |chunk| {
                 feed_scanner(
                     &mut scanner,
@@ -140,10 +158,25 @@ pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
                 )
             },
         )?;
+        let stats = outcome.stats;
         for event in scanner.finish() {
             handle_event(event, &mut content, &mut thinking, &mut tool_calls);
         }
         println!();
+        if outcome.reused_prefix > 0 {
+            eprintln!(
+                "[snapshot hit: reused {} of {} prompt tokens, restore {:.1}ms, capture {:.1}ms]",
+                outcome.reused_prefix,
+                prompt_ids.len(),
+                outcome.restore_seconds * 1000.0,
+                outcome.capture_seconds * 1000.0,
+            );
+        } else {
+            eprintln!(
+                "[snapshot miss, capture {:.1}ms]",
+                outcome.capture_seconds * 1000.0
+            );
+        }
         eprintln!(
             "[prompt {:.1} tok/s, decode {:.1} tok/s]",
             stats.prompt_tokens_per_sec(),

@@ -2,6 +2,7 @@
 //! a one-shot prompt-completion command, all driving the `rocml` engine.
 
 mod cmd_bench;
+mod cmd_bench_turns;
 mod cmd_chat;
 mod cmd_generate;
 mod cmd_models;

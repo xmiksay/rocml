@@ -2,9 +2,10 @@
 //! loading, and the sampling-flag set every subcommand that generates text
 //! takes identically.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
+use rocml::snapshot::{ModelStamp, SnapshotStore};
 use rocml::{
     KvCacheMode, LoadOptions, Model, ModelSpec, ResolvedModel, RocmlError, SamplingParams,
 };
@@ -112,6 +113,50 @@ impl SamplingArgs {
             ..base
         }
     }
+}
+
+/// `--snapshot-ram-mb`/`--snapshot-dir`/`--snapshot-disk-mb` — shared by
+/// `chat` and `bench --turns` (issue #1). Mirrors `rocml-serve`'s own flags
+/// of the same name.
+#[derive(Args, Debug, Clone)]
+pub struct SnapshotArgs {
+    /// Conversation-state snapshot RAM budget in MiB (qwen35-hybrid-only).
+    /// `0` disables the RAM tier.
+    #[arg(long = "snapshot-ram-mb", default_value_t = 4096)]
+    pub snapshot_ram_mb: usize,
+    /// Optional NVMe persistence tier — content-addressed files under this
+    /// directory, size-budgeted by `--snapshot-disk-mb`. Off by default.
+    #[arg(long = "snapshot-dir")]
+    pub snapshot_dir: Option<PathBuf>,
+    #[arg(long = "snapshot-disk-mb", default_value_t = 20_000)]
+    pub snapshot_disk_mb: u64,
+}
+
+impl SnapshotArgs {
+    /// `None` when both tiers are off (`--snapshot-ram-mb 0` and no
+    /// `--snapshot-dir`) — callers should pass that straight through to
+    /// `run_turn` as `None` rather than a zero-budget store: `run_turn`
+    /// still pays the D2H capture cost for a `Some` store even if nothing
+    /// ends up stored, and a fully-disabled snapshot layer should skip that
+    /// cost entirely, not just skip storing the result.
+    pub fn build_store(&self) -> Result<Option<SnapshotStore>, RocmlError> {
+        if self.snapshot_ram_mb == 0 && self.snapshot_dir.is_none() {
+            return Ok(None);
+        }
+        SnapshotStore::new(
+            self.snapshot_ram_mb * 1024 * 1024,
+            self.snapshot_dir.clone(),
+            self.snapshot_disk_mb * 1024 * 1024,
+        )
+        .map(Some)
+    }
+}
+
+/// Cheap model identity stamp (issue #1) — wraps `ModelStamp::from_path`'s
+/// `io::Error` into `RocmlError` for CLI call sites.
+pub fn model_stamp(path: &Path) -> Result<ModelStamp, RocmlError> {
+    ModelStamp::from_path(path)
+        .map_err(|e| RocmlError::Config(format!("failed to stamp {}: {e}", path.display())))
 }
 
 pub struct Loaded {

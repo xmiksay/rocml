@@ -47,6 +47,17 @@ impl TestServer {
 }
 
 async fn spawn_test_server(model_path: PathBuf) -> TestServer {
+    spawn_test_server_with_snapshots(model_path, 0).await
+}
+
+/// Like [`spawn_test_server`], with the conversation-state snapshot RAM
+/// budget (issue #1) as an explicit parameter — `0` (what every pre-existing
+/// test in this file uses) disables the snapshot layer entirely, keeping
+/// them exactly as they behaved before this feature existed.
+async fn spawn_test_server_with_snapshots(
+    model_path: PathBuf,
+    snapshot_ram_mb: usize,
+) -> TestServer {
     let (app, worker_thread) = build(ServerConfig {
         model_path,
         ctx: 4096,
@@ -55,6 +66,9 @@ async fn spawn_test_server(model_path: PathBuf) -> TestServer {
         no_think: true,
         default_sampling: rocml::SamplingParams::default(),
         model_id_override: None,
+        snapshot_ram_mb,
+        snapshot_dir: None,
+        snapshot_disk_mb: 0,
     })
     .expect("server failed to build (model load / tokenizer)");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -175,6 +189,73 @@ async fn chat_completions_end_to_end() {
     }
 
     server.shutdown().await;
+}
+
+/// Issue #1's server-level correctness gate: a two-turn conversation run
+/// against a server with the snapshot layer on must produce byte-identical
+/// output to the same conversation against a server with it fully disabled
+/// (`--snapshot-ram-mb 0`) — restoring turn 1's end-of-turn snapshot and
+/// prefilling only turn 2's new suffix must be indistinguishable from full
+/// reprocessing. (Whether turn 2 actually *hit* the snapshot is asserted
+/// directly against `rocml::snapshot::turn::run_turn` in
+/// `rocml/tests/snapshot_equivalence.rs`, which exercises the exact
+/// mechanism this server calls without needing to scrape log output.)
+#[tokio::test]
+async fn two_turn_conversation_matches_output_with_snapshots_disabled() {
+    let Some(gguf_path) = checkpoint(GGUF_REL) else {
+        return;
+    };
+    let with_snapshots = spawn_test_server_with_snapshots(gguf_path.clone(), 512).await;
+    let without_snapshots = spawn_test_server_with_snapshots(gguf_path, 0).await;
+
+    let turn2_with = run_two_turn_conversation(with_snapshots.addr).await;
+    let turn2_without = run_two_turn_conversation(without_snapshots.addr).await;
+
+    assert_eq!(
+        turn2_with, turn2_without,
+        "a snapshot-resumed turn 2 must match a from-scratch turn 2 byte-for-byte"
+    );
+
+    with_snapshots.shutdown().await;
+    without_snapshots.shutdown().await;
+}
+
+/// Runs a fixed two-turn greedy conversation against `addr` and returns
+/// turn 2's assistant content.
+async fn run_two_turn_conversation(addr: std::net::SocketAddr) -> String {
+    let body1 = json!({
+        "messages": [{"role": "user", "content": "In one short sentence, name the capital of France."}],
+        "max_tokens": 24,
+        "temperature": 0,
+        "stream": false,
+    })
+    .to_string();
+    let resp1 = support::post_json(addr, "/v1/chat/completions", &body1).await;
+    assert_eq!(resp1.status, 200, "turn 1 body: {}", resp1.body);
+    let parsed1: Value = serde_json::from_str(&resp1.body).expect("valid JSON response");
+    let content1 = parsed1["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("turn 1 content is a string")
+        .to_string();
+
+    let body2 = json!({
+        "messages": [
+            {"role": "user", "content": "In one short sentence, name the capital of France."},
+            {"role": "assistant", "content": content1},
+            {"role": "user", "content": "And what is a famous landmark there?"},
+        ],
+        "max_tokens": 32,
+        "temperature": 0,
+        "stream": false,
+    })
+    .to_string();
+    let resp2 = support::post_json(addr, "/v1/chat/completions", &body2).await;
+    assert_eq!(resp2.status, 200, "turn 2 body: {}", resp2.body);
+    let parsed2: Value = serde_json::from_str(&resp2.body).expect("valid JSON response");
+    parsed2["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("turn 2 content is a string")
+        .to_string()
 }
 
 /// Companion to the tools scenario above: Ornith-1.0-9B is the agentic

@@ -8,12 +8,12 @@ use rocml::generate::generate_sampled_profiled;
 use rocml::{LoadOptions, Profiler, RocmlError, SamplingParams};
 use serde_json::json;
 
-use crate::common::{self, ModelArgs};
+use crate::common::{self, ModelArgs, SnapshotArgs};
 
 #[derive(Args, Debug)]
 pub struct BenchArgs {
     #[command(flatten)]
-    model_args: ModelArgs,
+    pub(crate) model_args: ModelArgs,
     #[arg(long = "prompt-tokens", default_value_t = 64)]
     prompt_tokens: usize,
     #[arg(long = "decode-tokens", default_value_t = 128)]
@@ -33,9 +33,9 @@ pub struct BenchArgs {
     /// checkpoint's estimated VRAM budget (issue #3) same as every other
     /// command.
     #[arg(long)]
-    ctx: Option<usize>,
+    pub(crate) ctx: Option<usize>,
     #[arg(long)]
-    json: bool,
+    pub(crate) json: bool,
     /// Collect per-op/per-layer roofline instrumentation and print a report
     /// after the run (see `rocml::profile`). Only the final run is
     /// profiled — the others still contribute to the tok/s median, but
@@ -43,11 +43,33 @@ pub struct BenchArgs {
     /// into one report for no benefit.
     #[arg(long)]
     profile: bool,
+    /// Simulate a growing multi-turn conversation instead of the default
+    /// single prompt/decode measurement (issue #1's acceptance benchmark):
+    /// `turns` turns, each appending a fixed synthetic user message plus the
+    /// previous turn's generated output, reporting per-turn prefill latency.
+    /// All other throughput flags above (`--prompt-tokens`, `--depth`,
+    /// `--profile`) don't apply in this mode.
+    #[arg(long)]
+    turns: Option<usize>,
+    /// Tokens generated per simulated turn in `--turns` mode.
+    #[arg(long = "turn-decode-tokens", default_value_t = 300)]
+    pub(crate) turn_decode_tokens: usize,
+    /// Disable the snapshot layer for a `--turns` run — compare against a
+    /// second run with this flag to see snapshots' effect (this mode never
+    /// runs both conditions automatically, matching every other bench flag's
+    /// one-condition-per-invocation style).
+    #[arg(long)]
+    pub(crate) no_snapshots: bool,
+    #[command(flatten)]
+    pub(crate) snapshots: SnapshotArgs,
 }
 
 pub fn run(args: &BenchArgs) -> Result<(), RocmlError> {
     if args.runs == 0 {
         return Err(RocmlError::Config("--runs must be at least 1".to_string()));
+    }
+    if let Some(turns) = args.turns {
+        return crate::cmd_bench_turns::run(args, turns);
     }
     let resolved = args.model_args.resolve()?;
     let kv_cache: rocml::KvCacheMode = args.model_args.kv_cache.into();

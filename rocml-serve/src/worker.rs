@@ -8,12 +8,17 @@
 //! `tokio::sync::mpsc` channel, which is fine to construct and send from
 //! this plain thread: tokio's channel senders don't require a runtime to
 //! send on, only to receive-`.await` on the other end.
+//!
+//! The conversation-state snapshot store (issue #1, `rocml::snapshot`) lives
+//! here too, alongside `Model` — restoring/capturing needs `&mut Model`, so
+//! it can only ever happen on this same thread, between jobs.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
-use rocml::generate::generate_sampled_with_stop;
+use rocml::snapshot::turn::run_turn;
+use rocml::snapshot::{KvConfigStamp, ModelStamp, SnapshotStore};
 use rocml::{GenerateStats, LoadOptions, Model, SamplingParams};
 use rocml_core::tokenizer::BpeTokenizer;
 use tokio::sync::mpsc::UnboundedSender;
@@ -32,6 +37,14 @@ pub enum WorkerEvent {
     Error(String),
 }
 
+/// `--snapshot-ram-mb`/`--snapshot-dir`/`--snapshot-disk-mb` — see
+/// `rocml_serve::ServerConfig`'s doc comment.
+pub struct SnapshotConfig {
+    pub ram_mb: usize,
+    pub dir: Option<PathBuf>,
+    pub disk_mb: u64,
+}
+
 /// Spawns the worker thread and blocks (briefly) until the model has either
 /// finished loading or failed to, so startup failures surface synchronously
 /// from `main` instead of only showing up on the first request.
@@ -48,13 +61,23 @@ pub fn spawn(
     model_path: PathBuf,
     load_opts: LoadOptions,
     tokenizer: Arc<BpeTokenizer>,
+    snapshot_config: SnapshotConfig,
 ) -> Result<(Sender<Job>, std::thread::JoinHandle<()>), String> {
     let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     let handle = std::thread::Builder::new()
         .name("rocml-worker".to_string())
-        .spawn(move || worker_loop(model_path, load_opts, tokenizer, job_rx, ready_tx))
+        .spawn(move || {
+            worker_loop(
+                model_path,
+                load_opts,
+                tokenizer,
+                snapshot_config,
+                job_rx,
+                ready_tx,
+            )
+        })
         .map_err(|e| format!("failed to spawn worker thread: {e}"))?;
 
     ready_rx
@@ -67,6 +90,7 @@ fn worker_loop(
     model_path: PathBuf,
     load_opts: LoadOptions,
     tokenizer: Arc<BpeTokenizer>,
+    snapshot_config: SnapshotConfig,
     job_rx: Receiver<Job>,
     ready_tx: Sender<Result<(), String>>,
 ) {
@@ -77,6 +101,40 @@ fn worker_loop(
             return;
         }
     };
+    let model_stamp = match ModelStamp::from_path(&model_path) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = ready_tx.send(Err(format!(
+                "failed to stamp {}: {e}",
+                model_path.display()
+            )));
+            return;
+        }
+    };
+    let kv_config = KvConfigStamp {
+        mode: load_opts.kv_cache,
+        ctx: load_opts.ctx,
+    };
+    // `None` when both tiers are off: `run_turn` still pays the D2H capture
+    // cost for a `Some` store even if nothing ends up stored, so a fully
+    // disabled snapshot layer skips capture entirely rather than just
+    // skipping the store (see `rocml_cli::common::SnapshotArgs::build_store`'s
+    // doc comment, which this mirrors).
+    let mut snapshot_store = if snapshot_config.ram_mb == 0 && snapshot_config.dir.is_none() {
+        None
+    } else {
+        match SnapshotStore::new(
+            snapshot_config.ram_mb * 1024 * 1024,
+            snapshot_config.dir,
+            snapshot_config.disk_mb * 1024 * 1024,
+        ) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                let _ = ready_tx.send(Err(e.to_string()));
+                return;
+            }
+        }
+    };
     let _ = ready_tx.send(Ok(()));
 
     for job in job_rx.iter() {
@@ -85,7 +143,14 @@ fn worker_loop(
         // panic arm below resets it before the next job runs rather than
         // trusting whatever state was left behind.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_job(&mut model, &tokenizer, &job)
+            run_job(
+                &mut model,
+                &tokenizer,
+                snapshot_store.as_mut(),
+                &model_stamp,
+                &kv_config,
+                &job,
+            )
         }));
         let event = match outcome {
             Ok(Ok(stats)) => WorkerEvent::Done(stats),
@@ -99,69 +164,57 @@ fn worker_loop(
     }
 }
 
-/// Runs one job to completion: a fresh sequence (`Model::reset`) prefilled
-/// with `job.prompt_ids`, then sampled decode until `max_new_tokens`, eos,
-/// or an OpenAI `stop` string appears in the accumulated decoded text.
+/// Runs one job to completion via `rocml::snapshot::turn::run_turn`: a
+/// snapshot restore on a prefix hit, resumed prefill of the remaining
+/// suffix, sampled decode until `max_new_tokens`, eos, or an OpenAI `stop`
+/// string, then an end-of-turn capture. Logs the hit/miss outcome so
+/// snapshot effectiveness is visible in the server's normal logs.
 fn run_job(
     model: &mut Model,
     tokenizer: &BpeTokenizer,
+    snapshot_store: Option<&mut SnapshotStore>,
+    model_stamp: &ModelStamp,
+    kv_config: &KvConfigStamp,
     job: &Job,
 ) -> Result<GenerateStats, rocml::RocmlError> {
-    model.reset()?;
-    let mut decoded_so_far = String::new();
-    generate_sampled_with_stop(
+    let outcome = run_turn(
         model,
         tokenizer,
+        snapshot_store,
+        model_stamp,
+        kv_config,
         &job.prompt_ids,
         job.max_new_tokens,
         true,
         &job.sampling,
+        &job.stop_strings,
         |chunk| {
             let _ = job.respond_to.send(WorkerEvent::Chunk(chunk.to_string()));
-            decoded_so_far.push_str(chunk);
-            stop_matched(&decoded_so_far, &job.stop_strings)
         },
-    )
-}
-
-/// An empty stop string never matches (it would trivially match any text
-/// and halt generation on the first chunk) — `contains` alone can't
-/// distinguish "not yet seen" from "seen the whole prompt so far", so an
-/// empty string must be filtered explicitly rather than relying on it.
-fn stop_matched(decoded_so_far: &str, stop_strings: &[String]) -> bool {
-    stop_strings
-        .iter()
-        .any(|s| !s.is_empty() && decoded_so_far.contains(s.as_str()))
+    )?;
+    if outcome.reused_prefix > 0 {
+        tracing::info!(
+            reused_tokens = outcome.reused_prefix,
+            prompt_tokens = job.prompt_ids.len(),
+            restore_ms = outcome.restore_seconds * 1000.0,
+            capture_ms = outcome.capture_seconds * 1000.0,
+            "snapshot hit"
+        );
+    } else {
+        tracing::info!(
+            prompt_tokens = job.prompt_ids.len(),
+            capture_ms = outcome.capture_seconds * 1000.0,
+            "snapshot miss"
+        );
+    }
+    Ok(outcome.stats)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn no_stop_strings_never_matches() {
-        assert!(!stop_matched("hello world", &[]));
-    }
-
-    #[test]
-    fn matches_substring_anywhere_in_accumulated_text() {
-        let stops = vec!["STOP".to_string()];
-        assert!(!stop_matched("hello wor", &stops));
-        assert!(stop_matched("hello world STOP here", &stops));
-    }
-
-    #[test]
-    fn empty_stop_string_is_ignored() {
-        let stops = vec![String::new(), "END".to_string()];
-        assert!(!stop_matched("anything at all", &stops));
-        assert!(stop_matched("reached the END now", &stops));
-    }
-
-    #[test]
-    fn matches_first_of_several_stop_strings() {
-        let stops = vec!["```".to_string(), "\n\n".to_string()];
-        assert!(stop_matched("some code```", &stops));
-        assert!(stop_matched("line one\n\nline two", &stops));
-        assert!(!stop_matched("no stop here", &stops));
-    }
+    // `run_turn`'s stop-string matching (empty-string-never-matches,
+    // substring-anywhere, first-of-several) is covered by
+    // `rocml::snapshot::turn`'s own tests now that the loop lives there —
+    // this module has no more logic of its own to unit test beyond what the
+    // real-GPU `server_e2e` integration test already exercises end to end.
 }

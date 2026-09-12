@@ -66,6 +66,19 @@ struct Args {
     /// Qwen3.5-2B defaults reasoning off; Ornith-1.0-9B defaults it on).
     #[arg(long)]
     no_think: bool,
+    /// Conversation-state snapshot RAM budget in MiB (issue #1,
+    /// qwen35-hybrid-only). `0` disables the snapshot layer's RAM tier
+    /// entirely (a snapshot is only ever kept in RAM, never spilled to disk,
+    /// unless `--snapshot-dir` is also set).
+    #[arg(long = "snapshot-ram-mb", default_value_t = 4096)]
+    snapshot_ram_mb: usize,
+    /// Optional NVMe persistence tier for snapshots — content-addressed
+    /// files under this directory, size-budgeted by `--snapshot-disk-mb`.
+    /// Off by default.
+    #[arg(long = "snapshot-dir")]
+    snapshot_dir: Option<std::path::PathBuf>,
+    #[arg(long = "snapshot-disk-mb", default_value_t = 20_000)]
+    snapshot_disk_mb: u64,
 }
 
 #[tokio::main]
@@ -114,6 +127,9 @@ async fn run(args: Args) -> Result<(), String> {
         no_think,
         default_sampling,
         model_id_override,
+        snapshot_ram_mb: args.snapshot_ram_mb,
+        snapshot_dir: args.snapshot_dir,
+        snapshot_disk_mb: args.snapshot_disk_mb,
     };
     // The worker-thread join handle is for callers that shut down cleanly
     // (see `rocml_serve::build`'s doc comment) — this server runs until
