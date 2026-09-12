@@ -26,7 +26,15 @@ use rocml_core::testpaths::checkpoint;
 const GGUF_REL: &str = "Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
 const PROMPT_LENGTHS: &[usize] = &[1, 4, 127, 128, 129, 500, 2048];
 const CONTINUATION_LEN: usize = 8;
-const LOGITS_REL_TOL: f32 = 1e-3;
+// Recalibrated for the WMMA prefill GEMM (perf/wmma-gemm): full 128-row
+// chunks now run the matrix-core kernel with f16 A/B operands (f32
+// accumulate), so chunked-vs-token-serial is a *precision-mode* comparison,
+// not just a reduction-order one. Measured max relative logit deviation
+// 0.16%-0.55% across these prompt lengths; the issue-15 agentic eval
+// (19/20, PPL 1.0800/1.0807, identical to the pre-WMMA engine) plus the
+// exact-greedy check below (with its near-tie escape) are the behavioral
+// gates. This bound only catches order-of-magnitude regressions.
+const LOGITS_REL_TOL: f32 = 1e-2;
 /// A greedy pick counts as a documented near-tie (not a bug) when the
 /// runner-up is within this fraction of the winner's margin over the
 /// *next* logit — mirrors `qwen35_greedy_parity.rs`'s own threshold for the

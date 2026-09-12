@@ -31,7 +31,15 @@ const CONTINUATION_LEN: usize = 8;
 /// is near-exact rather than bitwise (reduction-order sensitivity from
 /// re-chunking at a non-128-aligned split), and issue #1's own text for why
 /// this bound (not bitwise) is the honest one to assert.
-const LOGITS_REL_TOL: f32 = 1e-6;
+///
+/// Recalibrated from 1e-6 for the WMMA prefill GEMM: a restore+suffix
+/// prefill re-chunks at a different offset than the full prefill, so
+/// different rows go through the f16-operand WMMA kernel vs the f32 scalar
+/// fallback — a precision-mode difference (same mechanism and magnitude as
+/// `qwen35_chunked_prefill_parity`'s recalibration, measured <=0.55%), not
+/// snapshot corruption. Exact greedy continuation (near-tie escape below)
+/// remains the behavioral gate.
+const LOGITS_REL_TOL: f32 = 1e-2;
 /// Same near-tie escape hatch as `qwen35_chunked_prefill_parity.rs`: a
 /// greedy-continuation disagreement only passes if the loser's own top-1/
 /// top-2 gap was already this small (a real divergence has a much larger
