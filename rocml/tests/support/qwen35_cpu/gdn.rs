@@ -81,7 +81,7 @@ pub fn step(cfg: &Qwen35Config, w: &GdnLayerWeights, state: &mut GdnState, x: &m
     // Beta/decay gates.
     let beta: Vec<f32> = b_raw.iter().map(|&b| sigmoid(b)).collect();
     let g: Vec<f32> = (0..num_heads)
-        .map(|h| -w.ssm_a[h].exp() * softplus(a_raw[h] + w.ssm_dt_bias[h]))
+        .map(|h| w.ssm_a[h] * softplus(a_raw[h] + w.ssm_dt_bias[h]))
         .collect();
 
     // L2-norm Q/K per head; Q additionally carries the recurrence's

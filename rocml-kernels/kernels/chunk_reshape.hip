@@ -88,5 +88,5 @@ extern "C" __global__ void gdn_gate_chunk_f32(
     unsigned head = i % heads;
     beta_out[i] = 1.0f / (1.0f + expf(-b_raw[i]));
     float softplus = logf(1.0f + expf(a_raw[i] + dt_bias[head]));
-    g_out[i] = -expf(a_log[head]) * softplus;
+    g_out[i] = a_log[head] * softplus;
 }

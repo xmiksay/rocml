@@ -134,12 +134,18 @@ fn run_gate(n: u32) {
 
     let a_raw: Vec<f32> = (0..n).map(|i| ((i % 9) as f32) * 0.2 - 0.9).collect();
     let b_raw: Vec<f32> = (0..n).map(|i| ((i % 7) as f32) * 0.3 - 1.0).collect();
-    let a_log: Vec<f32> = (0..n).map(|i| ((i % 5) as f32) * 0.15 - 0.4).collect();
+    // `a_log` models the GGUF `ssm_a` tensor, which already stores
+    // `-exp(A_log)` (pre-baked by llama.cpp's converter) — always negative,
+    // typically small magnitudes.
+    let a_log: Vec<f32> = (0..n).map(|i| ((i % 5) as f32) * -0.02 - 0.005).collect();
     let dt_bias: Vec<f32> = (0..n).map(|i| ((i % 3) as f32) * 0.1).collect();
 
     let expected_beta: Vec<f32> = b_raw.iter().map(|&b| 1.0 / (1.0 + (-b).exp())).collect();
+    // g = ssm_a * softplus(a + dt_bias) — the multiplier is used directly,
+    // NOT re-exponentiated (the GGUF value is already `-exp(A_log)`; see
+    // gdn_gate.hip's doc comment for the double-exp bug this pins down).
     let expected_g: Vec<f32> = (0..n as usize)
-        .map(|i| -a_log[i].exp() * (1.0 + (a_raw[i] + dt_bias[i]).exp()).ln())
+        .map(|i| a_log[i] * (1.0 + (a_raw[i] + dt_bias[i]).exp()).ln())
         .collect();
 
     let mut buf_a = DeviceBuffer::<f32>::new(n as usize).expect("hipMalloc a_raw failed");
