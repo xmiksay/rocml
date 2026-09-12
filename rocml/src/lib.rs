@@ -11,6 +11,7 @@ pub mod config;
 pub mod error;
 pub mod forward;
 pub mod generate;
+pub mod kv_quant;
 mod load_opts;
 mod model;
 pub mod profile;
