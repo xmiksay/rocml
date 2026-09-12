@@ -80,6 +80,7 @@ pub fn run(args: &GenerateArgs) -> Result<(), RocmlError> {
             RenderOpts {
                 add_generation_prompt: true,
                 enable_thinking,
+                keep_history_reasoning: false,
             },
         )
         .map_err(|e| RocmlError::Config(e.to_string()))?

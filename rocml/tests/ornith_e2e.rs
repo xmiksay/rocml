@@ -130,6 +130,7 @@ fn ornith_9b_tooled_prompt_greedy_matches_external_references() {
         rocml::chat::RenderOpts {
             add_generation_prompt: true,
             enable_thinking: None,
+            keep_history_reasoning: false,
         },
     )
     .expect("render");

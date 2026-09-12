@@ -81,6 +81,14 @@ fn all_fixture_cases_render_byte_identical() {
         let opts = RenderOpts {
             add_generation_prompt: case["add_generation_prompt"].as_bool().unwrap_or(false),
             enable_thinking: case["enable_thinking"].as_bool(),
+            // This suite's whole point is pinning byte-for-byte parity with
+            // the *raw* template (see the module doc comment) — including
+            // `tool_call_then_response`, whose assistant turn embeds a
+            // `<think>` block in `content`. Issue #9's default (strip prior
+            // reasoning) is a deliberate, documented divergence from the
+            // raw template, so it has its own dedicated test below rather
+            // than being folded into this generic fidelity check.
+            keep_history_reasoning: true,
         };
         let expected = case["rendered"].as_str().expect("rendered");
 
@@ -91,4 +99,150 @@ fn all_fixture_cases_render_byte_identical() {
             "case {name}: rendered output diverged from fixture"
         );
     }
+}
+
+/// Issue #9: resolves the "does the official template strip prior-turn
+/// thinking" contradiction, and pins the fix.
+///
+/// The raw `chat_template.jinja` (lines 90-100) does **not** strip a
+/// history assistant turn's reasoning on its own — whatever the caller
+/// supplies for a past turn (an explicit `reasoning_content` field, or a
+/// `<think>...</think>` block already embedded in `content`) is rendered
+/// verbatim, for every assistant turn in `messages`, not just the newest
+/// one. Confirmed directly against the template file this repo's fixtures
+/// were generated from, with:
+///
+/// ```text
+/// python3 - <<'PY'
+/// import jinja2
+/// env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
+/// env.globals['raise_exception'] = lambda m: (_ for _ in ()).throw(ValueError(m))
+/// tpl = env.from_string(open(
+///     "/mnt/nvme/miksa/checkpoints/Ornith-1.0-9B/chat_template.jinja"
+/// ).read())
+/// print(tpl.render(
+///     messages=[
+///         {"role": "system", "content": "You are a helpful assistant."},
+///         {"role": "user", "content": "What is 2+2?"},
+///         {
+///             "role": "assistant",
+///             "content": "The answer is 4.",
+///             "reasoning_content": "Let me think: 2+2=4.",
+///         },
+///         {"role": "user", "content": "And what is 3+3?"},
+///     ],
+///     tools=None,
+///     add_generation_prompt=True,
+///     add_vision_id=False,
+/// ))
+/// PY
+/// ```
+///
+/// which prints exactly `OFFICIAL_TEMPLATE_RENDERED` below — the prior
+/// turn's `<think>` block survives. But the Qwen3-family training recipe
+/// Ornith descends from removes prior-turn thinking from history at
+/// training time; feeding it back verbatim is out of distribution and is
+/// what caused issue #9's stuck-agent loop (the model kept re-reasoning
+/// about an already-resolved point). So `render`'s default
+/// (`RenderOpts::keep_history_reasoning: false`) diverges from the raw
+/// template and strips it; `keep_history_reasoning: true` opts back into
+/// the template-faithful behavior asserted below.
+#[test]
+fn history_reasoning_is_stripped_by_default_but_available_via_opt_in() {
+    let messages = vec![
+        Message::system("You are a helpful assistant."),
+        Message::user("What is 2+2?"),
+        Message::assistant("The answer is 4.").with_reasoning("Let me think: 2+2=4."),
+        Message::user("And what is 3+3?"),
+    ];
+
+    const OFFICIAL_TEMPLATE_RENDERED: &str = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\nLet me think: 2+2=4.\n</think>\n\nThe answer is 4.<|im_end|>\n<|im_start|>user\nAnd what is 3+3?<|im_end|>\n<|im_start|>assistant\n<think>\n";
+
+    let faithful = render(
+        &messages,
+        &[],
+        RenderOpts {
+            add_generation_prompt: true,
+            enable_thinking: None,
+            keep_history_reasoning: true,
+        },
+    )
+    .expect("render (faithful)");
+    assert_eq!(
+        faithful, OFFICIAL_TEMPLATE_RENDERED,
+        "keep_history_reasoning: true must match the raw jinja template byte-for-byte"
+    );
+
+    let stripped = render(
+        &messages,
+        &[],
+        RenderOpts {
+            add_generation_prompt: true,
+            enable_thinking: None,
+            keep_history_reasoning: false,
+        },
+    )
+    .expect("render (default)");
+    assert_eq!(
+        stripped,
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nThe answer is 4.<|im_end|>\n<|im_start|>user\nAnd what is 3+3?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "the default must strip the prior turn's reasoning, matching the training convention"
+    );
+}
+
+/// Issue #9's tool-result hygiene: an empty-body tool result is not a
+/// malformed input to special-case, just a result whose body happens to be
+/// empty — it renders exactly like any other body would (transport is
+/// faithful; a harness that never gives the model any evidence a call
+/// succeeded is a harness bug, see the README's server section).
+#[test]
+fn empty_tool_result_body_renders_as_is() {
+    let messages = vec![
+        Message::user("run the command"),
+        Message::assistant("").with_tool_calls(vec![ToolCall::new(
+            "run_command",
+            serde_json::json!({"cmd": "true"}),
+        )]),
+        Message::tool_response(""),
+    ];
+    let out = render(&messages, &[], RenderOpts::default()).unwrap();
+    assert!(
+        out.ends_with("<|im_start|>user\n<tool_response>\n\n</tool_response><|im_end|>\n"),
+        "empty tool body should render as an empty-but-present <tool_response>: {out:?}"
+    );
+}
+
+/// Multiple tool results answering multiple tool calls from the same
+/// assistant turn share a single `<|im_start|>user ... <|im_end|>` wrapper
+/// (template lines 127-138) rather than opening/closing one per result —
+/// verified here in isolation; `tool_call_then_response` in
+/// `rocml/tests/data/ornith_chat_fixtures.json` covers the same shape
+/// byte-for-byte against the real template.
+#[test]
+fn consecutive_tool_results_share_one_wrapper_in_order() {
+    let messages = vec![
+        Message::user("weather and files, please"),
+        Message::assistant("").with_tool_calls(vec![
+            ToolCall::new("get_weather", serde_json::json!({"location": "Prague"})),
+            ToolCall::new("list_files", serde_json::json!({"dir": "/tmp"})),
+        ]),
+        Message::tool_response("18C, cloudy"),
+        Message::tool_response("a.txt, b.txt"),
+    ];
+    let out = render(&messages, &[], RenderOpts::default()).unwrap();
+    let tail = &out[out.find("<tool_response>").unwrap()..];
+    assert_eq!(
+        tail,
+        "<tool_response>\n18C, cloudy\n</tool_response>\n<tool_response>\na.txt, b.txt\n</tool_response><|im_end|>\n"
+    );
+    // Exactly one wrapper open for both results, in call order — not one
+    // per result, and not reordered by tool_call_id (this renderer
+    // addresses tool results by transcript position only, matching the
+    // template and documented on `ChatMessageIn::tool_call_id`). The plain
+    // first user turn also contains the literal `<|im_start|>user`
+    // substring, so this checks the wrapper-open-into-`<tool_response>`
+    // sequence specifically rather than counting `<|im_start|>user`
+    // occurrences directly.
+    assert_eq!(out.matches("<|im_start|>user\n<tool_response>").count(), 1);
+    assert_eq!(out.matches("<tool_response>").count(), 2);
 }

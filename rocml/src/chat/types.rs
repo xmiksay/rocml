@@ -117,4 +117,21 @@ pub struct RenderOpts {
     /// `Some(false)` pre-closes the think block (reasoning OFF); `Some(true)`
     /// is equivalent to `None` for this template.
     pub enable_thinking: Option<bool>,
+    /// Issue #9: the raw `chat_template.jinja` does *not* strip a history
+    /// assistant turn's `reasoning_content` on its own — whatever the
+    /// caller passes for a past turn (an explicit `reasoning_content`
+    /// field, or a `<think>...</think>` block embedded in `content`) is
+    /// rendered verbatim, every turn, not just the newest one (verified
+    /// directly against the template — see
+    /// `rocml/tests/chat_fixtures.rs`'s
+    /// `history_reasoning_is_stripped_by_default_but_available_via_opt_in`).
+    /// But the Qwen3-family training recipe Ornith descends from removes
+    /// prior-turn thinking from history at training time — feeding a past
+    /// `<think>` block back as context is out of distribution and was
+    /// observed to make the model loop, re-reasoning about an already
+    /// resolved point forever. So `false` (the default, matching the
+    /// training convention) strips every history assistant turn's
+    /// reasoning; `true` opts back into raw-template-faithful behavior for
+    /// a caller that specifically needs byte-for-byte template parity.
+    pub keep_history_reasoning: bool,
 }

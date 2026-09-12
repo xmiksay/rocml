@@ -48,7 +48,7 @@ pub fn render(messages: &[Message], tools: &[Tool], opts: RenderOpts) -> Result<
             // check its position, which `validate_system_position` did.
             Role::System => {}
             Role::User => render_user_turn(&mut out, message),
-            Role::Assistant => render_assistant_turn(&mut out, message),
+            Role::Assistant => render_assistant_turn(&mut out, message, opts),
             Role::Tool => render_tool_turn(&mut out, messages, index),
         }
     }
@@ -107,8 +107,19 @@ fn render_user_turn(out: &mut String, message: &Message) {
     out.push_str("<|im_end|>\n");
 }
 
-fn render_assistant_turn(out: &mut String, message: &Message) {
+fn render_assistant_turn(out: &mut String, message: &Message, opts: RenderOpts) {
     let (reasoning, content) = split_reasoning(message);
+    // Issue #9: every message in `messages` is, by construction, a
+    // *completed* prior turn — the turn currently being generated is never
+    // part of this slice, it's produced after `render` returns. So
+    // "history" here means "every assistant turn", and the training
+    // convention (see `RenderOpts::keep_history_reasoning`'s doc comment)
+    // says none of them should carry their old thinking back in.
+    let reasoning = if opts.keep_history_reasoning {
+        reasoning
+    } else {
+        String::new()
+    };
     out.push_str("<|im_start|>assistant\n<think>\n");
     out.push_str(reasoning.trim());
     out.push_str("\n</think>\n\n");
@@ -344,6 +355,7 @@ mod tests {
             RenderOpts {
                 add_generation_prompt: true,
                 enable_thinking: None,
+                keep_history_reasoning: false,
             },
         )
         .unwrap();
@@ -352,4 +364,9 @@ mod tests {
             "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
         );
     }
+
+    // Issue #9's tool-result-hygiene tests (empty body, multiple consecutive
+    // results) live in `rocml/tests/chat_fixtures.rs` instead of here — this
+    // module is already at the 400-line cap, and both tests only exercise
+    // the public `render` API, no private internals.
 }

@@ -25,6 +25,11 @@ use crate::common::Loaded;
 const RENDER_OPTS: RenderOpts = RenderOpts {
     add_generation_prompt: true,
     enable_thinking: None,
+    // Issue #9: a `multi_turn` scenario's turn-1 assistant message (below,
+    // built with `.with_reasoning`) is re-rendered as history for turn 2 —
+    // its thinking must not leak back in, matching how the model was
+    // trained and how `rocml-serve` renders every request.
+    keep_history_reasoning: false,
 };
 
 pub fn run_scenario(

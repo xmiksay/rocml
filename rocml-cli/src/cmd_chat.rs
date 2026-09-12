@@ -75,6 +75,10 @@ pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
         } else {
             spec.map(|s| s.thinking_default)
         },
+        // Issue #9: every prior turn's stored `.with_reasoning(thinking)`
+        // (below) is dropped when it's re-rendered as history — only the
+        // turn currently being generated ever sees its own thinking.
+        keep_history_reasoning: false,
     };
     let sampling = args.sampling.to_sampling_params(spec.map(|s| &s.sampling));
     let mut messages: Vec<Message> = Vec::new();
