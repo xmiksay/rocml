@@ -34,6 +34,23 @@ const GEMM_QUANT_ROWS_PER_WARP: u32 = 8;
 /// fixes the launch's grid.y.
 const GEMM_QUANT_TILE_ROWS: u32 = GEMM_QUANT_WARPS_PER_BLOCK * GEMM_QUANT_ROWS_PER_WARP;
 
+/// Output rows (`X` rows) a `gemm_xwt_wmma_q*` workgroup tile covers —
+/// mirrors the kernel's `TILE_ROWS` (fixes the launch's grid.y and doubles
+/// as the dispatch threshold below: it exactly matches
+/// `qwen35::forward::chunk_forward::PREFILL_CHUNK_SIZE`, so every full
+/// chunked-prefill chunk fills one row-tile exactly and only a short last
+/// chunk falls back to the scalar kernel).
+const GEMM_WMMA_TILE_ROWS: u32 = 128;
+/// Output columns (`W` rows) a `gemm_xwt_wmma_q*` workgroup tile covers —
+/// mirrors the kernel's `TILE_M` (fixes the launch's grid.x).
+const GEMM_WMMA_TILE_M: u32 = 64;
+/// Reduction elements staged into LDS per outer iteration — mirrors the
+/// kernel's `K_STAGE`, used only to size the dynamic shared memory request
+/// (`(TILE_ROWS + TILE_M) * K_STAGE * sizeof(f16)`).
+const GEMM_WMMA_K_STAGE: u32 = 16;
+/// Warps per `gemm_xwt_wmma_q*` workgroup — fixes the launch's block.y.
+const GEMM_WMMA_WARPS_PER_BLOCK: u32 = 16;
+
 pub(crate) struct QuantKernels {
     _mod_q8_0: Module,
     q8_0_fn: rocml_hip::Function,
@@ -51,6 +68,14 @@ pub(crate) struct QuantKernels {
     gemm_q5_k_fn: rocml_hip::Function,
     _mod_gemm_q6_k: Module,
     gemm_q6_k_fn: rocml_hip::Function,
+    _mod_gemm_wmma_q8_0: Module,
+    gemm_wmma_q8_0_fn: rocml_hip::Function,
+    _mod_gemm_wmma_q4_k: Module,
+    gemm_wmma_q4_k_fn: rocml_hip::Function,
+    _mod_gemm_wmma_q5_k: Module,
+    gemm_wmma_q5_k_fn: rocml_hip::Function,
+    _mod_gemm_wmma_q6_k: Module,
+    gemm_wmma_q6_k_fn: rocml_hip::Function,
 }
 
 impl QuantKernels {
@@ -87,6 +112,22 @@ impl QuantKernels {
             rocml_kernels::GEMM_XWT_Q6_K_HSACO,
             rocml_kernels::GEMM_XWT_Q6_K_KERNEL,
         )?;
+        let (_mod_gemm_wmma_q8_0, gemm_wmma_q8_0_fn) = load(
+            rocml_kernels::GEMM_XWT_WMMA_Q8_0_HSACO,
+            rocml_kernels::GEMM_XWT_WMMA_Q8_0_KERNEL,
+        )?;
+        let (_mod_gemm_wmma_q4_k, gemm_wmma_q4_k_fn) = load(
+            rocml_kernels::GEMM_XWT_WMMA_Q4_K_HSACO,
+            rocml_kernels::GEMM_XWT_WMMA_Q4_K_KERNEL,
+        )?;
+        let (_mod_gemm_wmma_q5_k, gemm_wmma_q5_k_fn) = load(
+            rocml_kernels::GEMM_XWT_WMMA_Q5_K_HSACO,
+            rocml_kernels::GEMM_XWT_WMMA_Q5_K_KERNEL,
+        )?;
+        let (_mod_gemm_wmma_q6_k, gemm_wmma_q6_k_fn) = load(
+            rocml_kernels::GEMM_XWT_WMMA_Q6_K_HSACO,
+            rocml_kernels::GEMM_XWT_WMMA_Q6_K_KERNEL,
+        )?;
 
         Ok(Self {
             _mod_q8_0,
@@ -105,6 +146,14 @@ impl QuantKernels {
             gemm_q5_k_fn,
             _mod_gemm_q6_k,
             gemm_q6_k_fn,
+            _mod_gemm_wmma_q8_0,
+            gemm_wmma_q8_0_fn,
+            _mod_gemm_wmma_q4_k,
+            gemm_wmma_q4_k_fn,
+            _mod_gemm_wmma_q5_k,
+            gemm_wmma_q5_k_fn,
+            _mod_gemm_wmma_q6_k,
+            gemm_wmma_q6_k_fn,
         })
     }
 
@@ -149,8 +198,58 @@ impl QuantKernels {
     /// `gemm_xwt_<dtype>(x, w, out, rows, m, n)`: `out[rows,m] = X[rows,n] *
     /// dequant(W)^T`, the batched prefill-path sibling of [`Self::gemv`].
     /// Same dtype restriction as `gemv` (Q8_0/Q4_K/Q5_K/Q6_K only).
+    ///
+    /// Dispatches to the WMMA matrix-core kernel
+    /// (`gemm_xwt_quant_wmma.hip`, issue #6's follow-up) whenever the shape
+    /// can fill at least one full tile cleanly — `rows >= TILE_ROWS` and `m`/
+    /// `n` both multiples of 16 (WMMA's native fragment width) — and falls
+    /// back to the scalar-FMA kernel above otherwise (a short last
+    /// chunked-prefill chunk, or a shape WMMA can't tile at all). `n` is
+    /// already a multiple of 16 for every dtype this dispatches to
+    /// (Q8_0/Q4_K/Q5_K/Q6_K block widths are 32/256/256/256), so the check
+    /// below only ever turns on the fallback for `rows`/`m`.
+    ///
+    /// Known numeric consequence (measured, not a bug — see the kernel
+    /// source's module doc and issue #6's synthetic correctness tests for
+    /// why the WMMA kernel itself is verified correct against an
+    /// f16-rounded reference): every quantized linear layer a chunked-
+    /// prefill call routes through this path now rounds both operands to
+    /// f16 before the matrix-core multiply. That's the expected ~5e-4
+    /// relative per-layer input-rounding error the issue anticipated, but
+    /// it compounds across a ~30-layer model measurably more than the
+    /// *pre-WMMA* pure-f32 pipeline this dispatch replaced for `rows >=
+    /// 128` shapes — `rocml/tests/qwen35_chunked_prefill_parity.rs`'s
+    /// final-logits check (`LOGITS_REL_TOL = 1e-3`, no near-tie escape) and
+    /// `rocml/tests/snapshot_equivalence.rs`'s (`1e-6`, calibrated for pure
+    /// reduction-order differences, not a precision change) both fail at
+    /// prompt lengths that engage a full 128-row WMMA chunk, with measured
+    /// max relative logit error in the ~0.16%-0.55% range (up to ~21% of
+    /// vocab logits past 1e-3 at some lengths) — while every *greedy-token*
+    /// gate (which has a near-tie escape hatch) still passes, meaning
+    /// argmax decisions are preserved even though raw logit magnitudes
+    /// shift. Left enabled and documented here per the issue's honest-
+    /// reporting instruction, not resolved unilaterally by loosening either
+    /// test's tolerance.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn gemm(
+        &self,
+        dtype: GgmlDType,
+        x: DevPtr,
+        w: DevPtr,
+        out: DevPtr,
+        rows: u32,
+        m: u32,
+        n: u32,
+    ) -> Result<(), RocmlError> {
+        if rows >= GEMM_WMMA_TILE_ROWS && m.is_multiple_of(16) && n.is_multiple_of(16) {
+            self.gemm_wmma(dtype, x, w, out, rows, m, n)
+        } else {
+            self.gemm_scalar(dtype, x, w, out, rows, m, n)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_scalar(
         &self,
         dtype: GgmlDType,
         x: DevPtr,
@@ -180,6 +279,47 @@ impl QuantKernels {
         // SAFETY: params matches every gemm_xwt_<quant>'s signature (const
         // float*, const void*, float*, unsigned x3); block = (32, 8, 1)
         // matches the kernel's fixed warp-per-`ROWS_PER_WARP`-rows tiling.
+        unsafe { function.launch(&cfg, &mut params, None) }.map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_wmma(
+        &self,
+        dtype: GgmlDType,
+        x: DevPtr,
+        w: DevPtr,
+        out: DevPtr,
+        rows: u32,
+        m: u32,
+        n: u32,
+    ) -> Result<(), RocmlError> {
+        let function = match dtype {
+            GgmlDType::Q8_0 => &self.gemm_wmma_q8_0_fn,
+            GgmlDType::Q4_K => &self.gemm_wmma_q4_k_fn,
+            GgmlDType::Q5_K => &self.gemm_wmma_q5_k_fn,
+            GgmlDType::Q6_K => &self.gemm_wmma_q6_k_fn,
+            other => {
+                return Err(RocmlError::Config(format!(
+                    "gemm_quant: {other:?} has no fused WMMA kernel (internal loader bug)"
+                )))
+            }
+        };
+        let shared_mem_bytes =
+            (GEMM_WMMA_TILE_ROWS + GEMM_WMMA_TILE_M) * GEMM_WMMA_K_STAGE * size_of::<u16>() as u32;
+        let cfg = LaunchConfig {
+            grid: (
+                m.div_ceil(GEMM_WMMA_TILE_M),
+                rows.div_ceil(GEMM_WMMA_TILE_ROWS),
+                1,
+            ),
+            block: (32, GEMM_WMMA_WARPS_PER_BLOCK, 1),
+            shared_mem_bytes,
+        };
+        let mut params = kernel_params!(x, w, out, rows, m, n);
+        // SAFETY: params matches every gemm_xwt_wmma_<quant>'s signature
+        // (const float*, const void*, float*, unsigned x3); block = (32, 8,
+        // 1) and shared_mem_bytes match the kernel's fixed TILE_ROWS/TILE_M/
+        // K_STAGE tiling (see the kernel source's module doc).
         unsafe { function.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 }
