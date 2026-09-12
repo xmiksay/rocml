@@ -87,15 +87,14 @@ pub const GDN_RECURRENCE_DECODE_F32_HSACO: &[u8] =
 pub const GDN_RECURRENCE_DECODE_F32_KERNEL: &str = "gdn_recurrence_decode_f32";
 
 /// `kernels/gdn_chunk.hip`: Gated Delta Net batched causal conv1d
-/// (`causal_conv1d_chunk_f32`) and gated-delta-rule recurrence
-/// (`gdn_recurrence_chunk_f32`) over a whole prefill chunk in one launch
-/// each, reproducing their `_decode_f32` siblings' per-step math exactly.
-/// Both share one code object.
+/// (`causal_conv1d_chunk_f32`) over a whole prefill chunk in one launch,
+/// reproducing `causal_conv1d_decode_f32`'s per-step math exactly. The
+/// recurrence's chunk kernel used to share this file (`gdn_recurrence_chunk_f32`)
+/// — see `kernels/gdn_chunkwise.hip`, which replaced it with the chunkwise
+/// (blocked delta-rule) formulation.
 pub const GDN_CONV1D_CHUNK_F32_HSACO: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gdn_chunk.hsaco"));
 pub const GDN_CONV1D_CHUNK_F32_KERNEL: &str = "causal_conv1d_chunk_f32";
-pub const GDN_RECURRENCE_CHUNK_F32_HSACO: &[u8] = GDN_CONV1D_CHUNK_F32_HSACO;
-pub const GDN_RECURRENCE_CHUNK_F32_KERNEL: &str = "gdn_recurrence_chunk_f32";
 
 /// `kernels/gemv_t.hip`: decode-attention building block `y = A^T * x`, A is
 /// row-major rows x n (e.g. a cached-V plane, one row per time step). One
@@ -244,3 +243,24 @@ pub const ATTN_DECODE_PARTIAL_MIXED_Q8_HSACO: &[u8] =
 pub const ATTN_DECODE_PARTIAL_MIXED_Q8_KERNEL: &str = "attn_decode_partial_mixed_q8";
 pub const ATTN_DECODE_PARTIAL_MIXED_Q4_HSACO: &[u8] = ATTN_DECODE_PARTIAL_MIXED_Q8_HSACO;
 pub const ATTN_DECODE_PARTIAL_MIXED_Q4_KERNEL: &str = "attn_decode_partial_mixed_q4";
+
+/// `kernels/gdn_chunkwise.hip`: the chunkwise (blocked delta-rule)
+/// gated-delta-rule recurrence — replaces `gdn_recurrence_chunk_f32`'s
+/// token-serial-inside-chunk loop with O(chunk^2) parallel matmul-shaped
+/// kernels plus one short (`tile_len`-long) triangular-inverse dependency
+/// chain. See the kernel source's module doc for the seven-stage pipeline
+/// and the exact per-kernel launch contract (grid/block/shared-mem shapes).
+/// All seven share one code object.
+pub const GDN_CW_PREP_F32_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gdn_chunkwise.hsaco"));
+pub const GDN_CW_PREP_F32_KERNEL: &str = "gdn_chunkwise_prep_f32";
+pub const GDN_CW_UT_BUILD_F32_HSACO: &[u8] = GDN_CW_PREP_F32_HSACO;
+pub const GDN_CW_UT_BUILD_F32_KERNEL: &str = "gdn_chunkwise_ut_build_f32";
+pub const GDN_CW_TINV_F32_HSACO: &[u8] = GDN_CW_PREP_F32_HSACO;
+pub const GDN_CW_TINV_F32_KERNEL: &str = "gdn_chunkwise_tinv_f32";
+pub const GDN_CW_UV_VNEW_F32_HSACO: &[u8] = GDN_CW_PREP_F32_HSACO;
+pub const GDN_CW_UV_VNEW_F32_KERNEL: &str = "gdn_chunkwise_uv_vnew_f32";
+pub const GDN_CW_OUTPUT_F32_HSACO: &[u8] = GDN_CW_PREP_F32_HSACO;
+pub const GDN_CW_OUTPUT_F32_KERNEL: &str = "gdn_chunkwise_output_f32";
+pub const GDN_CW_STATE_F32_HSACO: &[u8] = GDN_CW_PREP_F32_HSACO;
+pub const GDN_CW_STATE_F32_KERNEL: &str = "gdn_chunkwise_state_f32";
