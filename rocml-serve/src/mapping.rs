@@ -166,6 +166,77 @@ mod tests {
         assert_eq!(mapped[0].content, "71F and sunny");
     }
 
+    /// Issue #9's tool-result hygiene: the body is transported verbatim,
+    /// byte for byte — no trimming, no re-encoding, no truncation. A caller
+    /// that sends odd whitespace or embedded JSON gets exactly that back
+    /// out of `map_messages`, and from there `render_tool_turn` (see
+    /// `rocml::chat::render`'s tests) only ever `.trim()`s it the same way
+    /// every other turn's content is trimmed.
+    #[test]
+    fn maps_tool_result_body_verbatim_including_embedded_json_and_whitespace() {
+        let input = vec![ChatMessageIn {
+            role: "tool".to_string(),
+            content: Some("  {\"temp_c\": 18, \"note\": \"line1\\nline2\"}  ".to_string()),
+            tool_calls: vec![],
+            tool_call_id: Some("call_1".to_string()),
+            reasoning_content: None,
+        }];
+        let mapped = map_messages(&input).unwrap();
+        assert_eq!(
+            mapped[0].content,
+            "  {\"temp_c\": 18, \"note\": \"line1\\nline2\"}  "
+        );
+    }
+
+    /// Issue #9: an empty (or entirely absent) tool result body is not
+    /// rejected or substituted — it maps straight through to an empty
+    /// `content` string, which `render` then renders as-is (see
+    /// `rocml::chat::render::tests::empty_tool_result_body_renders_as_is`).
+    /// Whether that then makes the model retry the call is a harness
+    /// problem (always return a non-empty result body — see the README's
+    /// server section), not something this transport layer should paper
+    /// over with a synthetic placeholder.
+    #[test]
+    fn maps_absent_tool_result_content_to_empty_string_without_erroring() {
+        let input = vec![ChatMessageIn {
+            role: "tool".to_string(),
+            content: None,
+            tool_calls: vec![],
+            tool_call_id: Some("call_1".to_string()),
+            reasoning_content: None,
+        }];
+        let mapped = map_messages(&input).unwrap();
+        assert_eq!(mapped[0].role, Role::Tool);
+        assert_eq!(mapped[0].content, "");
+    }
+
+    /// `tool_call_id` pairing is positional, not id-keyed: multiple tool
+    /// results in a row map through in transcript order regardless of
+    /// their ids, matching `render_tool_turn`'s own position-based pairing
+    /// (see `ChatMessageIn::tool_call_id`'s doc comment).
+    #[test]
+    fn maps_multiple_tool_results_in_transcript_order_regardless_of_id() {
+        let input = vec![
+            ChatMessageIn {
+                role: "tool".to_string(),
+                content: Some("first".to_string()),
+                tool_calls: vec![],
+                tool_call_id: Some("call_2".to_string()), // deliberately "out of order"
+                reasoning_content: None,
+            },
+            ChatMessageIn {
+                role: "tool".to_string(),
+                content: Some("second".to_string()),
+                tool_calls: vec![],
+                tool_call_id: Some("call_1".to_string()),
+                reasoning_content: None,
+            },
+        ];
+        let mapped = map_messages(&input).unwrap();
+        assert_eq!(mapped[0].content, "first");
+        assert_eq!(mapped[1].content, "second");
+    }
+
     #[test]
     fn round_trips_assistant_tool_calls() {
         let input = vec![ChatMessageIn {
