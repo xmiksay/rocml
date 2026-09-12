@@ -1,0 +1,492 @@
+[
+  {
+    "kind": "tool_choice",
+    "id": "weather_prague",
+    "system": "You are a helpful assistant with access to tools. Use a tool whenever the user's request requires current or external information.",
+    "user": "What's the weather like in Prague right now?",
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a location.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {"type": "string", "description": "City name"},
+            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+          },
+          "required": ["location"]
+        }
+      },
+      {
+        "name": "get_time",
+        "description": "Get the current time in a timezone.",
+        "parameters": {
+          "type": "object",
+          "properties": {"timezone": {"type": "string"}},
+          "required": ["timezone"]
+        }
+      }
+    ],
+    "expected": {"name": "get_weather", "arguments": {"location": "Prague"}}
+  },
+  {
+    "kind": "tool_choice",
+    "id": "send_email_basic",
+    "system": "You are a helpful assistant with access to tools. Use a tool whenever the user's request requires current or external information.",
+    "user": "Please send an email to boss@example.com with subject 'Status Update' and body 'The deployment finished successfully.'",
+    "tools": [
+      {
+        "name": "send_email",
+        "description": "Send an email.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "to": {"type": "string"},
+            "subject": {"type": "string"},
+            "body": {"type": "string"}
+          },
+          "required": ["to", "subject", "body"]
+        }
+      },
+      {
+        "name": "search_web",
+        "description": "Search the web for information.",
+        "parameters": {
+          "type": "object",
+          "properties": {"query": {"type": "string"}},
+          "required": ["query"]
+        }
+      }
+    ],
+    "expected": {
+      "name": "send_email",
+      "arguments": {
+        "to": "boss@example.com",
+        "subject": "Status Update",
+        "body": "The deployment finished successfully."
+      }
+    }
+  },
+  {
+    "kind": "tool_choice",
+    "id": "currency_convert",
+    "system": "You are a helpful assistant with access to tools. Use a tool whenever the user's request requires current or external information.",
+    "user": "How much is 250 US dollars in Japanese yen?",
+    "tools": [
+      {
+        "name": "convert_currency",
+        "description": "Convert an amount from one currency to another.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "amount": {"type": "number"},
+            "from": {"type": "string", "description": "3-letter currency code"},
+            "to": {"type": "string", "description": "3-letter currency code"}
+          },
+          "required": ["amount", "from", "to"]
+        }
+      },
+      {
+        "name": "get_stock_price",
+        "description": "Get the current stock price for a ticker.",
+        "parameters": {
+          "type": "object",
+          "properties": {"ticker": {"type": "string"}},
+          "required": ["ticker"]
+        }
+      }
+    ],
+    "expected": {"name": "convert_currency", "arguments": {"amount": 250, "from": "USD", "to": "JPY"}}
+  },
+  {
+    "kind": "tool_choice",
+    "id": "calendar_event",
+    "system": "You are a helpful assistant with access to tools. Use a tool whenever the user's request requires current or external information.",
+    "user": "Schedule a meeting called 'Q3 Planning' on 2026-09-20 at 14:00.",
+    "tools": [
+      {
+        "name": "create_calendar_event",
+        "description": "Create a calendar event.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "title": {"type": "string"},
+            "date": {"type": "string", "description": "YYYY-MM-DD"},
+            "time": {"type": "string", "description": "HH:MM 24-hour"}
+          },
+          "required": ["title", "date", "time"]
+        }
+      },
+      {
+        "name": "set_reminder",
+        "description": "Set a reminder.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {"type": "string"},
+            "minutes_before": {"type": "number"}
+          },
+          "required": ["text", "minutes_before"]
+        }
+      }
+    ],
+    "expected": {
+      "name": "create_calendar_event",
+      "arguments": {"title": "Q3 Planning", "date": "2026-09-20", "time": "14:00"}
+    }
+  },
+  {
+    "kind": "tool_choice",
+    "id": "stock_price",
+    "system": "You are a helpful assistant with access to tools. Use a tool whenever the user's request requires current or external information.",
+    "user": "What is the current stock price of NVIDIA (ticker NVDA)?",
+    "tools": [
+      {
+        "name": "get_stock_price",
+        "description": "Get the current stock price for a ticker.",
+        "parameters": {
+          "type": "object",
+          "properties": {"ticker": {"type": "string"}},
+          "required": ["ticker"]
+        }
+      },
+      {
+        "name": "convert_currency",
+        "description": "Convert an amount from one currency to another.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "amount": {"type": "number"},
+            "from": {"type": "string"},
+            "to": {"type": "string"}
+          },
+          "required": ["amount", "from", "to"]
+        }
+      }
+    ],
+    "expected": {"name": "get_stock_price", "arguments": {"ticker": "NVDA"}}
+  },
+  {
+    "kind": "tool_choice",
+    "id": "translate_text",
+    "system": "You are a helpful assistant with access to tools. Use a tool whenever the user's request requires current or external information.",
+    "user": "Translate 'good morning' into French.",
+    "tools": [
+      {
+        "name": "translate_text",
+        "description": "Translate text into a target language.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {"type": "string"},
+            "target_language": {"type": "string"}
+          },
+          "required": ["text", "target_language"]
+        }
+      },
+      {
+        "name": "lookup_definition",
+        "description": "Look up a word's definition.",
+        "parameters": {
+          "type": "object",
+          "properties": {"word": {"type": "string"}},
+          "required": ["word"]
+        }
+      }
+    ],
+    "expected": {"name": "translate_text", "arguments": {"text": "good morning", "target_language": "French"}}
+  },
+  {
+    "kind": "tool_choice",
+    "id": "set_reminder_quoted",
+    "system": "You are a helpful assistant with access to tools. Use a tool whenever the user's request requires current or external information.",
+    "user": "Remind me in 15 minutes to 'call the dentist'.",
+    "tools": [
+      {
+        "name": "set_reminder",
+        "description": "Set a reminder.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {"type": "string"},
+            "minutes_before": {"type": "number"}
+          },
+          "required": ["text", "minutes_before"]
+        }
+      },
+      {
+        "name": "send_sms",
+        "description": "Send an SMS text message.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "to": {"type": "string"},
+            "message": {"type": "string"}
+          },
+          "required": ["to", "message"]
+        }
+      }
+    ],
+    "expected": {"name": "set_reminder", "arguments": {"text": "call the dentist", "minutes_before": 15}}
+  },
+  {
+    "kind": "tool_choice",
+    "id": "control_light",
+    "system": "You are a helpful assistant with access to tools. Use a tool whenever the user's request requires current or external information.",
+    "user": "Turn on the kitchen lights and set them to 80% brightness.",
+    "tools": [
+      {
+        "name": "control_smart_light",
+        "description": "Control a smart light.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "room": {"type": "string"},
+            "state": {"type": "string", "enum": ["on", "off"]},
+            "brightness": {"type": "number", "description": "0-100"}
+          },
+          "required": ["room", "state"]
+        }
+      },
+      {
+        "name": "play_music",
+        "description": "Play music on a smart speaker.",
+        "parameters": {
+          "type": "object",
+          "properties": {"playlist": {"type": "string"}},
+          "required": ["playlist"]
+        }
+      }
+    ],
+    "expected": {"name": "control_smart_light", "arguments": {"room": "kitchen", "state": "on", "brightness": 80}}
+  },
+  {
+    "kind": "no_tool",
+    "id": "capital_of_france",
+    "system": "You are a helpful assistant with access to tools. Only use a tool when the request genuinely requires current or external information.",
+    "user": "What is the capital of France? Answer in one word.",
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a location.",
+        "parameters": {
+          "type": "object",
+          "properties": {"location": {"type": "string"}},
+          "required": ["location"]
+        }
+      },
+      {
+        "name": "set_reminder",
+        "description": "Set a reminder.",
+        "parameters": {
+          "type": "object",
+          "properties": {"text": {"type": "string"}, "minutes_before": {"type": "number"}},
+          "required": ["text", "minutes_before"]
+        }
+      }
+    ]
+  },
+  {
+    "kind": "no_tool",
+    "id": "http_meaning",
+    "system": "You are a helpful assistant with access to tools. Only use a tool when the request genuinely requires current or external information.",
+    "user": "In one short sentence, what does the acronym HTTP stand for?",
+    "tools": [
+      {
+        "name": "send_email",
+        "description": "Send an email.",
+        "parameters": {
+          "type": "object",
+          "properties": {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}},
+          "required": ["to", "subject", "body"]
+        }
+      },
+      {
+        "name": "search_web",
+        "description": "Search the web for information.",
+        "parameters": {
+          "type": "object",
+          "properties": {"query": {"type": "string"}},
+          "required": ["query"]
+        }
+      }
+    ]
+  },
+  {
+    "kind": "no_tool",
+    "id": "count_continents",
+    "system": "You are a helpful assistant with access to tools. Only use a tool when the request genuinely requires current or external information.",
+    "user": "How many continents are there on Earth?",
+    "tools": [
+      {
+        "name": "convert_currency",
+        "description": "Convert an amount from one currency to another.",
+        "parameters": {
+          "type": "object",
+          "properties": {"amount": {"type": "number"}, "from": {"type": "string"}, "to": {"type": "string"}},
+          "required": ["amount", "from", "to"]
+        }
+      },
+      {
+        "name": "get_stock_price",
+        "description": "Get the current stock price for a ticker.",
+        "parameters": {
+          "type": "object",
+          "properties": {"ticker": {"type": "string"}},
+          "required": ["ticker"]
+        }
+      }
+    ]
+  },
+  {
+    "kind": "multi_turn",
+    "id": "weather_then_advice",
+    "system": "You are a helpful assistant with access to tools.",
+    "user": "What's the weather in London right now?",
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a location.",
+        "parameters": {
+          "type": "object",
+          "properties": {"location": {"type": "string"}},
+          "required": ["location"]
+        }
+      }
+    ],
+    "expected_first": {"name": "get_weather", "arguments": {"location": "London"}},
+    "tool_result": "{\"location\": \"London\", \"condition\": \"light rain\", \"temperature_c\": 14}",
+    "second_turn": {"type": "final_answer", "contains": "14"}
+  },
+  {
+    "kind": "multi_turn",
+    "id": "stock_lookup_then_report",
+    "system": "You are a helpful assistant with access to tools.",
+    "user": "What is the current price of AAPL stock?",
+    "tools": [
+      {
+        "name": "get_stock_price",
+        "description": "Get the current stock price for a ticker.",
+        "parameters": {
+          "type": "object",
+          "properties": {"ticker": {"type": "string"}},
+          "required": ["ticker"]
+        }
+      }
+    ],
+    "expected_first": {"name": "get_stock_price", "arguments": {"ticker": "AAPL"}},
+    "tool_result": "{\"ticker\": \"AAPL\", \"price_usd\": 227.35}",
+    "second_turn": {"type": "final_answer", "contains": "227.35"}
+  },
+  {
+    "kind": "multi_turn",
+    "id": "email_then_confirm",
+    "system": "You are a helpful assistant with access to tools.",
+    "user": "Send an email to alice@example.com with subject 'Lunch' and body 'Are you free for lunch tomorrow?'",
+    "tools": [
+      {
+        "name": "send_email",
+        "description": "Send an email.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "to": {"type": "string"},
+            "subject": {"type": "string"},
+            "body": {"type": "string"}
+          },
+          "required": ["to", "subject", "body"]
+        }
+      }
+    ],
+    "expected_first": {
+      "name": "send_email",
+      "arguments": {"to": "alice@example.com", "subject": "Lunch"}
+    },
+    "tool_result": "{\"status\": \"sent\", \"message_id\": \"m-8842\"}",
+    "second_turn": {"type": "final_answer", "contains": "sent"}
+  },
+  {
+    "kind": "multi_turn",
+    "id": "two_city_weather",
+    "system": "You are a helpful assistant with access to tools.",
+    "user": "Can you check the weather in both London and Paris?",
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a location.",
+        "parameters": {
+          "type": "object",
+          "properties": {"location": {"type": "string"}},
+          "required": ["location"]
+        }
+      }
+    ],
+    "expected_first": {"name": "get_weather", "arguments": {"location": "London"}},
+    "tool_result": "{\"location\": \"London\", \"condition\": \"cloudy\", \"temperature_c\": 16}",
+    "second_turn": {"type": "tool_call", "name": "get_weather", "arguments": {"location": "Paris"}}
+  },
+  {
+    "kind": "multi_turn",
+    "id": "currency_then_advice",
+    "system": "You are a helpful assistant with access to tools.",
+    "user": "Convert 500 EUR to GBP for me.",
+    "tools": [
+      {
+        "name": "convert_currency",
+        "description": "Convert an amount from one currency to another.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "amount": {"type": "number"},
+            "from": {"type": "string"},
+            "to": {"type": "string"}
+          },
+          "required": ["amount", "from", "to"]
+        }
+      }
+    ],
+    "expected_first": {"name": "convert_currency", "arguments": {"amount": 500, "from": "EUR", "to": "GBP"}},
+    "tool_result": "{\"amount\": 500, \"from\": \"EUR\", \"to\": \"GBP\", \"result\": 430.15}",
+    "second_turn": {"type": "final_answer", "contains": "430.15"}
+  },
+  {
+    "kind": "long_context",
+    "id": "needle_4k_early",
+    "question": "What is the secret laboratory access code mentioned in the text above? Reply with just the code.",
+    "needle": "The secret laboratory access code is ZQ-7734.",
+    "expected_substring": "ZQ-7734",
+    "position_fraction": 0.15,
+    "target_length_tokens": 4000,
+    "seed": 101
+  },
+  {
+    "kind": "long_context",
+    "id": "needle_4k_late",
+    "question": "According to the passage above, what is the password to the vault?",
+    "needle": "The password to the vault is Falcon-Nine-Echo.",
+    "expected_substring": "Falcon-Nine-Echo",
+    "position_fraction": 0.85,
+    "target_length_tokens": 4000,
+    "seed": 202
+  },
+  {
+    "kind": "long_context",
+    "id": "needle_8k_middle",
+    "question": "Where and when is Agent Whitmore's rendezvous, according to the text above?",
+    "needle": "Agent Whitmore's rendezvous point is Pier 19 at midnight.",
+    "expected_substring": "Pier 19",
+    "position_fraction": 0.5,
+    "target_length_tokens": 8000,
+    "seed": 303
+  },
+  {
+    "kind": "long_context",
+    "id": "needle_8k_early",
+    "question": "What is the winning lottery number combination stated earlier in the text?",
+    "needle": "The winning lottery number combination is 14-27-33-49-52.",
+    "expected_substring": "14-27-33-49-52",
+    "position_fraction": 0.1,
+    "target_length_tokens": 8000,
+    "seed": 404
+  }
+]
