@@ -198,17 +198,19 @@ pub fn run_gemm_quant_kernel(
     let out_ptr: *mut c_void = buf_out.device_ptr();
     let mut params = kernel_params!(x_ptr, w_ptr, out_ptr, rows, m, n);
 
-    const TILE_ROWS: u32 = 8;
+    const WARPS_PER_BLOCK: u32 = 8;
+    const ROWS_PER_WARP: u32 = 8;
+    const TILE_ROWS: u32 = WARPS_PER_BLOCK * ROWS_PER_WARP;
     const TILE_ELEMS: u32 = 256;
     let cfg = LaunchConfig {
         grid: (m, rows.div_ceil(TILE_ROWS), 1),
-        block: (32, TILE_ROWS, 1),
+        block: (32, WARPS_PER_BLOCK, 1),
         shared_mem_bytes: TILE_ELEMS * std::mem::size_of::<f32>() as u32,
     };
     // SAFETY: params matches every gemm_xwt_<type> kernel's parameter list
     // (const float*, const void*, float*, unsigned x3) in order, and all
     // device buffers outlive this launch. Block = (32, 8, 1) matches the
-    // kernel's fixed TILE_ROWS/warp-per-row design.
+    // kernel's fixed warp-per-`ROWS_PER_WARP`-rows tiling.
     unsafe { function.launch(&cfg, &mut params, None) }.expect("kernel launch failed");
 
     let mut actual = vec![0.0f32; (rows * m) as usize];

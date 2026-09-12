@@ -2,9 +2,10 @@
 //! (`kernels/gemm_xwt_quant.hip`): `out[rows,m] = X[rows,n] * dequant(W)^T`
 //! for GGUF-quantized weights, compared against rocml-core's proven-correct
 //! CPU dequant + a CPU matmul. Shapes are chosen to cross the kernel's
-//! internal tile boundaries (`TILE_ROWS`=8 output rows, `TILE_ELEMS`=256
-//! reduction elements per outer iteration) and to include the degenerate
-//! `rows=1` case, which must match `gemv_q*`'s single-vector semantics.
+//! internal tile boundaries (`ROWS_PER_WARP`=8 output rows per warp,
+//! `TILE_ROWS`=64 output rows per workgroup, `TILE_ELEMS`=256 reduction
+//! elements per outer iteration) and to include the degenerate `rows=1`
+//! case, which must match `gemv_q*`'s single-vector semantics.
 mod common;
 
 use common::{
@@ -93,8 +94,10 @@ macro_rules! quant_gemm_tests {
 
             #[test]
             fn rows_crosses_tile_row_boundary() {
-                // TILE_ROWS=8: 17 rows exercises a full tile, a partial tile,
-                // and the tail-warp-out-of-range path within one tile.
+                // ROWS_PER_WARP=8: 17 rows exercises two full warps' worth
+                // of rows, a partial third warp, and the tail-row-
+                // out-of-range path within one workgroup (TILE_ROWS=64
+                // still covers all 17 rows in a single grid.y block).
                 run_case(
                     $dtype,
                     $hsaco,
@@ -105,6 +108,24 @@ macro_rules! quant_gemm_tests {
                     11,
                     2 * $block_elems as u32,
                     2,
+                );
+            }
+
+            #[test]
+            fn rows_crosses_workgroup_tile_boundary() {
+                // TILE_ROWS=64: 130 rows forces grid.y=3, exercising later
+                // workgroups' row-base offsets and the last one's
+                // out-of-range tail.
+                run_case(
+                    $dtype,
+                    $hsaco,
+                    $kernel,
+                    $block_bytes,
+                    $block_elems,
+                    130,
+                    9,
+                    2 * $block_elems as u32,
+                    5,
                 );
             }
 

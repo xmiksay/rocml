@@ -23,9 +23,16 @@ use crate::error::RocmlError;
 /// (`TILE_ELEMS * sizeof(f32)`) regardless of dtype (see
 /// `kernels/gemm_xwt_quant.hip`'s module doc).
 const GEMM_QUANT_TILE_ELEMS: u32 = 256;
+/// Warps per `gemm_xwt_q*` workgroup — fixes the launch's block.y. Must
+/// equal `GEMM_QUANT_TILE_ELEMS / 32` (the kernel's cooperative dequant
+/// stages one element per thread per outer iteration in a single pass).
+const GEMM_QUANT_WARPS_PER_BLOCK: u32 = 8;
+/// Output rows one warp carries in registers per weight tile (mirrors the
+/// kernel's `ROWS_PER_WARP`).
+const GEMM_QUANT_ROWS_PER_WARP: u32 = 8;
 /// Output rows one `gemm_xwt_q*` workgroup shares a weight row across —
-/// fixes the launch's block.y and grid.y.
-const GEMM_QUANT_TILE_ROWS: u32 = 8;
+/// fixes the launch's grid.y.
+const GEMM_QUANT_TILE_ROWS: u32 = GEMM_QUANT_WARPS_PER_BLOCK * GEMM_QUANT_ROWS_PER_WARP;
 
 pub(crate) struct QuantKernels {
     _mod_q8_0: Module,
@@ -166,13 +173,13 @@ impl QuantKernels {
         };
         let cfg = LaunchConfig {
             grid: (m, rows.div_ceil(GEMM_QUANT_TILE_ROWS), 1),
-            block: (32, GEMM_QUANT_TILE_ROWS, 1),
+            block: (32, GEMM_QUANT_WARPS_PER_BLOCK, 1),
             shared_mem_bytes: GEMM_QUANT_TILE_ELEMS * size_of::<f32>() as u32,
         };
         let mut params = kernel_params!(x, w, out, rows, m, n);
         // SAFETY: params matches every gemm_xwt_<quant>'s signature (const
         // float*, const void*, float*, unsigned x3); block = (32, 8, 1)
-        // matches the kernel's fixed warp-per-row tiling.
+        // matches the kernel's fixed warp-per-`ROWS_PER_WARP`-rows tiling.
         unsafe { function.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 }
