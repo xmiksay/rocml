@@ -9,6 +9,12 @@
 //!
 //! No hardcoded cap on `max_seq` any more — see `crate::cache`'s module doc
 //! for the issue #3 budgeting story this mirrors.
+//!
+//! `snapshot` (issue #1) adds capture/restore methods to every type here, in
+//! a child module purely for the 400-line file cap — see that module's own
+//! doc comment.
+
+mod snapshot;
 
 use half::f16;
 use rocml_hip::DeviceBuffer;
@@ -253,10 +259,34 @@ impl HybridCache {
         self.has_mixed_layers
     }
 
-    /// Zeroes every GDN layer's conv/recurrence state for a fresh sequence.
+    /// Zeroes every GDN layer's conv/recurrence state for a fresh sequence,
+    /// and rewinds every mixed-KV-cache layer's eviction bookkeeping
+    /// (`MixedAttnPlane`'s `window_base`) back to its initial post-sink
+    /// value. The latter is not just a "for good measure" reset: unlike a
+    /// dense `AttnPlane` (whose stale bytes past the new sequence's own
+    /// position are simply never read, so nothing there needs clearing —
+    /// see this module's doc comment), a mixed layer's `window_base` is
+    /// position-independent persistent state that a fresh sequence starting
+    /// back at position 0 must not inherit — leaving a stale, larger
+    /// `window_base` in place makes the very next `pos < window_base` for
+    /// any position past the sink, and in a release build (where the
+    /// affected `debug_assert!` in `MixedLayout::prepare_append` compiles
+    /// out) that underflows the unsigned `pos - window_base` subtraction
+    /// into a huge offset that then panics deep in a kernel launch — found
+    /// while adding issue #1's snapshot equivalence test, which is the first
+    /// thing in this codebase to reset-and-reprocess a mixed-cache model
+    /// more than once. Any long-lived process serving more than one request
+    /// against a `--kv-cache q8`/`q4-mixed` model (i.e. `rocml-serve`) hit
+    /// this on its second request before this fix — a real, and previously
+    /// silent, correctness bug independent of the snapshot layer.
     pub fn reset(&mut self) -> Result<(), RocmlError> {
         for slot in self.gdn.iter_mut().flatten() {
             slot.reset()?;
+        }
+        for slot in self.attn.iter_mut().flatten() {
+            if let AttnLayerCache::Mixed(plane) = slot {
+                plane.reset();
+            }
         }
         Ok(())
     }

@@ -61,6 +61,14 @@ impl MixedLayout {
         }
     }
 
+    /// Reconstructs a layout from a previously-observed `window_base` — used
+    /// by the snapshot layer (issue #1) to restore a mixed layer's eviction
+    /// state exactly, since `window_base` alone determines every other
+    /// derived quantity (`bulk_len`/`evicted_blocks`/`region`).
+    pub fn from_window_base(window_base: u32) -> Self {
+        Self { window_base }
+    }
+
     /// Absolute position the window's physical slot 0 currently maps to.
     pub fn window_base(&self) -> u32 {
         self.window_base

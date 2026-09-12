@@ -15,6 +15,7 @@ mod gdn_chunk;
 mod kernels;
 pub(crate) mod kernels_mixed;
 mod scratch;
+mod snapshot;
 
 use std::path::Path;
 

@@ -13,7 +13,9 @@ use crate::cache::KvDtype;
 /// nothing in the CLI/server ever selects it. `Q8`/`Q4Mixed` are issue #2's
 /// KIVI-style quantized bulk + fp16 attention-sink/recent-window design —
 /// see `crate::kv_quant`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum KvCacheMode {
     #[default]
     Fp16,

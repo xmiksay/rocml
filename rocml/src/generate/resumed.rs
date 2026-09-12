@@ -1,96 +1,53 @@
-//! Greedy generation loop: feed prompt tokens through the model one at a
-//! time (prefill == decode here, see `forward` module docs), then greedily
-//! sample (host-side argmax over the copied-back logits) until `eos` or
-//! `max_new_tokens`, streaming decoded text as tokens complete.
+//! Snapshot-aware generation entry points (issue #1) plus `generate_core`,
+//! the shared engine every function in `super` and this file ultimately
+//! calls — split out of `generate.rs` purely for the 400-line file cap, see
+//! that module's doc comment.
 
 use std::time::Instant;
 
 use rocml_core::tokenizer::BpeTokenizer;
 
+use super::GenerateStats;
 use crate::error::RocmlError;
 use crate::model::Model;
 use crate::profile::{Phase, Profiler};
 use crate::sample::{self, Rng, SamplingParams};
 
-#[derive(Debug, Clone, Copy)]
-pub struct GenerateStats {
-    pub prompt_tokens: usize,
-    pub generated_tokens: usize,
-    pub prompt_seconds: f64,
-    pub decode_seconds: f64,
-}
-
-impl GenerateStats {
-    pub fn prompt_tokens_per_sec(&self) -> f64 {
-        checked_rate(self.prompt_tokens, self.prompt_seconds)
-    }
-
-    pub fn decode_tokens_per_sec(&self) -> f64 {
-        checked_rate(self.generated_tokens, self.decode_seconds)
-    }
-}
-
-fn checked_rate(count: usize, seconds: f64) -> f64 {
-    if seconds > 0.0 {
-        count as f64 / seconds
-    } else {
-        0.0
-    }
-}
-
-/// Greedy-generates up to `max_new_tokens` tokens continuing `prompt_ids`
-/// from the model's current cache position (call `Model::reset` first for a
-/// fresh sequence). `on_text` receives each newly complete UTF-8 chunk as
-/// tokens decode; a token whose bytes don't yet complete a UTF-8 sequence is
-/// buffered instead of erroring, per `BpeTokenizer::token_bytes`'s contract.
+/// Like [`super::generate_sampled`], but the model's cache already holds the
+/// first `already_processed` tokens of `prompt_ids` (e.g. restored from a
+/// snapshot, see `crate::snapshot::turn::run_turn`) — only
+/// `prompt_ids[already_processed..]` is actually run through a forward
+/// pass. `prompt_ids` as a whole (not just the suffix) still seeds sampling
+/// history (repeat-penalty correctness).
 ///
-/// `stop_on_eos`: if true, generation stops (without emitting the eos token)
-/// the moment eos is sampled. The greedy-parity fixtures were captured by a
-/// reference implementation that always emits exactly `n` tokens regardless
-/// of eos, so the parity test passes `false` to compare like for like;
-/// real usage (the `generate` example) wants `true`.
-pub fn generate(
+/// `prefill_boundary` fires once after the initial prefill (whether or not
+/// there was anything left to prefill) and, for a long suffix, again every
+/// 4096 *absolute* tokens processed — see issue #1's "every 4096 processed
+/// tokens during long prefills" auto-snapshot trigger. It receives the
+/// model (so it can call `Model::as_hybrid_mut().capture_snapshot(..)`) and
+/// the absolute position reached so far.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_sampled_resumed(
     model: &mut Model,
     tokenizer: &BpeTokenizer,
     prompt_ids: &[u32],
-    max_new_tokens: usize,
-    stop_on_eos: bool,
-    on_text: impl FnMut(&str),
-) -> Result<GenerateStats, RocmlError> {
-    generate_sampled(
-        model,
-        tokenizer,
-        prompt_ids,
-        max_new_tokens,
-        stop_on_eos,
-        &SamplingParams::greedy(),
-        on_text,
-    )
-}
-
-/// Like [`generate`], but draws each next token via [`sample::sample`]
-/// against `params` instead of always taking the argmax — `params.is_greedy`
-/// (temperature `<= 0`) reduces to exactly the same argmax path `generate`
-/// always used, so this is a strict superset, not a behavior change for
-/// existing greedy callers (the parity fixture tests call `Model` directly,
-/// not this function, so they're unaffected either way).
-pub fn generate_sampled(
-    model: &mut Model,
-    tokenizer: &BpeTokenizer,
-    prompt_ids: &[u32],
+    already_processed: usize,
     max_new_tokens: usize,
     stop_on_eos: bool,
     params: &SamplingParams,
+    prefill_boundary: impl FnMut(&mut Model, usize),
     mut on_text: impl FnMut(&str),
 ) -> Result<GenerateStats, RocmlError> {
     generate_core(
         model,
         tokenizer,
         prompt_ids,
+        already_processed,
         max_new_tokens,
         stop_on_eos,
         params,
         None,
+        prefill_boundary,
         |s| {
             on_text(s);
             false
@@ -98,57 +55,62 @@ pub fn generate_sampled(
     )
 }
 
-/// Like [`generate_sampled`], but `on_text` returns `true` to request
-/// generation stop immediately after the chunk it was just given (the
-/// server uses this to enforce OpenAI-style `stop` strings, checked against
-/// the growing decoded text one chunk at a time — this function has no
-/// opinion on what "should stop" means, it just reacts to the answer).
-pub fn generate_sampled_with_stop(
+/// Like [`super::generate_sampled_with_stop`], with the same
+/// resumed-from-a-snapshot semantics as [`generate_sampled_resumed`] — this
+/// is the variant `rocml-serve`'s worker uses (it needs OpenAI `stop` string
+/// support).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_sampled_with_stop_resumed(
     model: &mut Model,
     tokenizer: &BpeTokenizer,
     prompt_ids: &[u32],
+    already_processed: usize,
     max_new_tokens: usize,
     stop_on_eos: bool,
     params: &SamplingParams,
+    prefill_boundary: impl FnMut(&mut Model, usize),
     on_text: impl FnMut(&str) -> bool,
 ) -> Result<GenerateStats, RocmlError> {
     generate_core(
         model,
         tokenizer,
         prompt_ids,
+        already_processed,
         max_new_tokens,
         stop_on_eos,
         params,
         None,
+        prefill_boundary,
         on_text,
     )
 }
 
-/// Like [`generate_sampled`], but records per-op timing/bytes/FLOPs through
-/// `prof` (issue #5's observability instrumentation) — `prof.set_phase` is
-/// flipped from `Prefill` to `Decode` at the same boundary
-/// [`GenerateStats`]'s own prompt/decode split uses, so a `Profiler::finish()`
-/// report and this call's returned tok/s numbers describe the same two
-/// windows.
+/// Like [`super::generate_sampled_profiled`], with the resumed-from-a-snapshot
+/// semantics of [`generate_sampled_resumed`] — `rocml-cli bench --turns`
+/// uses this to measure per-turn prefill latency with snapshots on.
 #[allow(clippy::too_many_arguments)]
-pub fn generate_sampled_profiled(
+pub fn generate_sampled_profiled_resumed(
     model: &mut Model,
     tokenizer: &BpeTokenizer,
     prompt_ids: &[u32],
+    already_processed: usize,
     max_new_tokens: usize,
     stop_on_eos: bool,
     params: &SamplingParams,
     prof: Option<&Profiler>,
+    prefill_boundary: impl FnMut(&mut Model, usize),
     mut on_text: impl FnMut(&str),
 ) -> Result<GenerateStats, RocmlError> {
     generate_core(
         model,
         tokenizer,
         prompt_ids,
+        already_processed,
         max_new_tokens,
         stop_on_eos,
         params,
         prof,
+        prefill_boundary,
         |s| {
             on_text(s);
             false
@@ -156,29 +118,67 @@ pub fn generate_sampled_profiled(
     )
 }
 
+/// Tokens per auto-snapshot boundary during a long prefill (issue #1): a
+/// suffix longer than this gets forward-passed in multiple segments so
+/// `prefill_boundary` can fire mid-prefill, not just once at the end —
+/// making a partial prefix reusable even if generation is later aborted.
+///
+/// Splitting a `Model::forward_prompt` call at an arbitrary token boundary
+/// preserves *what* gets computed (both architectures' forward passes are
+/// pure sequential-position advancement) but not necessarily the exact
+/// floating-point bits: the hybrid path's chunked kernels re-chunk each
+/// call's own slice starting at its own index 0, so a split that doesn't
+/// land on a 128-token chunk boundary changes which tokens land in the same
+/// batched GEMM/attention/GDN-chunk launch together, which can reorder
+/// summations — the same reduction-order sensitivity
+/// `qwen35_chunked_prefill_parity`'s own near-tie escape hatch documents for
+/// chunked-vs-serial. `rocml/tests/snapshot_equivalence.rs` is the dedicated
+/// gate for this: near-exact logits (relative tolerance) and exact greedy
+/// continuations, with that same near-tie escape hatch for a rare flip.
+pub(super) const PREFILL_CAPTURE_INTERVAL: usize = 4096;
+
 #[allow(clippy::too_many_arguments)]
-fn generate_core(
+pub(super) fn generate_core(
     model: &mut Model,
     tokenizer: &BpeTokenizer,
     prompt_ids: &[u32],
+    already_processed: usize,
     max_new_tokens: usize,
     stop_on_eos: bool,
     params: &SamplingParams,
     prof: Option<&Profiler>,
+    mut prefill_boundary: impl FnMut(&mut Model, usize),
     mut on_text: impl FnMut(&str) -> bool,
 ) -> Result<GenerateStats, RocmlError> {
     let eos = tokenizer.eos_token_id;
     let mut pending = Vec::new();
     let mut generated_tokens = 0usize;
+    let mut generated_ids = Vec::new();
     let mut history: Vec<u32> = prompt_ids.to_vec();
     let mut rng = Rng::new(params.seed);
     let mut stop_requested = false;
+
+    let already = already_processed.min(prompt_ids.len());
+    let suffix = &prompt_ids[already..];
 
     if let Some(p) = prof {
         p.set_phase(Phase::Prefill);
     }
     let prompt_start = Instant::now();
-    let mut logits = model.forward_prompt(prompt_ids, prof)?;
+    let mut logits;
+    let mut processed = already;
+    let mut i = 0usize;
+    loop {
+        let to_next_boundary = PREFILL_CAPTURE_INTERVAL - (processed % PREFILL_CAPTURE_INTERVAL);
+        let end = (i + to_next_boundary).min(suffix.len());
+        logits = model.forward_prompt(&suffix[i..end], prof)?;
+        processed += end - i;
+        i = end;
+        prefill_boundary(model, processed);
+        if i >= suffix.len() {
+            break;
+        }
+    }
     let prompt_seconds = prompt_start.elapsed().as_secs_f64();
 
     if let Some(p) = prof {
@@ -196,6 +196,7 @@ fn generate_core(
             }
         });
         history.push(next_id);
+        generated_ids.push(next_id);
         generated_tokens += 1;
         if stop_requested {
             break;
@@ -208,10 +209,11 @@ fn generate_core(
     let decode_seconds = decode_start.elapsed().as_secs_f64();
 
     Ok(GenerateStats {
-        prompt_tokens: prompt_ids.len(),
+        prompt_tokens: suffix.len(),
         generated_tokens,
         prompt_seconds,
         decode_seconds,
+        generated_ids,
     })
 }
 

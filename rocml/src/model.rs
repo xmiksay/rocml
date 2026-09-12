@@ -136,4 +136,25 @@ impl Model {
             Self::Hybrid(m) => m.config().vocab_size,
         }
     }
+
+    /// The snapshot layer (issue #1) only supports the qwen35 hybrid
+    /// architecture — see `crate::snapshot`'s module doc for why (dense
+    /// `qwen3`'s KV cache has no GDN-style fixed-size state to make a cheap
+    /// mid-conversation checkpoint interesting, and no chunked prefill to
+    /// hook capture into). Callers use these to detect which architecture
+    /// they have and skip snapshot lookup/capture entirely for `Dense`,
+    /// rather than this dispatch type growing snapshot-specific error arms.
+    pub fn as_hybrid(&self) -> Option<&crate::qwen35::forward::Model> {
+        match self {
+            Self::Hybrid(m) => Some(m),
+            Self::Dense(_) => None,
+        }
+    }
+
+    pub fn as_hybrid_mut(&mut self) -> Option<&mut crate::qwen35::forward::Model> {
+        match self {
+            Self::Hybrid(m) => Some(m),
+            Self::Dense(_) => None,
+        }
+    }
 }
