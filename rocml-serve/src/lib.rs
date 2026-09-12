@@ -2,10 +2,12 @@
 //! integration tests can build the router directly (binding an ephemeral
 //! port themselves) without going through the `rocml-serve` binary.
 
+pub mod debug;
 pub mod error;
 pub mod mapping;
 pub mod openai;
 pub mod routes;
+pub mod sse;
 pub mod state;
 pub mod worker;
 
@@ -37,6 +39,11 @@ pub struct ServerConfig {
     pub snapshot_ram_mb: usize,
     pub snapshot_dir: Option<PathBuf>,
     pub snapshot_disk_mb: u64,
+    /// Issue #9: mounts `GET /debug/last_prompt` when `true`. Off by
+    /// default — it exposes the exact rendered prompt text of the last (or
+    /// in-flight) request, i.e. full conversation content. Do not enable
+    /// on a shared host. See `debug` module docs.
+    pub debug_endpoints: bool,
 }
 
 /// Loads the tokenizer, spawns the model-owning worker thread (see
@@ -77,6 +84,10 @@ pub fn build(config: ServerConfig) -> Result<(axum::Router, std::thread::JoinHan
         snapshot_config,
     )?;
 
+    let debug_state = config
+        .debug_endpoints
+        .then(|| Arc::new(debug::LastPromptState::default()));
+
     let state = Arc::new(state::AppState {
         job_tx,
         tokenizer,
@@ -85,6 +96,11 @@ pub fn build(config: ServerConfig) -> Result<(axum::Router, std::thread::JoinHan
         ctx: config.ctx,
         max_tokens_default: config.max_tokens_default,
         no_think: config.no_think,
+        debug: debug_state.clone(),
     });
-    Ok((routes::router(state), worker_handle))
+    let mut app = routes::router(state);
+    if let Some(debug_state) = debug_state {
+        app = app.merge(debug::router(debug_state));
+    }
+    Ok((app, worker_handle))
 }

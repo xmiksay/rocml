@@ -43,6 +43,28 @@ pub async fn post_json(addr: std::net::SocketAddr, path: &str, body: &str) -> Ht
     parse_response(&raw)
 }
 
+/// Sends `GET {path}` to `addr` and reads the response to completion — the
+/// `POST`-only counterpart above, for issue #9's `GET /debug/last_prompt`.
+pub async fn get(addr: std::net::SocketAddr, path: &str) -> HttpResponse {
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .expect("connect to test server");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read response");
+    parse_response(&raw)
+}
+
 fn parse_response(raw: &[u8]) -> HttpResponse {
     let header_end = find(raw, b"\r\n\r\n").expect("response has no header/body separator") + 4;
     let header_text = String::from_utf8_lossy(&raw[..header_end]);

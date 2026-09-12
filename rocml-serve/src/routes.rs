@@ -1,30 +1,31 @@
 //! Axum routes: `POST /v1/chat/completions` (both the full-JSON and SSE
-//! shapes) and `GET /v1/models`. Streaming and non-streaming share the same
-//! request mapping and worker dispatch (`handle_request`); they only differ
-//! in how they drain the worker's per-job event channel.
+//! shapes, the latter in `sse.rs`) and `GET /v1/models`. Streaming and
+//! non-streaming share the same request mapping and worker dispatch
+//! (`handle_request`); they only differ in how they drain the worker's
+//! per-job event channel. The optional `GET /debug/last_prompt` route
+//! (issue #9, `--debug-endpoints`) is mounted separately by
+//! `rocml_serve::build` — see `debug` module.
 
-use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rocml::chat::{self, RenderOpts, ScanEvent, StreamScanner};
+use rocml::chat::{self, RenderOpts, StreamScanner};
 use serde_json::json;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::error::ApiError;
 use crate::mapping::{self, AssistantAccumulator};
 use crate::openai::{
-    self, ChatCompletionRequest, ChatCompletionResponse, ChatMessageOut, ChoiceOut, DeltaOut,
-    FunctionCallOut, ToolCallDeltaOut, ToolCallOut, UsageOut,
+    ChatCompletionRequest, ChatCompletionResponse, ChatMessageOut, ChoiceOut, FunctionCallOut,
+    ToolCallOut, UsageOut,
 };
+use crate::sse::stream_response;
 use crate::state::AppState;
 use crate::worker::{Job, WorkerEvent};
 
@@ -71,6 +72,12 @@ async fn handle_request(
     let render_opts = RenderOpts {
         add_generation_prompt: true,
         enable_thinking: state.no_think.then_some(false),
+        // Issue #9: an incoming assistant history message's
+        // `reasoning_content` (or a `<think>` block embedded in its
+        // `content`) must never leak back into the rendered prompt —
+        // matches the Qwen3-family training convention, see
+        // `RenderOpts::keep_history_reasoning`'s doc comment.
+        keep_history_reasoning: false,
     };
     // The generation-prompt tail opens `<think>\n` unless thinking is
     // explicitly off, so the response-side scanner must start already in
@@ -96,6 +103,14 @@ async fn handle_request(
     let sampling = mapping::map_sampling(&request, &state.default_sampling);
     let stop_strings = mapping::stop_strings(&request);
     let prompt_tokens = prompt_ids.len();
+
+    // Issue #9's debug endpoint: recorded at accept time (before dispatch)
+    // so an in-flight request's prompt is visible immediately, not only
+    // after it completes — mirrors llama.cpp's `/slots`. `None` when
+    // `--debug-endpoints` wasn't passed, so this is a no-op by default.
+    if let Some(debug) = &state.debug {
+        debug.record(prompt_text.clone(), prompt_tokens);
+    }
 
     let (tx, rx) = mpsc::unbounded_channel();
     let job = Job {
@@ -224,7 +239,8 @@ fn message_out(acc: &AssistantAccumulator) -> ChatMessageOut {
 
 /// Picks the scanner mode matching how the prompt's generation-prompt tail
 /// left the `<think>` block — see `StreamScanner::new_primed_for_thinking`.
-fn new_scanner(thinking_primed: bool) -> StreamScanner {
+/// `pub(crate)`: shared with `sse::pump_stream`.
+pub(crate) fn new_scanner(thinking_primed: bool) -> StreamScanner {
     if thinking_primed {
         StreamScanner::new_primed_for_thinking()
     } else {
@@ -232,172 +248,14 @@ fn new_scanner(thinking_primed: bool) -> StreamScanner {
     }
 }
 
-fn stream_response(
-    model_id: String,
-    prompt_tokens: usize,
-    max_new_tokens: usize,
-    rx: mpsc::UnboundedReceiver<WorkerEvent>,
-    started: Instant,
-    thinking_primed: bool,
-) -> Response {
-    let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
-    tokio::spawn(pump_stream(
-        model_id,
-        prompt_tokens,
-        max_new_tokens,
-        rx,
-        sse_tx,
-        started,
-        thinking_primed,
-    ));
-    Sse::new(UnboundedReceiverStream::new(sse_rx))
-        .keep_alive(KeepAlive::default())
-        .into_response()
-}
-
-/// Drains the worker's event channel, translating each `ScanEvent` into an
-/// OpenAI delta chunk as it arrives, then closes with a final chunk carrying
-/// `finish_reason` and a literal `[DONE]` — never leaving the connection
-/// hanging even if generation errors out mid-stream.
-async fn pump_stream(
-    model_id: String,
-    prompt_tokens: usize,
-    max_new_tokens: usize,
-    mut rx: mpsc::UnboundedReceiver<WorkerEvent>,
-    tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
-    started: Instant,
-    thinking_primed: bool,
-) {
-    let id = completion_id();
-    let created = now_unix();
-    let _ = send_chunk(
-        &tx,
-        openai::chunk(
-            &id,
-            created,
-            &model_id,
-            DeltaOut {
-                role: Some("assistant"),
-                ..Default::default()
-            },
-            None,
-        ),
-    );
-
-    let mut scanner = new_scanner(thinking_primed);
-    let mut acc = AssistantAccumulator::default();
-    let outcome = loop {
-        match rx.recv().await {
-            Some(WorkerEvent::Chunk(text)) => {
-                if let Ok(events) = scanner.feed(&text) {
-                    for ev in events {
-                        emit_event(&tx, &id, created, &model_id, ev, &mut acc);
-                    }
-                }
-            }
-            Some(WorkerEvent::Done(stats)) => break Ok(stats),
-            Some(WorkerEvent::Error(e)) => break Err(e),
-            None => break Err("model worker closed unexpectedly".to_string()),
-        }
-    };
-
-    let (finish_reason, completion_tokens) = match outcome {
-        Ok(stats) => {
-            for ev in scanner.finish() {
-                emit_event(&tx, &id, created, &model_id, ev, &mut acc);
-            }
-            (
-                acc.finish_reason(stats.generated_tokens, max_new_tokens),
-                stats.generated_tokens,
-            )
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "generation failed mid-stream");
-            ("stop", 0)
-        }
-    };
-    let _ = send_chunk(
-        &tx,
-        openai::chunk(
-            &id,
-            created,
-            &model_id,
-            DeltaOut::default(),
-            Some(finish_reason),
-        ),
-    );
-    let _ = tx.send(Ok(Event::default().data("[DONE]")));
-    tracing::info!(
-        route = "/v1/chat/completions",
-        prompt_tokens,
-        completion_tokens,
-        duration_ms = started.elapsed().as_millis() as u64,
-        "request completed"
-    );
-}
-
-fn emit_event(
-    tx: &mpsc::UnboundedSender<Result<Event, Infallible>>,
-    id: &str,
-    created: u64,
-    model_id: &str,
-    event: ScanEvent,
-    acc: &mut AssistantAccumulator,
-) {
-    match event {
-        ScanEvent::TextDelta(s) => {
-            let delta = DeltaOut {
-                content: Some(s.clone()),
-                ..Default::default()
-            };
-            acc.apply(ScanEvent::TextDelta(s));
-            let _ = send_chunk(tx, openai::chunk(id, created, model_id, delta, None));
-        }
-        ScanEvent::ThinkingDelta(s) => {
-            let delta = DeltaOut {
-                reasoning_content: Some(s.clone()),
-                ..Default::default()
-            };
-            acc.apply(ScanEvent::ThinkingDelta(s));
-            let _ = send_chunk(tx, openai::chunk(id, created, model_id, delta, None));
-        }
-        ScanEvent::ToolCallStarted => {}
-        ScanEvent::ToolCallComplete(call) => {
-            let index = acc.tool_calls.len();
-            let delta = DeltaOut {
-                tool_calls: vec![ToolCallDeltaOut {
-                    index,
-                    id: format!("call_{id}_{index}"),
-                    kind: "function",
-                    function: FunctionCallOut {
-                        name: call.name.clone(),
-                        arguments: serde_json::to_string(&call.arguments).unwrap_or_default(),
-                    },
-                }],
-                ..Default::default()
-            };
-            acc.apply(ScanEvent::ToolCallComplete(call));
-            let _ = send_chunk(tx, openai::chunk(id, created, model_id, delta, None));
-        }
-    }
-}
-
-fn send_chunk(
-    tx: &mpsc::UnboundedSender<Result<Event, Infallible>>,
-    chunk: openai::ChatCompletionChunk,
-) -> Result<(), ()> {
-    let data = serde_json::to_string(&chunk).map_err(|_| ())?;
-    tx.send(Ok(Event::default().data(data))).map_err(|_| ())
-}
-
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-fn completion_id() -> String {
+pub(crate) fn completion_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("chatcmpl-{}-{n}", now_unix())

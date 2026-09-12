@@ -1,4 +1,4 @@
-//! `rocml-serve --model <name-or-gguf> [--host] [--port] [--ctx] [--kv-cache] [--max-tokens-default] [--no-think] [--no-download]`
+//! `rocml-serve --model <name-or-gguf> [--host] [--port] [--ctx] [--kv-cache] [--max-tokens-default] [--no-think] [--no-download] [--debug-endpoints]`
 
 use std::process::ExitCode;
 
@@ -79,6 +79,13 @@ struct Args {
     snapshot_dir: Option<std::path::PathBuf>,
     #[arg(long = "snapshot-disk-mb", default_value_t = 20_000)]
     snapshot_disk_mb: u64,
+    /// Issue #9: mount `GET /debug/last_prompt`, returning the exact
+    /// rendered prompt string (plus token count and timestamp) of the
+    /// last-accepted or in-flight request. Off by default — this exposes
+    /// full conversation content (system prompt, prior turns, tool
+    /// results). Do not enable on a shared host.
+    #[arg(long = "debug-endpoints")]
+    debug_endpoints: bool,
 }
 
 #[tokio::main]
@@ -130,6 +137,7 @@ async fn run(args: Args) -> Result<(), String> {
         snapshot_ram_mb: args.snapshot_ram_mb,
         snapshot_dir: args.snapshot_dir,
         snapshot_disk_mb: args.snapshot_disk_mb,
+        debug_endpoints: args.debug_endpoints,
     };
     // The worker-thread join handle is for callers that shut down cleanly
     // (see `rocml_serve::build`'s doc comment) — this server runs until

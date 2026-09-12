@@ -58,6 +58,21 @@ async fn spawn_test_server_with_snapshots(
     model_path: PathBuf,
     snapshot_ram_mb: usize,
 ) -> TestServer {
+    spawn_test_server_with_options(model_path, snapshot_ram_mb, false).await
+}
+
+/// Like [`spawn_test_server`], with issue #9's `--debug-endpoints` flag on
+/// (mounting `GET /debug/last_prompt`) — every other test in this file
+/// leaves it off, matching the flag's off-by-default posture.
+async fn spawn_test_server_with_debug_endpoints(model_path: PathBuf) -> TestServer {
+    spawn_test_server_with_options(model_path, 0, true).await
+}
+
+async fn spawn_test_server_with_options(
+    model_path: PathBuf,
+    snapshot_ram_mb: usize,
+    debug_endpoints: bool,
+) -> TestServer {
     let (app, worker_thread) = build(ServerConfig {
         model_path,
         ctx: 4096,
@@ -69,6 +84,7 @@ async fn spawn_test_server_with_snapshots(
         snapshot_ram_mb,
         snapshot_dir: None,
         snapshot_disk_mb: 0,
+        debug_endpoints,
     })
     .expect("server failed to build (model load / tokenizer)");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -256,6 +272,78 @@ async fn run_two_turn_conversation(addr: std::net::SocketAddr) -> String {
         .as_str()
         .expect("turn 2 content is a string")
         .to_string()
+}
+
+/// Issue #9: `--debug-endpoints` off (the default) never mounts the route
+/// at all — a request to it is a plain 404, not e.g. an empty-but-200
+/// response, so there's no way to probe for the flag's presence from an
+/// unprivileged caller either.
+#[tokio::test]
+async fn debug_last_prompt_route_is_absent_by_default() {
+    let Some(gguf_path) = checkpoint(GGUF_REL) else {
+        return;
+    };
+    let server = spawn_test_server(gguf_path).await;
+    let resp = support::get(server.addr, "/debug/last_prompt").await;
+    assert_eq!(resp.status, 404, "body: {}", resp.body);
+    server.shutdown().await;
+}
+
+/// Issue #9's decisive diagnostic: with `--debug-endpoints` on, the last
+/// completed request's exact rendered prompt (the real chat-template
+/// output, not just the raw user message) is readable back out, alongside
+/// a token count matching `usage.prompt_tokens` and a timestamp.
+#[tokio::test]
+async fn debug_last_prompt_reports_the_exact_rendered_prompt() {
+    let Some(gguf_path) = checkpoint(GGUF_REL) else {
+        return;
+    };
+    let server = spawn_test_server_with_debug_endpoints(gguf_path).await;
+
+    // Before any request: present (mounted) but empty.
+    let empty = support::get(server.addr, "/debug/last_prompt").await;
+    assert_eq!(empty.status, 200, "body: {}", empty.body);
+    let empty_parsed: Value = serde_json::from_str(&empty.body).expect("valid JSON");
+    assert!(empty_parsed["prompt"].is_null(), "{empty_parsed}");
+
+    let body = json!({
+        "messages": [{"role": "user", "content": "Say hello in one short sentence."}],
+        "max_tokens": 16,
+        "temperature": 0,
+        "stream": false,
+    })
+    .to_string();
+    let resp = support::post_json(server.addr, "/v1/chat/completions", &body).await;
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let parsed: Value = serde_json::from_str(&resp.body).expect("valid JSON response");
+    let prompt_tokens = parsed["usage"]["prompt_tokens"]
+        .as_u64()
+        .expect("prompt_tokens");
+
+    let debug = support::get(server.addr, "/debug/last_prompt").await;
+    assert_eq!(debug.status, 200, "body: {}", debug.body);
+    let debug_parsed: Value = serde_json::from_str(&debug.body).expect("valid JSON");
+    let prompt = debug_parsed["prompt"]
+        .as_str()
+        .expect("prompt is a string once a request has been served");
+    // The exact *rendered* prompt, not the raw user message — proof this is
+    // the real chat-template output a harness author would diagnose against.
+    assert!(
+        prompt.contains("Say hello in one short sentence."),
+        "prompt: {prompt:?}"
+    );
+    assert!(
+        prompt.contains("<|im_start|>"),
+        "prompt should be template-rendered, not raw: {prompt:?}"
+    );
+    assert_eq!(
+        debug_parsed["prompt_tokens"].as_u64(),
+        Some(prompt_tokens),
+        "debug endpoint's token count should match usage.prompt_tokens"
+    );
+    assert!(debug_parsed["timestamp"].as_u64().is_some());
+
+    server.shutdown().await;
 }
 
 /// Companion to the tools scenario above: Ornith-1.0-9B is the agentic

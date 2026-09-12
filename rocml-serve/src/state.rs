@@ -8,6 +8,7 @@ use std::sync::Arc;
 use rocml::SamplingParams;
 use rocml_core::tokenizer::BpeTokenizer;
 
+use crate::debug::LastPromptState;
 use crate::worker::Job;
 
 pub struct AppState {
@@ -34,4 +35,10 @@ pub struct AppState {
     /// the request overrides it (not currently exposed per-request — the
     /// spec only asks for the server-wide flag).
     pub no_think: bool,
+    /// Issue #9's `/debug/last_prompt` endpoint: `None` (the default, no
+    /// `--debug-endpoints`) means `routes::handle_request` skips recording
+    /// entirely and `rocml_serve::build` never mounts the route. `Some`
+    /// when enabled — see `debug` module docs for what it exposes and why
+    /// it's opt-in.
+    pub debug: Option<Arc<LastPromptState>>,
 }
