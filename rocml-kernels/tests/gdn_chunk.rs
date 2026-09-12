@@ -1,11 +1,14 @@
 //! GPU integration test for the Gated Delta Net prefill-chunk causal-conv1d
-//! kernel (`causal_conv1d_chunk_f32`) against `causal_conv1d_decode_f32` run
-//! `chunk_len` times sequentially — the chunk kernel must produce the
-//! *exact same state evolution* as T decode steps (same math, just fewer
-//! launches). The recurrence's chunk kernel used to be tested here the same
-//! way (`gdn_recurrence_chunk_f32`, now removed) — its chunkwise
-//! replacement is tested in `gdn_chunkwise.rs` against both an f64 CPU
-//! reference and the same T-sequential-decode-launches ground truth.
+//! kernels (`causal_conv1d_chunk_f32` + `causal_conv1d_chunk_state_update_f32`)
+//! against `causal_conv1d_decode_f32` run `chunk_len` times sequentially —
+//! the two-kernel chunk pipeline must produce the *exact same state
+//! evolution* as T decode steps (same math, just fewer launches; see
+//! `gdn_chunk.hip`'s module doc for why the chunk path is a windowed conv,
+//! not a recurrence, and why the state carry is a separate launch). The
+//! recurrence's chunk kernel used to be tested here the same way
+//! (`gdn_recurrence_chunk_f32`, now removed) — its chunkwise replacement is
+//! tested in `gdn_chunkwise.rs` against both an f64 CPU reference and the
+//! same T-sequential-decode-launches ground truth.
 use std::ffi::c_void;
 
 use rocml_hip::{kernel_params, Device, DeviceBuffer, LaunchConfig, Module};
@@ -40,6 +43,10 @@ fn run_conv_chunk(channels: u32, kernel_size: u32, chunk_len: u32) {
     let (_mc, chunk_fn) = load(
         rocml_kernels::GDN_CONV1D_CHUNK_F32_HSACO,
         rocml_kernels::GDN_CONV1D_CHUNK_F32_KERNEL,
+    );
+    let (_mcs, chunk_state_fn) = load(
+        rocml_kernels::GDN_CONV1D_CHUNK_STATE_UPDATE_F32_HSACO,
+        rocml_kernels::GDN_CONV1D_CHUNK_STATE_UPDATE_F32_KERNEL,
     );
 
     let hist_len = (kernel_size - 1) as usize;
@@ -120,14 +127,27 @@ fn run_conv_chunk(channels: u32, kernel_size: u32, chunk_len: u32) {
     );
     let block = 64u32;
     let cfg = LaunchConfig {
-        grid: (channels.div_ceil(block), 1, 1),
+        grid: (channels.div_ceil(block), chunk_len, 1),
         block: (block, 1, 1),
         shared_mem_bytes: 0,
     };
     // SAFETY: params matches causal_conv1d_chunk_f32's parameter list (const
-    // float*, float*, const float*, float*, unsigned x3); buffers outlive
-    // this launch.
+    // float*, const float*, const float*, float*, unsigned x3); buffers
+    // outlive this launch.
     unsafe { chunk_fn.launch(&cfg, &mut params, None) }.expect("chunk launch failed");
+
+    let mut state_params = kernel_params!(x_ptr, state_ptr, channels, kernel_size, chunk_len);
+    let state_cfg = LaunchConfig {
+        grid: (channels.div_ceil(block), 1, 1),
+        block: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    // SAFETY: params matches causal_conv1d_chunk_state_update_f32's
+    // parameter list (const float*, float*, unsigned x3); issued after the
+    // main kernel on the same (default) stream, so it observes conv_state
+    // untouched by that launch.
+    unsafe { chunk_state_fn.launch(&state_cfg, &mut state_params, None) }
+        .expect("chunk state update launch failed");
 
     let mut actual_out = vec![0.0f32; cl * channels as usize];
     buf_out_chunk
@@ -155,4 +175,21 @@ fn conv_chunk_degenerate_single_token() {
 #[test]
 fn conv_chunk_kernel_size_one() {
     run_conv_chunk(8, 1, 5);
+}
+
+#[test]
+fn conv_chunk_shorter_than_history() {
+    // chunk_len=2 < hist_len=3: exercises the state-update kernel's
+    // pos<0 branch, which must fall back to reading the *old* conv_state
+    // (not yet overwritten) for slots the chunk itself can't fill.
+    run_conv_chunk(24, 4, 2);
+}
+
+#[test]
+fn conv_chunk_real_prefill_shape() {
+    // channels/chunk_len close to Ornith's actual conv_dim (8192) and
+    // PREFILL_CHUNK_SIZE (128) — exercises the full [channels, chunk_len]
+    // grid shape the parallel-over-token rewrite introduced, not just the
+    // small synthetic sizes above.
+    run_conv_chunk(1024, 4, 128);
 }

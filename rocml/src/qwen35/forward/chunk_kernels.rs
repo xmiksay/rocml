@@ -18,6 +18,8 @@ const LINEAR_BLOCK: u32 = 256;
 pub struct ChunkKernels {
     _mod_conv_chunk: Module,
     conv_chunk_fn: rocml_hip::Function,
+    _mod_conv_chunk_state: Module,
+    conv_chunk_state_fn: rocml_hip::Function,
     _mod_extract_heads: Module,
     extract_heads_fn: rocml_hip::Function,
     _mod_scatter_kv: Module,
@@ -33,6 +35,10 @@ impl ChunkKernels {
         let (_mod_conv_chunk, conv_chunk_fn) = load(
             rocml_kernels::GDN_CONV1D_CHUNK_F32_HSACO,
             rocml_kernels::GDN_CONV1D_CHUNK_F32_KERNEL,
+        )?;
+        let (_mod_conv_chunk_state, conv_chunk_state_fn) = load(
+            rocml_kernels::GDN_CONV1D_CHUNK_STATE_UPDATE_F32_HSACO,
+            rocml_kernels::GDN_CONV1D_CHUNK_STATE_UPDATE_F32_KERNEL,
         )?;
         let (_mod_extract_heads, extract_heads_fn) = load(
             rocml_kernels::EXTRACT_HEADS_F32_HSACO,
@@ -54,6 +60,8 @@ impl ChunkKernels {
         Ok(Self {
             _mod_conv_chunk,
             conv_chunk_fn,
+            _mod_conv_chunk_state,
+            conv_chunk_state_fn,
             _mod_extract_heads,
             extract_heads_fn,
             _mod_scatter_kv,
@@ -66,8 +74,13 @@ impl ChunkKernels {
     }
 
     /// `causal_conv1d_chunk_f32`: batched GDN causal-conv over a
-    /// `chunk_len`-token chunk in one launch, mutating `conv_state` in
-    /// place — the prefill-chunk sibling of `HybridKernels::gdn_conv1d_decode`.
+    /// `chunk_len`-token chunk, parallel over `(channel, token)` — grid is
+    /// `[channels.div_ceil(LINEAR_BLOCK), chunk_len]` blocks, restoring full
+    /// occupancy vs. the old `channels`-only grid (see the kernel's module
+    /// doc). `conv_state` is read-only; call
+    /// [`Self::gdn_conv1d_chunk_state_update`] afterward on the same stream
+    /// to carry it forward — the prefill-chunk sibling of
+    /// `HybridKernels::gdn_conv1d_decode`.
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_conv1d_chunk(
         &self,
@@ -80,15 +93,39 @@ impl ChunkKernels {
         chunk_len: u32,
     ) -> Result<(), RocmlError> {
         let cfg = LaunchConfig {
-            grid: (channels.div_ceil(LINEAR_BLOCK), 1, 1),
+            grid: (channels.div_ceil(LINEAR_BLOCK), chunk_len, 1),
             block: (LINEAR_BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut params =
             kernel_params!(x, conv_state, weight, out, channels, kernel_size, chunk_len);
         // SAFETY: params matches causal_conv1d_chunk_f32's signature (const
-        // float*, float*, const float*, float*, unsigned x3).
+        // float*, const float*, const float*, float*, unsigned x3).
         unsafe { self.conv_chunk_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
+    }
+
+    /// `causal_conv1d_chunk_state_update_f32`: writes the post-chunk
+    /// `conv_state` for [`Self::gdn_conv1d_chunk`] above — a separate launch
+    /// so the main kernel's per-token blocks never race on `conv_state` (see
+    /// that kernel's module doc for why). Must be issued on the same stream
+    /// after the main kernel's launch, never before or concurrently.
+    pub fn gdn_conv1d_chunk_state_update(
+        &self,
+        x: DevPtr,
+        conv_state: DevPtr,
+        channels: u32,
+        kernel_size: u32,
+        chunk_len: u32,
+    ) -> Result<(), RocmlError> {
+        let cfg = LaunchConfig {
+            grid: (channels.div_ceil(LINEAR_BLOCK), 1, 1),
+            block: (LINEAR_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut params = kernel_params!(x, conv_state, channels, kernel_size, chunk_len);
+        // SAFETY: params matches causal_conv1d_chunk_state_update_f32's
+        // signature (const float*, float*, unsigned x3).
+        unsafe { self.conv_chunk_state_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 
     /// `extract_heads_f32(src, dst, tokens, heads, head_dim, src_stride,

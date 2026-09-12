@@ -102,6 +102,16 @@ pub(crate) fn gdn_chunk_step(
                 gdn.conv_kernel,
                 chunk_len,
             )?;
+            // Must follow gdn_conv1d_chunk on the same stream — it reads
+            // conv_state (untouched by the kernel above) and x to carry the
+            // state forward; see both kernels' module doc in gdn_chunk.hip.
+            chunk.gdn_conv1d_chunk_state_update(
+                offset(&scratch.gdn_qkv, 0),
+                offset(&state.conv_state, 0),
+                gdn.conv_dim,
+                gdn.conv_kernel,
+                chunk_len,
+            )?;
             chunk.gdn_gate_chunk(
                 offset(&scratch.gdn_a_raw, 0),
                 offset(&scratch.gdn_b_raw, 0),

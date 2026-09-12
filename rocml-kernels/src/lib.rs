@@ -87,7 +87,8 @@ pub const GDN_RECURRENCE_DECODE_F32_HSACO: &[u8] =
 pub const GDN_RECURRENCE_DECODE_F32_KERNEL: &str = "gdn_recurrence_decode_f32";
 
 /// `kernels/gdn_chunk.hip`: Gated Delta Net batched causal conv1d
-/// (`causal_conv1d_chunk_f32`) over a whole prefill chunk in one launch,
+/// (`causal_conv1d_chunk_f32`) over a whole prefill chunk, parallel over
+/// `(channel, token)` — a plain windowed conv, not a recurrence, despite
 /// reproducing `causal_conv1d_decode_f32`'s per-step math exactly. The
 /// recurrence's chunk kernel used to share this file (`gdn_recurrence_chunk_f32`)
 /// — see `kernels/gdn_chunkwise.hip`, which replaced it with the chunkwise
@@ -95,6 +96,14 @@ pub const GDN_RECURRENCE_DECODE_F32_KERNEL: &str = "gdn_recurrence_decode_f32";
 pub const GDN_CONV1D_CHUNK_F32_HSACO: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gdn_chunk.hsaco"));
 pub const GDN_CONV1D_CHUNK_F32_KERNEL: &str = "causal_conv1d_chunk_f32";
+
+/// `kernels/gdn_chunk.hip`'s state-carry follow-up to
+/// `causal_conv1d_chunk_f32` — writes the post-chunk `conv_state` in a
+/// separate launch so the main kernel's per-token blocks never race on it
+/// (see that kernel's module doc). Same `.hsaco` (one source file).
+pub const GDN_CONV1D_CHUNK_STATE_UPDATE_F32_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gdn_chunk.hsaco"));
+pub const GDN_CONV1D_CHUNK_STATE_UPDATE_F32_KERNEL: &str = "causal_conv1d_chunk_state_update_f32";
 
 /// `kernels/gemv_t.hip`: decode-attention building block `y = A^T * x`, A is
 /// row-major rows x n (e.g. a cached-V plane, one row per time step). One
