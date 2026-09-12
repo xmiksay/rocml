@@ -21,6 +21,7 @@ test:
 		--skip qwen35_cpu_reference_matches_crane_for_a_handful_of_tokens \
 		--skip qwen35_2b_hybrid_greedy_matches_crane_gpu_reference \
 		--skip ornith_9b_greedy_decode_is_well_formed_and_deterministic \
+		--skip qwen35_2b_chunked_prefill_matches_token_serial \
 		--skip chat_completions_end_to_end
 	$(MAKE) test-model
 
@@ -42,6 +43,7 @@ test-model:
 	cargo test --release -p rocml --test greedy_parity
 	cargo test --release -p rocml --test qwen35_cpu_reference
 	cargo test --release -p rocml --test qwen35_greedy_parity
+	cargo test --release -p rocml --test qwen35_chunked_prefill_parity
 	cargo test --release -p rocml --test ornith_e2e
 	cargo test --release -p rocml-serve --test server_e2e
 	cargo test --release -p rocml-serve --test server_e2e -- --ignored ornith_tool_call_is_emitted

@@ -4,13 +4,21 @@
 //! logits. Mirrors `crate::forward` (the dense Qwen3 path) structurally.
 
 mod attention;
+mod attention_chunk;
+mod chunk_forward;
+mod chunk_kernels;
+mod chunk_scratch;
 mod ffn;
+mod ffn_chunk;
 mod gdn;
+mod gdn_chunk;
 mod kernels;
 mod scratch;
 
 use std::path::Path;
 
+use chunk_kernels::ChunkKernels;
+use chunk_scratch::ChunkScratch;
 use kernels::HybridKernels;
 use rocml_core::gguf::GgufFile;
 use rocml_hip::{Device, MemoryInfo};
@@ -31,6 +39,12 @@ pub struct Model {
     kernels: Kernels,
     hybrid: HybridKernels,
     scratch: Scratch,
+    /// Chunked-prefill-only kernels/scratch (issue #6) — see
+    /// `chunk_forward::forward_chunk`. Loaded unconditionally at model load
+    /// (the same way `scratch`/`hybrid` always are), since the public API
+    /// always processes the prompt in chunks (see `crate::generate`).
+    chunk_kernels: ChunkKernels,
+    chunk_scratch: ChunkScratch,
     pos: u32,
 }
 
@@ -44,6 +58,8 @@ impl Model {
         let kernels = Kernels::load_all()?;
         let hybrid = HybridKernels::load_all()?;
         let scratch = Scratch::new(&config)?;
+        let chunk_kernels = ChunkKernels::load_all()?;
+        let chunk_scratch = ChunkScratch::new(&config)?;
 
         Ok(Self {
             _device: device,
@@ -53,6 +69,8 @@ impl Model {
             kernels,
             hybrid,
             scratch,
+            chunk_kernels,
+            chunk_scratch,
             pos: 0,
         })
     }

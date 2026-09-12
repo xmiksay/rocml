@@ -178,10 +178,7 @@ fn generate_core(
         p.set_phase(Phase::Prefill);
     }
     let prompt_start = Instant::now();
-    let mut logits = Vec::new();
-    for &id in prompt_ids {
-        logits = model.forward_token_profiled(id, prof)?;
-    }
+    let mut logits = model.forward_prompt(prompt_ids, prof)?;
     let prompt_seconds = prompt_start.elapsed().as_secs_f64();
 
     if let Some(p) = prof {

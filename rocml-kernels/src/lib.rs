@@ -149,6 +149,18 @@ pub const GEMM_XWT_Q5_K_KERNEL: &str = "gemm_xwt_q5_k";
 pub const GEMM_XWT_Q6_K_HSACO: &[u8] = GEMM_XWT_Q8_0_HSACO;
 pub const GEMM_XWT_Q6_K_KERNEL: &str = "gemm_xwt_q6_k";
 
+/// `kernels/chunk_reshape.hip`: small batched reshape/broadcast kernels the
+/// chunked-prefill forward pass needs (per-head extraction, batched KV-cache
+/// append, the GDN gate's per-token broadcast). All three share one code
+/// object.
+pub const EXTRACT_HEADS_F32_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/chunk_reshape.hsaco"));
+pub const EXTRACT_HEADS_F32_KERNEL: &str = "extract_heads_f32";
+pub const SCATTER_KV_CHUNK_F32_HSACO: &[u8] = EXTRACT_HEADS_F32_HSACO;
+pub const SCATTER_KV_CHUNK_F32_KERNEL: &str = "scatter_kv_chunk_f32";
+pub const GDN_GATE_CHUNK_F32_HSACO: &[u8] = EXTRACT_HEADS_F32_HSACO;
+pub const GDN_GATE_CHUNK_F32_KERNEL: &str = "gdn_gate_chunk_f32";
+
 /// `kernels/attn_decode.hip`: fused flash-decoding-style single-token causal
 /// attention, split-K over the sequence axis. `attn_decode_partial_f32`
 /// (grid = `[n_kv_heads, n_splits]`, block = `[32, group]`) produces one

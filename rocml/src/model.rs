@@ -63,6 +63,30 @@ impl Model {
         }
     }
 
+    /// Processes a whole (non-empty) prompt and returns the logits for its
+    /// last token. The hybrid (qwen35) architecture processes `prompt_ids`
+    /// in batched chunks (issue #6 — see
+    /// `qwen35::forward::Model::forward_prompt_chunked`); the dense
+    /// architecture doesn't yet have a chunked forward pass, so it falls
+    /// back to the original token-serial loop (out of scope for issue #6,
+    /// which targets the hybrid models `bench`/the parity suites cover).
+    pub fn forward_prompt(
+        &mut self,
+        prompt_ids: &[u32],
+        prof: Option<&Profiler>,
+    ) -> Result<Vec<f32>, RocmlError> {
+        match self {
+            Self::Dense(m) => {
+                let mut logits = Vec::new();
+                for &id in prompt_ids {
+                    logits = m.forward_token_profiled(id, prof)?;
+                }
+                Ok(logits)
+            }
+            Self::Hybrid(m) => m.forward_prompt_chunked(prompt_ids, prof),
+        }
+    }
+
     pub fn reset(&mut self) -> Result<(), RocmlError> {
         match self {
             Self::Dense(m) => {

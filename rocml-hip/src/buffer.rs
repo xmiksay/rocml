@@ -73,6 +73,35 @@ impl<T: Copy> DeviceBuffer<T> {
         })
     }
 
+    /// Copies `data` into this buffer's `[0, data.len())` prefix — unlike
+    /// [`Self::copy_from_host`], `data` may be shorter than the buffer
+    /// (never longer). Used by fixed-capacity scratch buffers that serve a
+    /// variable-length chunk (e.g. `ChunkScratch::token_ids`, sized for
+    /// `CHUNK_CAP` but fed anywhere from 1 to `CHUNK_CAP` tokens per call).
+    pub fn copy_prefix_from_host(&mut self, data: &[T]) -> Result<(), HipError> {
+        if data.len() > self.len {
+            return Err(HipError::LengthMismatch {
+                expected: self.len,
+                actual: data.len(),
+            });
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let bytes = mem::size_of_val(data);
+        // SAFETY: `data.len() <= self.len` was just checked, so `bytes` is
+        // within `self.ptr`'s live `hipMalloc` allocation; `data` is a host
+        // slice of that same byte length.
+        check(unsafe {
+            ffi::hipMemcpy(
+                self.ptr,
+                data.as_ptr() as *const c_void,
+                bytes,
+                ffi::hip_memcpy_host_to_device,
+            )
+        })
+    }
+
     /// Copies this buffer to `data`. Errors (rather than panics) if the
     /// lengths don't match.
     pub fn copy_to_host(&self, data: &mut [T]) -> Result<(), HipError> {
