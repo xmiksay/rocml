@@ -225,6 +225,25 @@ pub const ATTN_PREFILL_F32_KERNEL: &str = "attn_prefill_f32";
 pub const ATTN_PREFILL_F16_HSACO: &[u8] = ATTN_PREFILL_F32_HSACO;
 pub const ATTN_PREFILL_F16_KERNEL: &str = "attn_prefill_f16";
 
+/// `kernels/attn_prefill_flash.hip`: two-level tiled (`BR`-row query tile x
+/// `BC`-row KV tile) prefill attention with split-K over the KV/depth axis
+/// — the flash-attention-style redesign (issue #6 flash-prefill round).
+/// `attn_prefill_flash_partial_f32`/`_f16` (grid = `[n_kv_heads,
+/// chunk_len.div_ceil(BR), n_splits]`, block = `[32, group]`) produce one
+/// per-(row, head, split) online-softmax partial; `attn_prefill_flash_reduce_f32`
+/// (grid = `[chunk_len, n_heads]`, block = `[head_dim]`) merges them — see
+/// the kernel source's module doc for the full design, occupancy math, and
+/// why WMMA was evaluated and rejected for this kernel.
+pub const ATTN_PREFILL_FLASH_PARTIAL_F32_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill_flash.hsaco"));
+pub const ATTN_PREFILL_FLASH_PARTIAL_F32_KERNEL: &str = "attn_prefill_flash_partial_f32";
+pub const ATTN_PREFILL_FLASH_REDUCE_F32_HSACO: &[u8] = ATTN_PREFILL_FLASH_PARTIAL_F32_HSACO;
+pub const ATTN_PREFILL_FLASH_REDUCE_F32_KERNEL: &str = "attn_prefill_flash_reduce_f32";
+/// f16-KV-cache sibling (issue #3's default KV dtype) — same code object,
+/// different entry point; the reduce kernel is shared unchanged.
+pub const ATTN_PREFILL_FLASH_PARTIAL_F16_HSACO: &[u8] = ATTN_PREFILL_FLASH_PARTIAL_F32_HSACO;
+pub const ATTN_PREFILL_FLASH_PARTIAL_F16_KERNEL: &str = "attn_prefill_flash_partial_f16";
+
 /// `kernels/kv_quant.hip`: quantize-on-evict for the KIVI-style mixed KV
 /// cache (issue #2) — one batch launch per evicted `WINDOW_LEN`-position
 /// block. K is per-channel Q8 (`quantize_evict_k_f16_to_q8`, block =
