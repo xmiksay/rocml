@@ -3,6 +3,8 @@
 //! this measures raw forward-pass throughput, not sampling behavior, and
 //! greedy keeps every run's token count identical for a clean median.
 
+use std::path::PathBuf;
+
 use clap::Args;
 use rocml::generate::generate_sampled_profiled;
 use rocml::{LoadOptions, Profiler, RocmlError, SamplingParams};
@@ -43,6 +45,15 @@ pub struct BenchArgs {
     /// into one report for no benefit.
     #[arg(long)]
     profile: bool,
+    /// Write the roofline report (see `rocml::profile`) as machine-readable
+    /// JSON to this path instead of (or in addition to) printing the human
+    /// table — implies collecting profiling data on the final run, same as
+    /// `--profile`. The written document wraps the report under `"report"`
+    /// alongside a `"metadata"` object (model/ctx/depth/prompt/decode token
+    /// counts) so a downstream analysis script doesn't need to re-derive
+    /// run parameters from the report's contents.
+    #[arg(long = "profile-json")]
+    profile_json: Option<PathBuf>,
     /// Simulate a growing multi-turn conversation instead of the default
     /// single prompt/decode measurement (issue #1's acceptance benchmark):
     /// `turns` turns, each appending a fixed synthetic user message plus the
@@ -102,13 +113,14 @@ pub fn run(args: &BenchArgs) -> Result<(), RocmlError> {
             .unwrap_or_default(),
     );
 
+    let want_profile = args.profile || args.profile_json.is_some();
     let mut prompt_tps = Vec::with_capacity(args.runs);
     let mut decode_tps = Vec::with_capacity(args.runs);
     let sampling = SamplingParams::greedy();
     let mut report = None;
     for run_idx in 0..args.runs {
         loaded.model.reset()?;
-        let profiler = (args.profile && run_idx + 1 == args.runs).then(Profiler::new);
+        let profiler = (want_profile && run_idx + 1 == args.runs).then(Profiler::new);
         // `stop_on_eos: false` forces exactly `decode_tokens` tokens every
         // run regardless of what the (synthetic, meaningless) filler prompt
         // happens to continue with, so every run measures the same amount
@@ -139,6 +151,29 @@ pub fn run(args: &BenchArgs) -> Result<(), RocmlError> {
 
     let prompt_median = median(&mut prompt_tps);
     let decode_median = median(&mut decode_tps);
+
+    if let Some(path) = &args.profile_json {
+        let report = report.as_ref().ok_or_else(|| {
+            RocmlError::Config(
+                "--profile-json produced no report (profiling collection didn't run)".to_string(),
+            )
+        })?;
+        let document = json!({
+            "metadata": {
+                "model": common::model_id(&resolved),
+                "ctx": ctx,
+                "depth": args.depth,
+                "prompt_tokens": prompt_ids.len(),
+                "decode_tokens": args.decode_tokens,
+                "runs": args.runs,
+                "prompt_tokens_per_sec_median": prompt_median,
+                "decode_tokens_per_sec_median": decode_median,
+            },
+            "report": report,
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&document)?)?;
+        eprintln!("wrote profile JSON to {}", path.display());
+    }
 
     if args.json {
         let mut out = json!({

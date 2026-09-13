@@ -7,7 +7,7 @@ ROCML_CHECKPOINT_DIR ?= $(HOME)/checkpoints
 # Dev/test model (fast); override to point at a different checkpoint.
 QWEN_MODEL ?= $(ROCML_CHECKPOINT_DIR)/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf
 
-.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench eval mmq-layer-diff mmq-endtoend-measure
+.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench bench-profile bench-profile-json eval mmq-layer-diff mmq-endtoend-measure
 
 build:
 	cargo build --workspace
@@ -30,7 +30,8 @@ test:
 		--skip q4_mixed_chunked_prefill_matches_token_serial \
 		--skip chat_completions_end_to_end \
 		--skip two_turn_conversation_matches_output_with_snapshots_disabled \
-		--skip qwen35_snapshot_equivalence
+		--skip qwen35_snapshot_equivalence \
+		--skip profile_json_is_valid_and_well_shaped
 	$(MAKE) test-model
 
 test-unit:
@@ -59,6 +60,7 @@ test-model:
 	cargo test --release -p rocml --test ornith_e2e -- --test-threads=1
 	cargo test --release -p rocml-serve --test server_e2e
 	cargo test --release -p rocml-serve --test server_e2e -- --ignored ornith_tool_call_is_emitted
+	cargo test --release -p rocml-cli --test profile_json_smoke
 
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
@@ -77,6 +79,23 @@ serve:
 # Synthetic prompt/decode throughput benchmark against the dev/test model.
 bench:
 	cargo run --release -p rocml-cli -- bench --model $(QWEN_MODEL) --json
+
+# Issue #5's roofline observability: profiled bench run, human-readable
+# table printed to stdout. Override MODEL/DEPTH to point at a different
+# checkpoint/context depth (e.g. `make bench-profile MODEL=ornith-9b DEPTH=8192`).
+MODEL ?= $(QWEN_MODEL)
+DEPTH ?= 2048
+bench-profile:
+	cargo run --release -p rocml-cli -- bench --model $(MODEL) --depth $(DEPTH) --profile
+
+# Same run, but the roofline report (per-phase/per-op/per-layer rows plus
+# bandwidth/FLOP-roofline efficiency and wasted-time) is written as JSON to
+# OUT instead of printed — the input `docs/prefill-gap-analysis.md`'s
+# lever-ranking was built from. Override MODEL/DEPTH/OUT as needed.
+OUT ?= bench/profile/$(DEPTH).json
+bench-profile-json:
+	mkdir -p $(dir $(OUT))
+	cargo run --release -p rocml-cli -- bench --model $(MODEL) --depth $(DEPTH) --profile-json $(OUT)
 
 # Issue #15's agentic quality-eval harness: establishes the Q6_K fp16-KV
 # baseline and the Q4_K_M candidate, both at ctx 16384 (long-context
