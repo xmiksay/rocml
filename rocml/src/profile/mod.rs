@@ -29,10 +29,13 @@
 //! run creating unbounded events regardless of phase.
 
 mod cost;
+mod human;
 mod report;
+mod roofline;
 
 pub use cost::*;
-pub use report::Report;
+pub use report::{AggRow, PhaseReport, Report};
+pub use roofline::{BW_ROOFLINE_BYTES_PER_SEC, PRACTICAL_FLOPS_PER_SEC, WMMA_PEAK_FLOPS_PER_SEC};
 
 use std::cell::{Cell, RefCell};
 
