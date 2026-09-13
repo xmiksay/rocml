@@ -1,7 +1,7 @@
 //! Diagnostic perf probe (not part of any CI gate — `#[ignore]`d, run
 //! explicitly) for the chunkwise GDN recurrence pipeline at a realistic
 //! Ornith-1.0-9B shape (32 v-heads / 16 k-heads, head dims 128, tile 128):
-//! times each of the six kernel stages individually to find which one
+//! times each of the seven kernel stages individually to find which one
 //! dominates wall time.
 #[path = "gdn_chunkwise_support/mod.rs"]
 mod support;
@@ -71,18 +71,28 @@ fn perf_probe_gdn_chunkwise_stages_ornith_shape() {
         }};
     }
 
-    time_stage!("A prep", {
+    time_stage!("A1 prep_point", {
+        let cfg = LaunchConfig {
+            grid: (h, t, 1),
+            block: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let l2_eps = 1e-6f32;
+        let mut params = kernel_params!(
+            conv_out_p, beta_p, q_norm_p, k_norm_p, k_beta_p, h, hk, sk, conv_dim, key_dim, t,
+            l2_eps
+        );
+        unsafe { k.prep_point_fn().launch(&cfg, &mut params, None) }.unwrap();
+    });
+
+    time_stage!("A2 prep_cumsum", {
         let cfg = LaunchConfig {
             grid: (h, 1, 1),
             block: (t, 1, 1),
             shared_mem_bytes: t * 4,
         };
-        let l2_eps = 1e-6f32;
-        let mut params = kernel_params!(
-            conv_out_p, beta_p, g_p, q_norm_p, k_norm_p, k_beta_p, g_cum_p, cde_p, h, hk, sk,
-            conv_dim, key_dim, t, l2_eps
-        );
-        unsafe { k.prep_fn().launch(&cfg, &mut params, None) }.unwrap();
+        let mut params = kernel_params!(g_p, g_cum_p, cde_p, h, t);
+        unsafe { k.prep_cumsum_fn().launch(&cfg, &mut params, None) }.unwrap();
     });
 
     time_stage!("B ut_build", {

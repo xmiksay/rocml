@@ -103,7 +103,9 @@ pub fn reference_sequential(
 
 pub struct ChunkwiseKernels {
     _m1: Module,
-    prep: rocml_hip::Function,
+    prep_point: rocml_hip::Function,
+    _m1b: Module,
+    prep_cumsum: rocml_hip::Function,
     _m2: Module,
     ut_build: rocml_hip::Function,
     _m3: Module,
@@ -118,9 +120,13 @@ pub struct ChunkwiseKernels {
 
 impl ChunkwiseKernels {
     pub fn load() -> Self {
-        let (_m1, prep) = load(
-            rocml_kernels::GDN_CW_PREP_F32_HSACO,
-            rocml_kernels::GDN_CW_PREP_F32_KERNEL,
+        let (_m1, prep_point) = load(
+            rocml_kernels::GDN_CW_PREP_POINT_F32_HSACO,
+            rocml_kernels::GDN_CW_PREP_POINT_F32_KERNEL,
+        );
+        let (_m1b, prep_cumsum) = load(
+            rocml_kernels::GDN_CW_PREP_CUMSUM_F32_HSACO,
+            rocml_kernels::GDN_CW_PREP_CUMSUM_F32_KERNEL,
         );
         let (_m2, ut_build) = load(
             rocml_kernels::GDN_CW_UT_BUILD_F32_HSACO,
@@ -144,7 +150,9 @@ impl ChunkwiseKernels {
         );
         Self {
             _m1,
-            prep,
+            prep_point,
+            _m1b,
+            prep_cumsum,
             _m2,
             ut_build,
             _m3,
@@ -158,8 +166,11 @@ impl ChunkwiseKernels {
         }
     }
 
-    pub fn prep_fn(&self) -> &rocml_hip::Function {
-        &self.prep
+    pub fn prep_point_fn(&self) -> &rocml_hip::Function {
+        &self.prep_point
+    }
+    pub fn prep_cumsum_fn(&self) -> &rocml_hip::Function {
+        &self.prep_cumsum
     }
     pub fn ut_build_fn(&self) -> &rocml_hip::Function {
         &self.ut_build
@@ -229,19 +240,30 @@ pub fn run_chunkwise_gpu(
     let vnew_p: *mut c_void = v_new.device_ptr();
     let y_p: *mut c_void = y.device_ptr();
 
-    // A: prep
+    // A1: prep_point
+    {
+        let cfg = LaunchConfig {
+            grid: (h, t, 1),
+            block: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let l2_eps = L2_EPS as f32;
+        let mut params = kernel_params!(
+            conv_out_p, beta_p, q_norm_p, k_norm_p, k_beta_p, h, hk, sk, conv_dim, key_dim, t,
+            l2_eps
+        );
+        unsafe { k.prep_point.launch(&cfg, &mut params, None) }.expect("prep_point launch failed");
+    }
+    // A2: prep_cumsum
     {
         let cfg = LaunchConfig {
             grid: (h, 1, 1),
             block: (t, 1, 1),
             shared_mem_bytes: t * 4,
         };
-        let l2_eps = L2_EPS as f32;
-        let mut params = kernel_params!(
-            conv_out_p, beta_p, g_p, q_norm_p, k_norm_p, k_beta_p, g_cum_p, cde_p, h, hk, sk,
-            conv_dim, key_dim, t, l2_eps
-        );
-        unsafe { k.prep.launch(&cfg, &mut params, None) }.expect("prep launch failed");
+        let mut params = kernel_params!(g_p, g_cum_p, cde_p, h, t);
+        unsafe { k.prep_cumsum.launch(&cfg, &mut params, None) }
+            .expect("prep_cumsum launch failed");
     }
     // B: ut_build (block = (32, UT_BUILD_J_PER_BLOCK, 1) — must match the
     // kernel source's #define exactly)

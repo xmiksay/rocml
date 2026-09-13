@@ -285,25 +285,30 @@ pub const ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q4_HSACO: &[u8] =
     ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q8_HSACO;
 pub const ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q4_KERNEL: &str = "attn_prefill_flash_partial_mixed_q4";
 
-/// `kernels/gdn_chunkwise.hip`: the chunkwise (blocked delta-rule)
+/// `kernels/gdn_chunkwise.hip` (stages B-G) + `kernels/gdn_chunkwise_prep.hip`
+/// (stage A, split into its own file for the 400-line cap by the
+/// `gdn-recur-occupancy` round): the chunkwise (blocked delta-rule)
 /// gated-delta-rule recurrence — replaces `gdn_recurrence_chunk_f32`'s
 /// token-serial-inside-chunk loop with O(chunk^2) parallel matmul-shaped
 /// kernels plus one short (`tile_len`-long) triangular-inverse dependency
-/// chain. See the kernel source's module doc for the seven-stage pipeline
+/// chain. See each kernel source's module doc for the seven-kernel pipeline
 /// and the exact per-kernel launch contract (grid/block/shared-mem shapes).
-/// All seven share one code object.
-pub const GDN_CW_PREP_F32_HSACO: &[u8] =
+/// The two files compile to separate code objects.
+pub const GDN_CW_PREP_POINT_F32_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gdn_chunkwise_prep.hsaco"));
+pub const GDN_CW_PREP_POINT_F32_KERNEL: &str = "gdn_chunkwise_prep_point_f32";
+pub const GDN_CW_PREP_CUMSUM_F32_HSACO: &[u8] = GDN_CW_PREP_POINT_F32_HSACO;
+pub const GDN_CW_PREP_CUMSUM_F32_KERNEL: &str = "gdn_chunkwise_prep_cumsum_f32";
+pub const GDN_CW_UT_BUILD_F32_HSACO: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gdn_chunkwise.hsaco"));
-pub const GDN_CW_PREP_F32_KERNEL: &str = "gdn_chunkwise_prep_f32";
-pub const GDN_CW_UT_BUILD_F32_HSACO: &[u8] = GDN_CW_PREP_F32_HSACO;
 pub const GDN_CW_UT_BUILD_F32_KERNEL: &str = "gdn_chunkwise_ut_build_f32";
-pub const GDN_CW_TINV_F32_HSACO: &[u8] = GDN_CW_PREP_F32_HSACO;
+pub const GDN_CW_TINV_F32_HSACO: &[u8] = GDN_CW_UT_BUILD_F32_HSACO;
 pub const GDN_CW_TINV_F32_KERNEL: &str = "gdn_chunkwise_tinv_f32";
-pub const GDN_CW_UV_VNEW_F32_HSACO: &[u8] = GDN_CW_PREP_F32_HSACO;
+pub const GDN_CW_UV_VNEW_F32_HSACO: &[u8] = GDN_CW_UT_BUILD_F32_HSACO;
 pub const GDN_CW_UV_VNEW_F32_KERNEL: &str = "gdn_chunkwise_uv_vnew_f32";
-pub const GDN_CW_OUTPUT_F32_HSACO: &[u8] = GDN_CW_PREP_F32_HSACO;
+pub const GDN_CW_OUTPUT_F32_HSACO: &[u8] = GDN_CW_UT_BUILD_F32_HSACO;
 pub const GDN_CW_OUTPUT_F32_KERNEL: &str = "gdn_chunkwise_output_f32";
-pub const GDN_CW_STATE_F32_HSACO: &[u8] = GDN_CW_PREP_F32_HSACO;
+pub const GDN_CW_STATE_F32_HSACO: &[u8] = GDN_CW_UT_BUILD_F32_HSACO;
 pub const GDN_CW_STATE_F32_KERNEL: &str = "gdn_chunkwise_state_f32";
 
 /// `kernels/quantize_act_q8.hip`: per-32-element-block absmax int8

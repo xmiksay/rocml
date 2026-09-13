@@ -23,9 +23,16 @@
 // longer request into <=128-token tiles run in sequence, since the
 // per-block LDS budget below only fits a 128x128 f32 tile exactly):
 //
-//   A. `gdn_chunkwise_prep_f32`      — per-token L2-norm(Q,K), k_beta = K*beta,
-//                                      inclusive cumsum of g -> g_cum, and
-//                                      cum_decay_exp = exp(g_cum).
+//   A1/A2. `gdn_chunkwise_prep_{point,cumsum}_f32` — per-token L2-norm(Q,K),
+//                                      k_beta = K*beta, and the inclusive
+//                                      cumsum of g -> g_cum, cum_decay_exp =
+//                                      exp(g_cum). Split across two kernels
+//                                      and moved to their own file,
+//                                      `gdn_chunkwise_prep.hip` — see that
+//                                      file's module doc for why (grid-width
+//                                      occupancy fix, `gdn-recur-occupancy`
+//                                      round) and the exact per-kernel launch
+//                                      shape.
 //   B. `gdn_chunkwise_ut_build_f32`  — kb[i,j] = strictly-lower((k_beta_i . k_j) * decay(i,j))
 //                                      kq[i,j] = lower-or-diag((q_i . k_j) * decay(i,j))
 //                                      decay(i,j) = exp(g_cum[i] - g_cum[j]).
@@ -87,66 +94,10 @@
 // possibly-partial, chunk of a prompt works unchanged.
 #include <hip/hip_runtime.h>
 
-// ── A: per-token L2-norm(Q,K), k_beta, g cumsum ────────────────────────────
-//
-// `conv_out` is `[tile_len, conv_dim]` (`gdn_layer_step`'s `[Q|K|V]` layout,
-// `key_dim = num_k_heads*head_k_dim`, token-major — this kernel is the seam
-// between that layout and every downstream kernel's head-major one);
-// `beta`/`g` are `[tile_len, num_v_heads]` (`gdn_gate_chunk_f32`'s existing
-// output layout). Grid: one block per value head, block size `tile_len`
-// (one thread per token) — the cumsum phase additionally uses that block's
-// threads for a Hillis-Steele inclusive scan over `g`, so `blockDim.x` must
-// equal `tile_len` exactly (not just `>=`).
-extern "C" __global__ void gdn_chunkwise_prep_f32(
-    const float* conv_out, const float* beta, const float* g, float* q_norm, float* k_norm,
-    float* k_beta, float* g_cum, float* cum_decay_exp, unsigned num_v_heads, unsigned num_k_heads,
-    unsigned head_k_dim, unsigned conv_dim, unsigned key_dim, unsigned tile_len, float l2_eps) {
-    unsigned head = blockIdx.x;
-    unsigned t = threadIdx.x;
-    if (head >= num_v_heads || t >= tile_len) {
-        return;
-    }
-    unsigned key_head = head % num_k_heads;
-    float q_scale = rsqrtf((float)head_k_dim);
-
-    const float* row = conv_out + (size_t)t * conv_dim;
-    const float* q_h = row + (size_t)key_head * head_k_dim;
-    const float* k_h = row + key_dim + (size_t)key_head * head_k_dim;
-
-    float sq = 0.0f, sk = 0.0f;
-    for (unsigned d = 0; d < head_k_dim; ++d) {
-        sq += q_h[d] * q_h[d];
-        sk += k_h[d] * k_h[d];
-    }
-    float inv_q = rsqrtf(sq + l2_eps) * q_scale;
-    float inv_k = rsqrtf(sk + l2_eps);
-    float beta_t = beta[(size_t)t * num_v_heads + head];
-
-    float* q_out = q_norm + ((size_t)head * tile_len + t) * head_k_dim;
-    float* k_out = k_norm + ((size_t)head * tile_len + t) * head_k_dim;
-    float* kb_out = k_beta + ((size_t)head * tile_len + t) * head_k_dim;
-    for (unsigned d = 0; d < head_k_dim; ++d) {
-        float qn = q_h[d] * inv_q;
-        float kn = k_h[d] * inv_k;
-        q_out[d] = qn;
-        k_out[d] = kn;
-        kb_out[d] = kn * beta_t;
-    }
-
-    // Inclusive prefix sum of g[:, head] over the tile, Hillis-Steele in
-    // shared memory (tile_len <= 128, so <= 7 doubling steps).
-    extern __shared__ float sh_g[];
-    sh_g[t] = g[(size_t)t * num_v_heads + head];
-    __syncthreads();
-    for (unsigned offset = 1; offset < tile_len; offset <<= 1) {
-        float add = (t >= offset) ? sh_g[t - offset] : 0.0f;
-        __syncthreads();
-        sh_g[t] += add;
-        __syncthreads();
-    }
-    g_cum[(size_t)head * tile_len + t] = sh_g[t];
-    cum_decay_exp[(size_t)head * tile_len + t] = expf(sh_g[t]);
-}
+// Stage A (`gdn_chunkwise_prep_{point,cumsum}_f32`) lives in
+// `gdn_chunkwise_prep.hip`, split out purely for the 400-line cap once it
+// became two kernels — see this file's module doc above and that file's own
+// module doc for the split rationale and measurements.
 
 // Columns (`j`) a block's warps cover per outer-loop iteration in
 // `gdn_chunkwise_ut_build_f32` below — `blockDim.y`, chosen so

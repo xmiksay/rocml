@@ -1,5 +1,5 @@
 //! Host orchestration for the chunkwise (blocked delta-rule) Gated Delta Net
-//! recurrence (issue #6's chunkwise rewrite) — the six-kernel pipeline
+//! recurrence (issue #6's chunkwise rewrite) — the seven-kernel pipeline
 //! `kernels/gdn_chunkwise.hip` implements, replacing
 //! `gdn_recurrence_chunk_f32`'s token-serial-inside-chunk loop with O(tile^2)
 //! parallel matmul-shaped kernels. See that file's module doc for the
@@ -72,15 +72,12 @@ fn run_tile(
     let v_new = offset(&scratch.gdn_cw_v_new, 0);
     let state_ptr = offset(&state.state, 0);
 
-    cw.prep(
+    cw.prep_point(
         conv_out,
         beta,
-        g,
         q_norm,
         k_norm,
         k_beta,
-        g_cum,
-        cum_decay_exp,
         h,
         hk,
         sk,
@@ -89,6 +86,7 @@ fn run_tile(
         tile_len,
         L2_NORM_EPS,
     )?;
+    cw.prep_cumsum(g, g_cum, cum_decay_exp, h, tile_len)?;
     cw.ut_build(q_norm, k_norm, k_beta, g_cum, kb, kq, h, sk, tile_len)?;
     cw.tinv(kb, h, tile_len)?;
     cw.uv_vnew(

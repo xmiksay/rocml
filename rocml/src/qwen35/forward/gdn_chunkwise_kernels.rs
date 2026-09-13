@@ -2,7 +2,7 @@
 //! Net recurrence kernels (`kernels/gdn_chunkwise.hip`) — split out of
 //! `chunk_kernels.rs` purely for the 400-line cap, same reasoning as
 //! `kernels_quant.rs`/`kernels_kv.rs` in the decode-path kernel set. See the
-//! `.hip` file's module doc for the six-stage pipeline this wraps and
+//! `.hip` file's module doc for the seven-kernel pipeline this wraps and
 //! `gdn_chunkwise.rs` for the host-side orchestration (including the
 //! `chunk_len > GDN_RECUR_TILE` sub-chunking loop).
 
@@ -15,8 +15,10 @@ use crate::forward::kernels::{load, DevPtr};
 const UT_BUILD_J_PER_BLOCK: u32 = 8;
 
 pub struct GdnChunkwiseKernels {
-    _mod_prep: Module,
-    prep_fn: rocml_hip::Function,
+    _mod_prep_point: Module,
+    prep_point_fn: rocml_hip::Function,
+    _mod_prep_cumsum: Module,
+    prep_cumsum_fn: rocml_hip::Function,
     _mod_ut_build: Module,
     ut_build_fn: rocml_hip::Function,
     _mod_tinv: Module,
@@ -31,9 +33,13 @@ pub struct GdnChunkwiseKernels {
 
 impl GdnChunkwiseKernels {
     pub fn load_all() -> Result<Self, RocmlError> {
-        let (_mod_prep, prep_fn) = load(
-            rocml_kernels::GDN_CW_PREP_F32_HSACO,
-            rocml_kernels::GDN_CW_PREP_F32_KERNEL,
+        let (_mod_prep_point, prep_point_fn) = load(
+            rocml_kernels::GDN_CW_PREP_POINT_F32_HSACO,
+            rocml_kernels::GDN_CW_PREP_POINT_F32_KERNEL,
+        )?;
+        let (_mod_prep_cumsum, prep_cumsum_fn) = load(
+            rocml_kernels::GDN_CW_PREP_CUMSUM_F32_HSACO,
+            rocml_kernels::GDN_CW_PREP_CUMSUM_F32_KERNEL,
         )?;
         let (_mod_ut_build, ut_build_fn) = load(
             rocml_kernels::GDN_CW_UT_BUILD_F32_HSACO,
@@ -56,8 +62,10 @@ impl GdnChunkwiseKernels {
             rocml_kernels::GDN_CW_STATE_F32_KERNEL,
         )?;
         Ok(Self {
-            _mod_prep,
-            prep_fn,
+            _mod_prep_point,
+            prep_point_fn,
+            _mod_prep_cumsum,
+            prep_cumsum_fn,
             _mod_ut_build,
             ut_build_fn,
             _mod_tinv,
@@ -71,20 +79,19 @@ impl GdnChunkwiseKernels {
         })
     }
 
-    /// `gdn_chunkwise_prep_f32`: block size must equal `tile_len` exactly
-    /// (the in-kernel Hillis-Steele g-cumsum scan needs every thread index
-    /// `< tile_len` present and no more).
+    /// `gdn_chunkwise_prep_point_f32`: grid = `(num_v_heads, tile_len, 1)`,
+    /// block = `(32, 1, 1)` — one warp per (head, token) pair. Embarrassingly
+    /// parallel per-token work (L2-norm(Q,K), `k_beta`), split out of the
+    /// original fused `prep` kernel specifically to widen its grid past
+    /// `num_v_heads` blocks — see the kernel source's module doc.
     #[allow(clippy::too_many_arguments)]
-    pub fn prep(
+    pub fn prep_point(
         &self,
         conv_out: DevPtr,
         beta: DevPtr,
-        g: DevPtr,
         q_norm: DevPtr,
         k_norm: DevPtr,
         k_beta: DevPtr,
-        g_cum: DevPtr,
-        cum_decay_exp: DevPtr,
         num_v_heads: u32,
         num_k_heads: u32,
         head_k_dim: u32,
@@ -94,19 +101,16 @@ impl GdnChunkwiseKernels {
         l2_eps: f32,
     ) -> Result<(), RocmlError> {
         let cfg = LaunchConfig {
-            grid: (num_v_heads, 1, 1),
-            block: (tile_len, 1, 1),
-            shared_mem_bytes: tile_len * size_of_f32(),
+            grid: (num_v_heads, tile_len, 1),
+            block: (32, 1, 1),
+            shared_mem_bytes: 0,
         };
         let mut params = kernel_params!(
             conv_out,
             beta,
-            g,
             q_norm,
             k_norm,
             k_beta,
-            g_cum,
-            cum_decay_exp,
             num_v_heads,
             num_k_heads,
             head_k_dim,
@@ -115,10 +119,33 @@ impl GdnChunkwiseKernels {
             tile_len,
             l2_eps
         );
-        // SAFETY: params matches gdn_chunkwise_prep_f32's signature (three
-        // const float*, five float*, five unsigned, float); block ==
-        // tile_len as required.
-        unsafe { self.prep_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
+        // SAFETY: params matches gdn_chunkwise_prep_point_f32's signature
+        // (two const float*, three float*, five unsigned, float).
+        unsafe { self.prep_point_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
+    }
+
+    /// `gdn_chunkwise_prep_cumsum_f32`: block size must equal `tile_len`
+    /// exactly (the in-kernel Hillis-Steele g-cumsum scan needs every thread
+    /// index `< tile_len` present and no more). Independent of
+    /// [`Self::prep_point`] — no ordering requirement between the two.
+    pub fn prep_cumsum(
+        &self,
+        g: DevPtr,
+        g_cum: DevPtr,
+        cum_decay_exp: DevPtr,
+        num_v_heads: u32,
+        tile_len: u32,
+    ) -> Result<(), RocmlError> {
+        let cfg = LaunchConfig {
+            grid: (num_v_heads, 1, 1),
+            block: (tile_len, 1, 1),
+            shared_mem_bytes: tile_len * size_of_f32(),
+        };
+        let mut params = kernel_params!(g, g_cum, cum_decay_exp, num_v_heads, tile_len);
+        // SAFETY: params matches gdn_chunkwise_prep_cumsum_f32's signature
+        // (one const float*, two float*, two unsigned); block == tile_len as
+        // required.
+        unsafe { self.prep_cumsum_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 
     /// `gdn_chunkwise_ut_build_f32`: grid = `(num_v_heads, tile_len, 1)`,
