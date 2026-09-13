@@ -76,6 +76,27 @@ ROCm 7.2.4 + gfx1101 combination even for kernels that clearly use LDS
 (`gdn_chunkwise_*`'s in-LDS triangular-inverse solve) — a rocprofv3
 reporting gap on this target, not a real zero; don't trust that column here.
 
+**Gotcha: `Grid_Size_X`/`Workgroup_Size_X` alone don't give you total block
+count for a multi-dimensional grid.** `Grid_Size_X`/`Y`/`Z` in the kernel
+trace CSV are each `gridDim.<dim> * blockDim.<dim>` (total *threads* along
+that one axis), not blocks — `Grid_Size_X / Workgroup_Size_X` only recovers
+the true block count when `gridDim.y == gridDim.z == 1`. For a kernel
+launched with a 2D grid (e.g. `gdn_chunkwise_ut_build_f32`'s
+`grid=(num_v_heads, tile_len, 1)`), the real block count is
+`(Grid_Size_X/Workgroup_Size_X) * (Grid_Size_Y/Workgroup_Size_Y)` — computing
+it from the X axis alone silently drops the `Grid_Size_Y` factor and
+undercounts by exactly that multiplier. This bit a prior round's analysis
+(`docs/prefill-gap-analysis.md`'s `gdn-recur` write-up claimed "every one of
+these six kernels launches a grid of exactly 32 blocks" from an X-axis-only
+read; four of the six actually launch `num_v_heads * tile_len` = 4096 blocks
+via `gridDim.y`, confirmed both by re-deriving from the launch configs in
+`gdn_chunkwise_kernels.rs` and by a real `--pmc OccupancyPercent` run showing
+~75% occupancy on those four vs. ~5% on the two that are genuinely
+32-block — see the `gdn-recur-occupancy` round's notes in `.claude/CLAUDE.md`
+for the corrected picture). Always multiply out every non-1 grid dimension,
+or cross-check with `--pmc OccupancyPercent` directly, before concluding a
+kernel is block-count-starved.
+
 For occupancy specifically, `-L`/`--list-avail` lists derived counters —
 `OccupancyPercent` (`100*reduce(SQ_WAVE_CYCLES,sum)/reduce(GRBM_GUI_ACTIVE,max)/CU_NUM/32`)
 is the one to use, collected with `--pmc` and (to keep the trace small)
@@ -122,7 +143,7 @@ report next to a `rocprofv3 --stats` table requires knowing which is which:
 | `AttnDecode` (qwen35 chunked **prefill**) | `attention_chunk.rs` | `scatter_kv_chunk[_f16]` + `attn_prefill_flash[_f16]` (`attn_prefill_flash_partial_f16` + `attn_prefill_flash_reduce_f32`) — **a different kernel family from the decode case above, reusing the same `OpKind`** (see the gotcha below) |
 | `AttnOut` | attention output projection | `gemm_xwt_{wmma_,}q*`/`gemv_q*` + residual add |
 | `GdnConv` | `gdn_chunk.rs` | **bundled**: `attn_qkv`/`attn_gate`/`ssm_alpha`/`ssm_beta` input-projection GEMMs + `causal_conv1d_chunk_f32` + `causal_conv1d_chunk_state_update_f32` + `gdn_gate_chunk_f32` |
-| `GdnRecur` | `gdn_chunkwise_step` | `gdn_chunkwise_{prep,ut_build,tinv,uv_vnew,output,state}_f32` (six kernels, clean 1:1 with this span — not bundled with anything else) |
+| `GdnRecur` | `gdn_chunkwise_step` | `gdn_chunkwise_{prep_point,prep_cumsum,ut_build,tinv,uv_vnew,output,state}_f32` (seven kernels since the `gdn-recur-occupancy` round split `prep` in two — clean 1:1 with this span, not bundled with anything else) |
 | `GdnOut` | GDN output projection | `rmsnorm_f32` + `gemm_xwt_{wmma_,}q*`/`gemv_q*` (ssm_out) |
 | `FfnGateUp` | `ffn_chunk.rs`/`ffn.rs` | gate+up `gemm_xwt_{wmma_,}q*`/`gemv_q*` (two GEMMs) + `silu_mul_f32` |
 | `FfnDown` | `ffn_chunk.rs`/`ffn.rs` | down-projection `gemm_xwt_{wmma_,}q*`/`gemv_q*` |
