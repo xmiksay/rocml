@@ -221,6 +221,7 @@ pub fn run_chunkwise_gpu(
     let k_beta = DeviceBuffer::<f32>::new((t * sk * h) as usize).unwrap();
     let g_cum = DeviceBuffer::<f32>::new((t * h) as usize).unwrap();
     let cum_decay_exp = DeviceBuffer::<f32>::new((t * h) as usize).unwrap();
+    let state_decay = DeviceBuffer::<f32>::new((t * h) as usize).unwrap();
     let kb = DeviceBuffer::<f32>::new((t * t * h) as usize).unwrap();
     let kq = DeviceBuffer::<f32>::new((t * t * h) as usize).unwrap();
     let v_new = DeviceBuffer::<f32>::new((t * sv * h) as usize).unwrap();
@@ -235,6 +236,7 @@ pub fn run_chunkwise_gpu(
     let k_beta_p: *mut c_void = k_beta.device_ptr();
     let g_cum_p: *mut c_void = g_cum.device_ptr();
     let cde_p: *mut c_void = cum_decay_exp.device_ptr();
+    let sd_p: *mut c_void = state_decay.device_ptr();
     let kb_p: *mut c_void = kb.device_ptr();
     let kq_p: *mut c_void = kq.device_ptr();
     let vnew_p: *mut c_void = v_new.device_ptr();
@@ -261,7 +263,7 @@ pub fn run_chunkwise_gpu(
             block: (t, 1, 1),
             shared_mem_bytes: t * 4,
         };
-        let mut params = kernel_params!(g_p, g_cum_p, cde_p, h, t);
+        let mut params = kernel_params!(g_p, g_cum_p, cde_p, sd_p, h, t);
         unsafe { k.prep_cumsum.launch(&cfg, &mut params, None) }
             .expect("prep_cumsum launch failed");
     }
@@ -318,7 +320,7 @@ pub fn run_chunkwise_gpu(
             block: (sv, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut params = kernel_params!(k_norm_p, g_cum_p, vnew_p, state_p, h, sk, sv, t);
+        let mut params = kernel_params!(k_norm_p, cde_p, sd_p, vnew_p, state_p, h, sk, sv, t);
         unsafe { k.state_update.launch(&cfg, &mut params, None) }
             .expect("state_update launch failed");
     }

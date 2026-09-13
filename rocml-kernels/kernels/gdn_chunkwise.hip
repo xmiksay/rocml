@@ -94,6 +94,10 @@
 // possibly-partial, chunk of a prompt works unchanged.
 #include <hip/hip_runtime.h>
 
+namespace {
+typedef float float4_t __attribute__((ext_vector_type(4)));
+} // namespace
+
 // Stage A (`gdn_chunkwise_prep_{point,cumsum}_f32`) lives in
 // `gdn_chunkwise_prep.hip`, split out purely for the 400-line cap once it
 // became two kernels — see this file's module doc above and that file's own
@@ -142,7 +146,30 @@ extern "C" __global__ void gdn_chunkwise_ut_build_f32(
         float dot_kb = 0.0f, dot_kq = 0.0f;
         if (j < tile_len) {
             const float* k_j = head_k_norm + (size_t)j * head_k_dim;
-            for (unsigned d = lane; d < head_k_dim; d += 32) {
+            // Vectorized 32-wide reduction (per-wave-efficiency lever, gdn
+            // round): each lane covers a contiguous 4-wide group starting at
+            // `lane*4`, striding by `32*4`=128 — one float4 load per operand
+            // per group instead of 4 scalar loads. Generic for any
+            // `head_k_dim` (including this pipeline's smallest test shapes,
+            // 8/16/32): a lane whose group doesn't fully fit falls through to
+            // the scalar remainder loop below, picking up exactly where the
+            // vectorized loop left off — every element still gets covered by
+            // exactly one lane, vectorized or not (worked out by
+            // construction: consecutive lanes' 4-wide groups tile
+            // `head_k_dim` with no gaps or overlap). `memcpy` avoids relying
+            // on 16-byte alignment (a row start isn't guaranteed aligned when
+            // `head_k_dim % 4 != 0`) — same technique
+            // `gemm_xwt_wmma_impl.h`'s X-tile vectorized load uses.
+            unsigned d = lane * 4;
+            for (; d + 4 <= head_k_dim; d += 128) {
+                float4_t k4, kb4, q4;
+                memcpy(&k4, k_j + d, sizeof(float4_t));
+                memcpy(&kb4, kb_i + d, sizeof(float4_t));
+                memcpy(&q4, q_i + d, sizeof(float4_t));
+                dot_kb += kb4[0] * k4[0] + kb4[1] * k4[1] + kb4[2] * k4[2] + kb4[3] * k4[3];
+                dot_kq += q4[0] * k4[0] + q4[1] * k4[1] + q4[2] * k4[2] + q4[3] * k4[3];
+            }
+            for (; d < head_k_dim; ++d) {
                 float kjd = k_j[d];
                 dot_kb += kb_i[d] * kjd;
                 dot_kq += q_i[d] * kjd;
@@ -316,26 +343,37 @@ extern "C" __global__ void gdn_chunkwise_output_f32(
 // `head_k_dim`), `blockDim.x == head_v_dim`. `state` is mutated in place —
 // safe since each thread only ever reads/writes its own `[head, k, d]`
 // element (the `v_new`/`k_norm` reduction over `t` never touches `state`).
+//
+// `chunk_decay`/`gdiff[t]` used to be recomputed by every one of this
+// kernel's `head_v_dim * head_k_dim` threads (16384 at Ornith's shape) even
+// though neither depends on `d` (this thread) or `k` (this block) — only on
+// `(head, t)`, of which only `num_v_heads * tile_len` (4096) distinct values
+// exist. `gdn_chunkwise_prep_cumsum_f32` (`gdn_chunkwise_prep.hip`) now
+// computes both once (see that kernel's doc comment: bit-identical to what
+// this kernel used to compute inline, not a reformulation) — `cum_decay_exp`
+// already existed for stage B/D+E/F's own use, and `chunk_decay ==
+// cum_decay_exp[tile_len-1]` exactly (same `expf(g_cum[tile_len-1])` this
+// kernel used to redo itself); `state_decay[t]` is `gdiff[t]`'s new home.
 extern "C" __global__ void gdn_chunkwise_state_f32(
-    const float* k_norm, const float* g_cum, const float* v_new, float* state,
-    unsigned num_v_heads, unsigned head_k_dim, unsigned head_v_dim, unsigned tile_len) {
+    const float* k_norm, const float* cum_decay_exp, const float* state_decay, const float* v_new,
+    float* state, unsigned num_v_heads, unsigned head_k_dim, unsigned head_v_dim,
+    unsigned tile_len) {
     unsigned head = blockIdx.x;
     unsigned k = blockIdx.y;
     unsigned d = threadIdx.x;
     if (head >= num_v_heads || k >= head_k_dim || d >= head_v_dim) {
         return;
     }
-    const float* head_g_cum = g_cum + (size_t)head * tile_len;
+    const float* head_cde = cum_decay_exp + (size_t)head * tile_len;
+    const float* head_state_decay = state_decay + (size_t)head * tile_len;
     const float* head_k_norm = k_norm + (size_t)head * tile_len * head_k_dim;
     const float* head_v_new = v_new + (size_t)head * tile_len * head_v_dim;
-    float g_last = head_g_cum[tile_len - 1];
-    float chunk_decay = expf(g_last);
+    float chunk_decay = head_cde[tile_len - 1];
 
     float acc = 0.0f;
     for (unsigned t = 0; t < tile_len; ++t) {
         float kn = head_k_norm[t * head_k_dim + k];
-        float gdiff = expf(g_last - head_g_cum[t]);
-        acc += kn * gdiff * head_v_new[t * head_v_dim + d];
+        acc += kn * head_state_decay[t] * head_v_new[t * head_v_dim + d];
     }
     float* s = state + (size_t)head * head_k_dim * head_v_dim + (size_t)k * head_v_dim + d;
     *s = *s * chunk_decay + acc;

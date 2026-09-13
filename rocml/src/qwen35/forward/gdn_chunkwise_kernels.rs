@@ -128,11 +128,15 @@ impl GdnChunkwiseKernels {
     /// exactly (the in-kernel Hillis-Steele g-cumsum scan needs every thread
     /// index `< tile_len` present and no more). Independent of
     /// [`Self::prep_point`] — no ordering requirement between the two.
+    /// `state_decay` (per-wave-efficiency round, gdn) is `exp(g_last -
+    /// g_cum[t])`, computed once here instead of redundantly inside
+    /// `gdn_chunkwise_state_f32` — see that kernel's doc comment.
     pub fn prep_cumsum(
         &self,
         g: DevPtr,
         g_cum: DevPtr,
         cum_decay_exp: DevPtr,
+        state_decay: DevPtr,
         num_v_heads: u32,
         tile_len: u32,
     ) -> Result<(), RocmlError> {
@@ -141,10 +145,11 @@ impl GdnChunkwiseKernels {
             block: (tile_len, 1, 1),
             shared_mem_bytes: tile_len * size_of_f32(),
         };
-        let mut params = kernel_params!(g, g_cum, cum_decay_exp, num_v_heads, tile_len);
+        let mut params =
+            kernel_params!(g, g_cum, cum_decay_exp, state_decay, num_v_heads, tile_len);
         // SAFETY: params matches gdn_chunkwise_prep_cumsum_f32's signature
-        // (one const float*, two float*, two unsigned); block == tile_len as
-        // required.
+        // (one const float*, three float*, two unsigned); block == tile_len
+        // as required.
         unsafe { self.prep_cumsum_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 
@@ -292,12 +297,16 @@ impl GdnChunkwiseKernels {
     }
 
     /// `gdn_chunkwise_state_f32`: grid = `(num_v_heads, head_k_dim, 1)`,
-    /// block = `(head_v_dim, 1, 1)`. Mutates `state` in place.
+    /// block = `(head_v_dim, 1, 1)`. Mutates `state` in place. Takes
+    /// `cum_decay_exp`/`state_decay` (both from [`Self::prep_cumsum`]) in
+    /// place of the raw `g_cum` the kernel used to take and re-derive
+    /// `chunk_decay`/`gdiff` from itself — see the kernel's doc comment.
     #[allow(clippy::too_many_arguments)]
     pub fn state_update(
         &self,
         k_norm: DevPtr,
-        g_cum: DevPtr,
+        cum_decay_exp: DevPtr,
+        state_decay: DevPtr,
         v_new: DevPtr,
         state: DevPtr,
         num_v_heads: u32,
@@ -312,7 +321,8 @@ impl GdnChunkwiseKernels {
         };
         let mut params = kernel_params!(
             k_norm,
-            g_cum,
+            cum_decay_exp,
+            state_decay,
             v_new,
             state,
             num_v_heads,
@@ -320,7 +330,7 @@ impl GdnChunkwiseKernels {
             head_v_dim,
             tile_len
         );
-        // SAFETY: params matches gdn_chunkwise_state_f32's signature (three
+        // SAFETY: params matches gdn_chunkwise_state_f32's signature (four
         // const float*, float*, four unsigned).
         unsafe { self.state_fn.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }

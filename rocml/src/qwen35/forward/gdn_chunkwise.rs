@@ -67,6 +67,7 @@ fn run_tile(
     let k_beta = offset(&scratch.gdn_cw_k_beta, 0);
     let g_cum = offset(&scratch.gdn_cw_g_cum, 0);
     let cum_decay_exp = offset(&scratch.gdn_cw_cum_decay_exp, 0);
+    let state_decay = offset(&scratch.gdn_cw_state_decay, 0);
     let kb = offset(&scratch.gdn_cw_kb, 0);
     let kq = offset(&scratch.gdn_cw_kq, 0);
     let v_new = offset(&scratch.gdn_cw_v_new, 0);
@@ -86,7 +87,7 @@ fn run_tile(
         tile_len,
         L2_NORM_EPS,
     )?;
-    cw.prep_cumsum(g, g_cum, cum_decay_exp, h, tile_len)?;
+    cw.prep_cumsum(g, g_cum, cum_decay_exp, state_decay, h, tile_len)?;
     cw.ut_build(q_norm, k_norm, k_beta, g_cum, kb, kq, h, sk, tile_len)?;
     cw.tinv(kb, h, tile_len)?;
     cw.uv_vnew(
@@ -117,5 +118,15 @@ fn run_tile(
         sv,
         tile_len,
     )?;
-    cw.state_update(k_norm, g_cum, v_new, state_ptr, h, sk, sv, tile_len)
+    cw.state_update(
+        k_norm,
+        cum_decay_exp,
+        state_decay,
+        v_new,
+        state_ptr,
+        h,
+        sk,
+        sv,
+        tile_len,
+    )
 }

@@ -57,8 +57,12 @@ pub struct ChunkScratch {
     pub gdn_cw_k_beta: DeviceBuffer<f32>,
     pub gdn_cw_g_cum: DeviceBuffer<f32>, // [num_v_heads, tile]
     pub gdn_cw_cum_decay_exp: DeviceBuffer<f32>, // [num_v_heads, tile]
-    pub gdn_cw_kb: DeviceBuffer<f32>,    // [num_v_heads, tile, tile] (becomes Tinv in place)
-    pub gdn_cw_kq: DeviceBuffer<f32>,    // [num_v_heads, tile, tile]
+    // `exp(g_last - g_cum[t])`, precomputed once per (head, t) instead of
+    // redundantly inside `gdn_chunkwise_state_f32` — per-wave-efficiency
+    // round (gdn), see that kernel's doc comment.
+    pub gdn_cw_state_decay: DeviceBuffer<f32>, // [num_v_heads, tile]
+    pub gdn_cw_kb: DeviceBuffer<f32>,          // [num_v_heads, tile, tile] (becomes Tinv in place)
+    pub gdn_cw_kq: DeviceBuffer<f32>,          // [num_v_heads, tile, tile]
     pub gdn_cw_v_new: DeviceBuffer<f32>,
 
     // Full-attention layer scratch, `[CHUNK_CAP, ...]`.
@@ -165,6 +169,7 @@ impl ChunkScratch {
             gdn_cw_k_beta: DeviceBuffer::new(tile * head_k_dim * num_v_heads)?,
             gdn_cw_g_cum: DeviceBuffer::new(tile * num_v_heads)?,
             gdn_cw_cum_decay_exp: DeviceBuffer::new(tile * num_v_heads)?,
+            gdn_cw_state_decay: DeviceBuffer::new(tile * num_v_heads)?,
             gdn_cw_kb: DeviceBuffer::new(tile * tile * num_v_heads)?,
             gdn_cw_kq: DeviceBuffer::new(tile * tile * num_v_heads)?,
             gdn_cw_v_new: DeviceBuffer::new(tile * head_v_dim * num_v_heads)?,

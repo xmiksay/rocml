@@ -102,8 +102,22 @@ extern "C" __global__ void gdn_chunkwise_prep_point_f32(
 // so `blockDim.x` must equal `tile_len` exactly (not just `>=`). Independent
 // of `gdn_chunkwise_prep_point_f32` above (reads only `g`) — the two may run
 // in either order.
+// `state_decay[head,t] = exp(g_last - g_cum[t])` (per-wave-efficiency lever,
+// gdn round): the state-update kernel (`gdn_chunkwise_state_f32`,
+// `gdn_chunkwise.hip`) used to recompute this exact quantity itself, once per
+// thread per reduction step — but the value depends only on `(head, t)`, not
+// on that kernel's `d`/`k` thread and block indices, so it was being
+// recomputed `head_v_dim * head_k_dim` (16384 at Ornith's shape) times more
+// often than the `num_v_heads * tile_len` (4096) distinct values that
+// actually exist. Computing it once here (this kernel already holds both
+// `sh_g[t]` and `sh_g[tile_len-1]` in shared memory from the scan above) and
+// having the state kernel just read it back is a pure redundant-computation
+// elimination, not a reformulation: same two operands, same subtraction,
+// same `expf` — bit-identical to what the state kernel used to compute
+// inline, not merely numerically close.
 extern "C" __global__ void gdn_chunkwise_prep_cumsum_f32(
-    const float* g, float* g_cum, float* cum_decay_exp, unsigned num_v_heads, unsigned tile_len) {
+    const float* g, float* g_cum, float* cum_decay_exp, float* state_decay,
+    unsigned num_v_heads, unsigned tile_len) {
     unsigned head = blockIdx.x;
     unsigned t = threadIdx.x;
     if (head >= num_v_heads || t >= tile_len) {
@@ -121,6 +135,8 @@ extern "C" __global__ void gdn_chunkwise_prep_cumsum_f32(
         sh_g[t] += add;
         __syncthreads();
     }
+    float g_last = sh_g[tile_len - 1];
     g_cum[(size_t)head * tile_len + t] = sh_g[t];
     cum_decay_exp[(size_t)head * tile_len + t] = expf(sh_g[t]);
+    state_decay[(size_t)head * tile_len + t] = expf(g_last - sh_g[t]);
 }
