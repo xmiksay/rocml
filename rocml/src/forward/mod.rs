@@ -10,6 +10,7 @@ pub(crate) mod kernels_flash;
 pub(crate) mod kernels_kv;
 pub(crate) mod kernels_mmq;
 pub(crate) mod kernels_quant;
+mod kernels_quant_dispatch;
 mod scratch;
 
 use std::path::Path;

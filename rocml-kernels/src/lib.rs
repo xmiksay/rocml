@@ -177,6 +177,25 @@ pub const GEMM_XWT_WMMA_Q5_K_KERNEL: &str = "gemm_xwt_wmma_q5_k";
 pub const GEMM_XWT_WMMA_Q6_K_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_HSACO;
 pub const GEMM_XWT_WMMA_Q6_K_KERNEL: &str = "gemm_xwt_wmma_q6_k";
 
+/// `kernels/gemm_xwt_quant_wmma_narrow.hip`: same contract as the
+/// `GEMM_XWT_WMMA_Q*` kernels above, but built with the narrower
+/// TILE_M=64/WARPS_M=8/WARPS_N=2 tile config (the original 1x2-fragment
+/// layout, before the per-wave-efficiency round's TILE_M=128 rewrite) —
+/// see that file's module doc for the shape-aware dispatch round's
+/// measured `m`-crossover. `rocml/src/forward/kernels_quant.rs` dispatches
+/// here for `m < 2048`.
+pub const GEMM_XWT_WMMA_Q8_0_NARROW_HSACO: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/gemm_xwt_quant_wmma_narrow.hsaco"
+));
+pub const GEMM_XWT_WMMA_Q8_0_NARROW_KERNEL: &str = "gemm_xwt_wmma_q8_0_narrow";
+pub const GEMM_XWT_WMMA_Q4_K_NARROW_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_NARROW_HSACO;
+pub const GEMM_XWT_WMMA_Q4_K_NARROW_KERNEL: &str = "gemm_xwt_wmma_q4_k_narrow";
+pub const GEMM_XWT_WMMA_Q5_K_NARROW_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_NARROW_HSACO;
+pub const GEMM_XWT_WMMA_Q5_K_NARROW_KERNEL: &str = "gemm_xwt_wmma_q5_k_narrow";
+pub const GEMM_XWT_WMMA_Q6_K_NARROW_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_NARROW_HSACO;
+pub const GEMM_XWT_WMMA_Q6_K_NARROW_KERNEL: &str = "gemm_xwt_wmma_q6_k_narrow";
+
 /// `kernels/chunk_reshape.hip`: small batched reshape/broadcast kernels the
 /// chunked-prefill forward pass needs (per-head extraction, batched KV-cache
 /// append, the GDN gate's per-token broadcast). All three share one code
