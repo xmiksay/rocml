@@ -316,24 +316,37 @@ pub const QUANTIZE_ACT_Q8_BLK_HSACO: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/quantize_act_q8.hsaco"));
 pub const QUANTIZE_ACT_Q8_BLK_KERNEL: &str = "quantize_act_q8_blk";
 
-/// `kernels/gemm_xwt_quant_mmq.hip`: int8 MMQ-style prefill GEMM for Q8_0-
-/// and Q4_K-quantized weights (WMMA-pipeline round, issue #6 lever 2
-/// prototype — see the kernel source's module doc for why Q5_K/Q6_K aren't
-/// implemented here). Consumes `quantize_act_q8_blk`'s int8 code/scale/sum
-/// output directly (never a raw f32 `X`). Launch with `block = (32, 16,
-/// 1)`, `grid = (ceil(m/64), ceil(rows/128), 1)`; Q8_0's dynamic shared
-/// memory is `(128*32 + 64*32 + 128*4 + 64*4)` bytes, Q4_K's an extra
-/// `(128 + 64)*4` bytes for the two additional per-(row,col) scale/offset
-/// lookup tables (see the kernel source for the exact LDS layout).
-/// Correctness-tested (`rocml-kernels/tests/gemm_xwt_quant_mmq*.rs`) and
-/// perf-measured (`gemm_xwt_quant_mmq*_perf.rs`) standalone; **not yet
-/// wired into `Model`'s forward-pass dispatch** — see the WMMA-pipeline
-/// round's report for why (end-to-end integration needs new
-/// `ChunkScratch` buffers, a `LinearWeight::matmul` dispatch change, and a
-/// full parity/agentic-eval re-run this round didn't have budget left to
-/// do safely).
+/// `kernels/gemm_xwt_quant_mmq_q{8_0,4_k,5_k,6_k}.hip`: int8 MMQ-style
+/// prefill GEMM for every raw-quant weight kind this crate supports
+/// (WMMA-pipeline round, issue #6 lever 2 prototyped Q8_0/Q4_K; the
+/// int8-MMQ-integration round added Q5_K/Q6_K and split what was one
+/// combined `gemm_xwt_quant_mmq.hip` into one file per family — sharing
+/// tile geometry/fragment helpers via `kernels/mmq_common.h` — once adding
+/// the two new variants would have pushed it past the 400-line cap).
+/// Consumes `quantize_act_q8_blk`'s int8 code/scale/(sum) output directly
+/// (never a raw f32 `X`); Q4_K/Q5_K (affine, need the min-offset-cancelling
+/// block sum) and Q8_0/Q6_K (symmetric, no sum needed) have different
+/// signatures — see `rocml/src/forward/kernels_quant.rs`'s `gemm_mmq` for
+/// the exact per-dtype parameter lists. Launch with `block = (32, 16, 1)`,
+/// `grid = (ceil(m/64), ceil(rows/128), 1)`; dynamic shared memory is
+/// `(128*32 + 64*32 + 128*4 + 64*4)` bytes for Q8_0, an extra `(128 +
+/// 64)*4` bytes for Q4_K/Q5_K's two additional per-(row,col) scale/offset
+/// lookup tables, and `(128*32 + 64*32 + 128*4 + 64*4*2)` for Q6_K (one
+/// `d_a` table but two `d_w` scales per column — see that kernel's module
+/// doc for why). Correctness-tested
+/// (`rocml-kernels/tests/gemm_xwt_quant_mmq*.rs`) against f64 CPU
+/// references and wired into `Model`'s chunked-prefill dispatch behind
+/// `LoadOptions::with_mmq` — see `kernels_quant.rs`'s module doc for the
+/// dispatch policy and default-on/flagged status.
 pub const GEMM_XWT_MMQ_Q8_0_HSACO: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_xwt_quant_mmq.hsaco"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_xwt_quant_mmq_q8_0.hsaco"));
 pub const GEMM_XWT_MMQ_Q8_0_KERNEL: &str = "gemm_xwt_mmq_q8_0";
-pub const GEMM_XWT_MMQ_Q4_K_HSACO: &[u8] = GEMM_XWT_MMQ_Q8_0_HSACO;
+pub const GEMM_XWT_MMQ_Q4_K_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_xwt_quant_mmq_q4_k.hsaco"));
 pub const GEMM_XWT_MMQ_Q4_K_KERNEL: &str = "gemm_xwt_mmq_q4_k";
+pub const GEMM_XWT_MMQ_Q5_K_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_xwt_quant_mmq_q5_k.hsaco"));
+pub const GEMM_XWT_MMQ_Q5_K_KERNEL: &str = "gemm_xwt_mmq_q5_k";
+pub const GEMM_XWT_MMQ_Q6_K_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_xwt_quant_mmq_q6_k.hsaco"));
+pub const GEMM_XWT_MMQ_Q6_K_KERNEL: &str = "gemm_xwt_mmq_q6_k";
