@@ -17,14 +17,32 @@ use crate::qwen35::cache::AttnLayerCache;
 use crate::qwen35::config::LayerKind;
 use crate::qwen35::weights::LayerWeights;
 
-/// Prompt-chunk size `generate` drives the hybrid forward pass with, chosen
-/// by measurement among {128, 256, 512} on Qwen3.5-2B `bench --depth 2048`
-/// (see issue #6's report): 246/241/239 tok/s respectively — a small but
-/// consistent edge for the smallest chunk, since this GEMM/GDN-chunk-kernel
-/// implementation isn't yet compute-bound enough at these depths for a
-/// bigger chunk's better per-launch amortization to outweigh its slightly
-/// larger constant-ish per-token kernel overhead.
-pub const PREFILL_CHUNK_SIZE: u32 = 128;
+/// Prompt-chunk size `generate` drives the hybrid forward pass with.
+/// Originally chosen as 128 by measurement among {128, 256, 512} on
+/// Qwen3.5-2B `bench --depth 2048` back when the GEMM path was still
+/// scalar-FMA (issue #6's original report: 246/241/239 tok/s respectively —
+/// not yet compute-bound enough for a bigger chunk's launch-overhead
+/// amortization to outweigh its slightly larger per-token kernel overhead).
+/// Re-swept on the WMMA-pipeline round: the WMMA GEMM kernel tiles rows
+/// internally in fixed 128-row tiles regardless of chunk size (a bigger
+/// chunk here just means more row-tiles per launch, not a kernel change),
+/// and every batched kernel this touches (GDN conv/chunkwise-recurrence,
+/// attention, FFN) was already sized/looped for up to `CHUNK_CAP` (512)
+/// tokens (`chunk_scratch.rs`) — so growing this constant needed no other
+/// code change. Measured end-to-end on ornith-9b (Q4_K_M) `bench --depth
+/// {2048,8192}` (median of 3 runs, decode unaffected either way):
+///   128 -> 256 -> 512 tok/s @ 2048: 466.3 -> 528.8 -> 587.0
+///   128 -> 256 -> 512 tok/s @ 8192: 403.5 -> 450.1 -> 489.8
+/// 512 wins outright at both depths (launch-overhead amortization keeps
+/// paying off all the way to `CHUNK_CAP`, unlike the scalar-kernel-era
+/// sweep above) with no VRAM cost (`ChunkScratch` was already allocated at
+/// `CHUNK_CAP` regardless of this constant) and no GDN chunkwise-recurrence
+/// code change needed (`gdn_chunkwise_step` already sub-chunks any
+/// `chunk_len > GDN_RECUR_TILE`(128) into 128-token tiles, carrying state
+/// between them — this was written for `forward_chunk`'s documented
+/// `1..=CHUNK_CAP` contract from the start, just never previously exercised
+/// beyond one tile per call).
+pub const PREFILL_CHUNK_SIZE: u32 = 512;
 
 impl Model {
     /// Splits `prompt_ids` (non-empty) into `PREFILL_CHUNK_SIZE`-token
