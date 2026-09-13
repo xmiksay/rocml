@@ -50,6 +50,25 @@
 // native tile width) or `rows` too small to amortize a whole `TILE_ROWS`
 // tile are refused by the dispatch layer, not handled here — see
 // `rocml/src/forward/kernels_quant.rs`.
+//
+// Software pipelining (WMMA-pipeline round, issue #6 follow-up): the
+// straight-line version above staged the K-tile into one LDS buffer, then
+// paid *two* `__syncthreads()` per outer iteration — one so every thread's
+// dequant-to-LDS stores were visible before any WMMA op read them, a second
+// so every thread's WMMA reads were done before the next iteration
+// overwrote the same buffer. Neither the dequant/staging work nor the WMMA
+// math depends on the other tile's *data*, only on write-then-read
+// ordering into the *same* addresses — so double-buffering (`x_tile`/
+// `w_tile` each become a `[2]` array) lets the next stage's global loads +
+// dequant + LDS stores for buffer `1-cur` run declared right next to the
+// current stage's WMMA math against buffer `cur`, with only one
+// `__syncthreads()` per iteration instead of two: it both publishes the
+// just-filled `1-cur` buffer for the *next* iteration's WMMA reads, and
+// guarantees this iteration's WMMA reads of `cur` are done before `cur`
+// gets overwritten as the *next* next-buffer two iterations later. A
+// one-time prologue fills buffer 0 before the loop starts. Measured impact:
+// see `tests/gemm_xwt_quant_wmma_perf.rs`'s module doc for before/after
+// GFLOP/s at rows={128,512}, m=12288, n=4096.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -98,6 +117,46 @@ __device__ __forceinline__ half16 load_row_frag(
     return frag;
 }
 
+// Dequant-and-stage one K-tile (`x_tile`/`w_tile`, whichever buffer the
+// caller passes) starting at reduction offset `k0`. Pulled out of
+// `gemm_xwt_wmma_impl` so the pipelined loop below can call it identically
+// for the prologue fill and every steady-state next-buffer fill.
+template <unsigned QK, unsigned BLOCK_BYTES, typename DequantFn>
+__device__ __forceinline__ void stage_k_tile(
+    _Float16* x_tile, _Float16* w_tile, const float* x, const unsigned char* w, unsigned row_base,
+    unsigned col_base, unsigned rows, unsigned m, unsigned n, unsigned blocks_per_row,
+    unsigned k0, unsigned tid, DequantFn dequant_elem) {
+    unsigned elems_here = min(K_STAGE, n - k0);
+
+    // Cooperative stage: X tile (TILE_ROWS x K_STAGE) and W tile
+    // (TILE_M x K_STAGE, dequantized on the fly) — a few elements per
+    // thread each at the tile sizes above (2048/1024 elements over 512
+    // threads).
+    for (unsigned idx = tid; idx < TILE_ROWS * K_STAGE; idx += WARPS_PER_BLOCK * 32) {
+        unsigned r = idx / K_STAGE;
+        unsigned koff = idx % K_STAGE;
+        unsigned row = row_base + r;
+        unsigned row_c = row < rows ? row : rows - 1;
+        float v = koff < elems_here ? x[(size_t)row_c * n + k0 + koff] : 0.0f;
+        x_tile[idx] = (_Float16)v;
+    }
+    for (unsigned idx = tid; idx < TILE_M * K_STAGE; idx += WARPS_PER_BLOCK * 32) {
+        unsigned r = idx / K_STAGE;
+        unsigned koff = idx % K_STAGE;
+        unsigned col = col_base + r;
+        unsigned col_c = col < m ? col : m - 1;
+        float v = 0.0f;
+        if (koff < elems_here) {
+            unsigned k_global = k0 + koff;
+            unsigned blk = k_global / QK;
+            unsigned e = k_global % QK;
+            const unsigned char* bptr = w + ((size_t)col_c * blocks_per_row + blk) * BLOCK_BYTES;
+            v = dequant_elem(bptr, e);
+        }
+        w_tile[idx] = (_Float16)v;
+    }
+}
+
 template <unsigned QK, unsigned BLOCK_BYTES, typename DequantFn>
 __device__ __forceinline__ void gemm_xwt_wmma_impl(
     const float* x, const unsigned char* w, float* out, unsigned rows, unsigned m, unsigned n,
@@ -111,9 +170,18 @@ __device__ __forceinline__ void gemm_xwt_wmma_impl(
     unsigned wn = warp % WARPS_N;
     unsigned blocks_per_row = n / QK;
 
+    constexpr unsigned X_TILE_ELEMS = TILE_ROWS * K_STAGE;
+    constexpr unsigned W_TILE_ELEMS = TILE_M * K_STAGE;
     extern __shared__ _Float16 smem[];
-    _Float16* x_tile = smem;
-    _Float16* w_tile = smem + (size_t)TILE_ROWS * K_STAGE;
+    // Double-buffered: buffer 0 then buffer 1, X tile then W tile within
+    // each — see the module doc's "Software pipelining" section. Plain base
+    // pointers plus `buf * ELEMS` offsets rather than a `_Float16*[2]`
+    // array: hipcc/LLVM tried to promote a local array-of-pointers-into-LDS
+    // to a static initializer and failed to lower the resulting
+    // addrspace(3) addrspacecast ("unsupported expression in static
+    // initializer") — this form sidesteps that entirely.
+    _Float16* x_base = smem;
+    _Float16* w_base = smem + 2 * X_TILE_ELEMS;
 
     float8 acc[SUBCOLS_PER_WARP];
 #pragma unroll
@@ -121,39 +189,31 @@ __device__ __forceinline__ void gemm_xwt_wmma_impl(
         acc[c] = {0, 0, 0, 0, 0, 0, 0, 0};
     }
 
+    // Prologue: fill buffer 0 with the first K-stage before the loop starts.
+    stage_k_tile<QK, BLOCK_BYTES>(
+        x_base, w_base, x, w, row_base, col_base, rows, m, n, blocks_per_row, 0, tid,
+        dequant_elem);
+    __syncthreads();
+
+    unsigned cur = 0;
     for (unsigned k0 = 0; k0 < n; k0 += K_STAGE) {
-        unsigned elems_here = min(K_STAGE, n - k0);
-
-        // Cooperative stage: X tile (TILE_ROWS x K_STAGE) and W tile
-        // (TILE_M x K_STAGE, dequantized on the fly) — a few elements per
-        // thread each at the tile sizes above (2048/1024 elements over 512
-        // threads).
-        for (unsigned idx = tid; idx < TILE_ROWS * K_STAGE; idx += WARPS_PER_BLOCK * 32) {
-            unsigned r = idx / K_STAGE;
-            unsigned koff = idx % K_STAGE;
-            unsigned row = row_base + r;
-            unsigned row_c = row < rows ? row : rows - 1;
-            float v = koff < elems_here ? x[(size_t)row_c * n + k0 + koff] : 0.0f;
-            x_tile[idx] = (_Float16)v;
+        unsigned next_k0 = k0 + K_STAGE;
+        unsigned next = cur ^ 1;
+        // Issue the next stage's global loads/dequant/LDS stores now, ahead
+        // of consuming the current stage below — the hardware overlaps this
+        // stage's WMMA math (independent registers, independent LDS
+        // addresses) with the load/dequant latency instead of stalling on
+        // it every iteration. No sync needed here: nothing below reads
+        // `next`, only `cur` (already synced from the previous iteration or
+        // the prologue).
+        if (next_k0 < n) {
+            stage_k_tile<QK, BLOCK_BYTES>(
+                x_base + next * X_TILE_ELEMS, w_base + next * W_TILE_ELEMS, x, w, row_base,
+                col_base, rows, m, n, blocks_per_row, next_k0, tid, dequant_elem);
         }
-        for (unsigned idx = tid; idx < TILE_M * K_STAGE; idx += WARPS_PER_BLOCK * 32) {
-            unsigned r = idx / K_STAGE;
-            unsigned koff = idx % K_STAGE;
-            unsigned col = col_base + r;
-            unsigned col_c = col < m ? col : m - 1;
-            float v = 0.0f;
-            if (koff < elems_here) {
-                unsigned k_global = k0 + koff;
-                unsigned blk = k_global / QK;
-                unsigned e = k_global % QK;
-                const unsigned char* bptr =
-                    w + ((size_t)col_c * blocks_per_row + blk) * BLOCK_BYTES;
-                v = dequant_elem(bptr, e);
-            }
-            w_tile[idx] = (_Float16)v;
-        }
-        __syncthreads();
 
+        _Float16* x_tile = x_base + cur * X_TILE_ELEMS;
+        _Float16* w_tile = w_base + cur * W_TILE_ELEMS;
         for (unsigned ks = 0; ks < K_STAGE; ks += 16) {
             half16 a_frag = load_row_frag(x_tile, wm * 16, ks, lane);
 #pragma unroll
@@ -163,7 +223,12 @@ __device__ __forceinline__ void gemm_xwt_wmma_impl(
                 acc[c] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, acc[c]);
             }
         }
+        // Single sync per iteration: publishes `next`'s stores for the next
+        // iteration's WMMA reads, and guarantees this iteration's WMMA
+        // reads of `cur` finished before `cur` is overwritten as the
+        // following iteration's `next` buffer.
         __syncthreads();
+        cur = next;
     }
 
 #pragma unroll

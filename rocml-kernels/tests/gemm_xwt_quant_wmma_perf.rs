@@ -92,7 +92,9 @@ fn perf_probe(
     let cfg = LaunchConfig {
         grid: (m.div_ceil(TILE_M), rows.div_ceil(TILE_ROWS), 1),
         block: (32, WARPS_PER_BLOCK, 1),
-        shared_mem_bytes: (TILE_ROWS + TILE_M) * K_STAGE * std::mem::size_of::<u16>() as u32,
+        // x2: double-buffered LDS K-stage tiles (WMMA pipelining round) —
+        // must match `kernels_quant.rs::gemm_wmma`'s launch exactly.
+        shared_mem_bytes: 2 * (TILE_ROWS + TILE_M) * K_STAGE * std::mem::size_of::<u16>() as u32,
     };
 
     for _ in 0..WARMUP_ITERS {
@@ -121,6 +123,10 @@ fn perf_probe(
 }
 
 fn q4_k_case(label: &str, m: u32, n: u32, seed: u32) {
+    q4_k_case_rows(label, ROWS, m, n, seed);
+}
+
+fn q4_k_case_rows(label: &str, rows: u32, m: u32, n: u32, seed: u32) {
     let blocks_per_row = n as usize / K_BLOCK_ELEMS;
     let mut rng = Rng::new(seed);
     let w_bytes = build_w_bytes(
@@ -135,16 +141,20 @@ fn q4_k_case(label: &str, m: u32, n: u32, seed: u32) {
         rocml_kernels::GEMM_XWT_WMMA_Q4_K_HSACO,
         rocml_kernels::GEMM_XWT_WMMA_Q4_K_KERNEL,
         &w_bytes,
-        &make_x(ROWS, n),
+        &make_x(rows, n),
         Q4_K_BLOCK_BYTES,
         K_BLOCK_ELEMS,
-        ROWS,
+        rows,
         m,
         n,
     );
 }
 
 fn q6_k_case(label: &str, m: u32, n: u32, seed: u32) {
+    q6_k_case_rows(label, ROWS, m, n, seed);
+}
+
+fn q6_k_case_rows(label: &str, rows: u32, m: u32, n: u32, seed: u32) {
     let blocks_per_row = n as usize / K_BLOCK_ELEMS;
     let mut rng = Rng::new(seed);
     let w_bytes = build_w_bytes(
@@ -159,10 +169,10 @@ fn q6_k_case(label: &str, m: u32, n: u32, seed: u32) {
         rocml_kernels::GEMM_XWT_WMMA_Q6_K_HSACO,
         rocml_kernels::GEMM_XWT_WMMA_Q6_K_KERNEL,
         &w_bytes,
-        &make_x(ROWS, n),
+        &make_x(rows, n),
         Q6_K_BLOCK_BYTES,
         K_BLOCK_ELEMS,
-        ROWS,
+        rows,
         m,
         n,
     );
@@ -211,5 +221,34 @@ fn perf_probe_gemm_xwt_wmma_q6_k_12288() {
         12288,
         4096,
         212,
+    );
+}
+
+// rows=512 variants of the m=12288/n=4096 shape (the WMMA pipelining
+// round's before/after headline shapes — a bigger row-tile count per launch
+// is exactly what double-buffering the K-stage load is meant to help,
+// since there's more WMMA math per outer iteration to hide the next
+// stage's dequant-to-LDS latency behind).
+#[test]
+#[ignore]
+fn perf_probe_gemm_xwt_wmma_q4_k_512x12288() {
+    q4_k_case_rows(
+        "gemm_xwt_wmma_q4_k (512x4096 x 4096x12288)",
+        512,
+        12288,
+        4096,
+        220,
+    );
+}
+
+#[test]
+#[ignore]
+fn perf_probe_gemm_xwt_wmma_q6_k_512x12288() {
+    q6_k_case_rows(
+        "gemm_xwt_wmma_q6_k (512x4096 x 4096x12288)",
+        512,
+        12288,
+        4096,
+        221,
     );
 }

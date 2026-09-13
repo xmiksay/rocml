@@ -266,8 +266,9 @@ pub fn expected_gemm_wmma(
 /// Uploads `w_bytes`/`x`, launches `gemm_xwt_wmma_<type>` (`kernel_name` from
 /// `hsaco`) with the fixed `TILE_ROWS=128`/`TILE_M=64`/`K_STAGE=16` tiling
 /// `gemm_xwt_quant_wmma.hip` requires (block=(32,16,1), grid=
-/// `(ceil(m/64), ceil(rows/128), 1)`, `(128+64)*16*sizeof(f16)` bytes of
-/// dynamic shared memory), and downloads `out` (`rows x m`).
+/// `(ceil(m/64), ceil(rows/128), 1)`, `2*(128+64)*16*sizeof(f16)` bytes of
+/// dynamic shared memory — the kernel double-buffers its LDS K-stage tiles,
+/// see its module doc), and downloads `out` (`rows x m`).
 pub fn run_gemm_wmma_kernel(
     hsaco: &[u8],
     kernel_name: &str,
@@ -301,7 +302,8 @@ pub fn run_gemm_wmma_kernel(
     let cfg = LaunchConfig {
         grid: (m.div_ceil(TILE_M), rows.div_ceil(TILE_ROWS), 1),
         block: (32, WARPS_PER_BLOCK, 1),
-        shared_mem_bytes: (TILE_ROWS + TILE_M) * K_STAGE * std::mem::size_of::<u16>() as u32,
+        // x2: double-buffered LDS K-stage tiles (WMMA pipelining round).
+        shared_mem_bytes: 2 * (TILE_ROWS + TILE_M) * K_STAGE * std::mem::size_of::<u16>() as u32,
     };
     // SAFETY: params matches every gemm_xwt_wmma_<type> kernel's parameter
     // list (const float*, const void*, float*, unsigned x3) in order, and

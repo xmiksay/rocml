@@ -345,8 +345,14 @@ impl QuantKernels {
                 )))
             }
         };
-        let shared_mem_bytes =
-            (GEMM_WMMA_TILE_ROWS + GEMM_WMMA_TILE_M) * GEMM_WMMA_K_STAGE * size_of::<u16>() as u32;
+        // x2: the kernel now double-buffers its LDS K-stage tiles (WMMA
+        // software-pipelining round) to overlap the next stage's
+        // dequant-to-LDS staging with the current stage's WMMA math — see
+        // `gemm_xwt_quant_wmma.hip`'s module doc.
+        let shared_mem_bytes = 2
+            * (GEMM_WMMA_TILE_ROWS + GEMM_WMMA_TILE_M)
+            * GEMM_WMMA_K_STAGE
+            * size_of::<u16>() as u32;
         let cfg = LaunchConfig {
             grid: (
                 m.div_ceil(GEMM_WMMA_TILE_M),
