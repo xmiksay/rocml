@@ -43,12 +43,15 @@ const GEMM_QUANT_TILE_ROWS: u32 = GEMM_QUANT_WARPS_PER_BLOCK * GEMM_QUANT_ROWS_P
 /// chunk falls back to the scalar kernel).
 const GEMM_WMMA_TILE_ROWS: u32 = 128;
 /// Output columns (`W` rows) a `gemm_xwt_wmma_q*` workgroup tile covers —
-/// mirrors the kernel's `TILE_M` (fixes the launch's grid.x).
-const GEMM_WMMA_TILE_M: u32 = 64;
+/// mirrors the kernel's `TILE_M` (fixes the launch's grid.x). 128 since the
+/// per-wave-efficiency round — see `gemm_xwt_quant_wmma.hip`'s module doc.
+const GEMM_WMMA_TILE_M: u32 = 128;
 /// Reduction elements staged into LDS per outer iteration — mirrors the
-/// kernel's `K_STAGE`, used only to size the dynamic shared memory request
-/// (`(TILE_ROWS + TILE_M) * K_STAGE * sizeof(f16)`).
+/// kernel's `K_STAGE`; combined with `GEMM_WMMA_LDS_PAD` to size the LDS
+/// request (the kernel's per-row stride is padded past `K_STAGE`).
 const GEMM_WMMA_K_STAGE: u32 = 16;
+/// LDS row-stride padding — must match the kernel's `LDS_PAD` (bank-conflict elimination).
+const GEMM_WMMA_LDS_PAD: u32 = 8;
 /// Warps per `gemm_xwt_wmma_q*` workgroup — fixes the launch's block.y.
 const GEMM_WMMA_WARPS_PER_BLOCK: u32 = 16;
 
@@ -373,13 +376,10 @@ impl QuantKernels {
                 )))
             }
         };
-        // x2: the kernel now double-buffers its LDS K-stage tiles (WMMA
-        // software-pipelining round) to overlap the next stage's
-        // dequant-to-LDS staging with the current stage's WMMA math — see
-        // `gemm_xwt_quant_wmma.hip`'s module doc.
+        // x2: double-buffered LDS K-stage tiles (padded rows, see LDS_PAD).
         let shared_mem_bytes = 2
             * (GEMM_WMMA_TILE_ROWS + GEMM_WMMA_TILE_M)
-            * GEMM_WMMA_K_STAGE
+            * (GEMM_WMMA_K_STAGE + GEMM_WMMA_LDS_PAD)
             * size_of::<u16>() as u32;
         let cfg = LaunchConfig {
             grid: (

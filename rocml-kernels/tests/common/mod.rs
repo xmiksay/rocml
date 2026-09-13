@@ -296,14 +296,24 @@ pub fn run_gemm_wmma_kernel(
     let mut params = kernel_params!(x_ptr, w_ptr, out_ptr, rows, m, n);
 
     const TILE_ROWS: u32 = 128;
-    const TILE_M: u32 = 64;
+    // Per-wave-efficiency round: TILE_M doubled from 64 alongside the 2x2
+    // (subrow x subcol) per-warp accumulator tile (`WARPS_M=4, WARPS_N=4` in
+    // the kernel source, `WARPS_PER_BLOCK` unchanged at 16) — must match
+    // `gemm_xwt_quant_wmma.hip` exactly, or `threadIdx.y`/`blockIdx.x` run
+    // past the kernel's compiled-in tiling and read/write out-of-range slices.
+    const TILE_M: u32 = 128;
     const K_STAGE: u32 = 16;
+    // LDS row-stride padding (lever 2) — must match the kernel's `LDS_PAD`.
+    const LDS_PAD: u32 = 8;
     const WARPS_PER_BLOCK: u32 = 16;
     let cfg = LaunchConfig {
         grid: (m.div_ceil(TILE_M), rows.div_ceil(TILE_ROWS), 1),
         block: (32, WARPS_PER_BLOCK, 1),
         // x2: double-buffered LDS K-stage tiles (WMMA pipelining round).
-        shared_mem_bytes: 2 * (TILE_ROWS + TILE_M) * K_STAGE * std::mem::size_of::<u16>() as u32,
+        shared_mem_bytes: 2
+            * (TILE_ROWS + TILE_M)
+            * (K_STAGE + LDS_PAD)
+            * std::mem::size_of::<u16>() as u32,
     };
     // SAFETY: params matches every gemm_xwt_wmma_<type> kernel's parameter
     // list (const float*, const void*, float*, unsigned x3) in order, and

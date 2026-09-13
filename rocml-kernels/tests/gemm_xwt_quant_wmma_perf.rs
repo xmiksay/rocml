@@ -8,6 +8,22 @@
 //! Same shapes as `gemm_xwt_quant_perf.rs` (issue #6's acceptance shapes:
 //! `rows=128` against `n=4096` x `m in {4096, 8192, 12288}`) so the two
 //! probes' printed GFLOP/s are directly comparable before/after.
+//!
+//! ## Per-wave-efficiency round (issue #6 second follow-up)
+//!
+//! Landed: a 2x2 (`WARPS_M=4,WARPS_N=4`) per-warp accumulator tile at
+//! `TILE_M`=128 (lever 1, up to +18.9% GFLOP/s over the original 1x2/
+//! `TILE_M`=64), plus an 8-half LDS row-stride pad breaking a bank-conflict
+//! pattern (lever 2, +7.5-8.3% more). Rejected: `K_STAGE`=32 (lever 4,
+//! -10.8% at m=12288). Every sweep ran through a **standalone hipcc
+//! harness** (not checked in) interleaving configs in one process —
+//! same-process `cargo test` runs on this machine showed up to 2x GFLOP/s
+//! swings from ambient GPU clock state alone, making cross-process
+//! comparison unusable here. Full sweep tables (every config x shape tried,
+//! landed and rejected) are in `.claude/CLAUDE.md`'s "Per-wave-efficiency
+//! round" bullet and `gemm_xwt_quant_wmma.hip`'s module doc. Lever 3
+//! (dequant off the critical path) was not attempted this round — flagged
+//! for a future one.
 mod common;
 
 use std::ffi::c_void;
@@ -24,8 +40,13 @@ const K_BLOCK_ELEMS: usize = 256;
 /// crate, so duplicated here) — the probe must launch exactly what
 /// production does or the numbers don't mean anything.
 const TILE_ROWS: u32 = 128;
-const TILE_M: u32 = 64;
+// Per-wave-efficiency round: TILE_M doubled from 64 alongside the 2x2
+// (subrow x subcol) per-warp accumulator tile (`WARPS_M=4, WARPS_N=4` in the
+// kernel source) — see `gemm_xwt_quant_wmma.hip`'s module doc.
+const TILE_M: u32 = 128;
 const K_STAGE: u32 = 16;
+// LDS row-stride padding (lever 2) — must match the kernel's `LDS_PAD`.
+const LDS_PAD: u32 = 8;
 const WARPS_PER_BLOCK: u32 = 16;
 
 fn make_x(rows: u32, n: u32) -> Vec<f32> {
@@ -94,7 +115,10 @@ fn perf_probe(
         block: (32, WARPS_PER_BLOCK, 1),
         // x2: double-buffered LDS K-stage tiles (WMMA pipelining round) —
         // must match `kernels_quant.rs::gemm_wmma`'s launch exactly.
-        shared_mem_bytes: 2 * (TILE_ROWS + TILE_M) * K_STAGE * std::mem::size_of::<u16>() as u32,
+        shared_mem_bytes: 2
+            * (TILE_ROWS + TILE_M)
+            * (K_STAGE + LDS_PAD)
+            * std::mem::size_of::<u16>() as u32,
     };
 
     for _ in 0..WARMUP_ITERS {
@@ -250,5 +274,88 @@ fn perf_probe_gemm_xwt_wmma_q6_k_512x12288() {
         12288,
         4096,
         221,
+    );
+}
+
+// rows=512 variants at the other acceptance-shape `m`s (4096/8192) —
+// `PREFILL_CHUNK_SIZE` is 512 (`chunk_forward.rs`), so a real chunked-prefill
+// call is always `rows=512` against every projection's own `m`, not just
+// the FFN's 12288; the per-wave-efficiency round's TILE_M bump needs
+// checking against the smaller `m`s too (fewer grid.x blocks can leave the
+// GPU under-filled at `rows=128`, the pre-512-chunk-size microbench shape —
+// see this file's module doc for the measured regression there).
+#[test]
+#[ignore]
+fn perf_probe_gemm_xwt_wmma_q4_k_512x4096() {
+    q4_k_case_rows(
+        "gemm_xwt_wmma_q4_k (512x4096 x 4096x4096)",
+        512,
+        4096,
+        4096,
+        222,
+    );
+}
+
+#[test]
+#[ignore]
+fn perf_probe_gemm_xwt_wmma_q4_k_512x8192() {
+    q4_k_case_rows(
+        "gemm_xwt_wmma_q4_k (512x4096 x 4096x8192)",
+        512,
+        8192,
+        4096,
+        223,
+    );
+}
+
+#[test]
+#[ignore]
+fn perf_probe_gemm_xwt_wmma_q6_k_512x4096() {
+    q6_k_case_rows(
+        "gemm_xwt_wmma_q6_k (512x4096 x 4096x4096)",
+        512,
+        4096,
+        4096,
+        224,
+    );
+}
+
+#[test]
+#[ignore]
+fn perf_probe_gemm_xwt_wmma_q6_k_512x8192() {
+    q6_k_case_rows(
+        "gemm_xwt_wmma_q6_k (512x4096 x 4096x8192)",
+        512,
+        8192,
+        4096,
+        225,
+    );
+}
+
+// rows=512, m=1024: ornith-9b's real attn_k/attn_v projection shape
+// (head_count_kv * key_length = 4*256), the smallest real WMMA-eligible `m`
+// this kernel serves in production — checked separately since a `TILE_M`
+// bump shrinks `grid.x` most, proportionally, at small `m`.
+#[test]
+#[ignore]
+fn perf_probe_gemm_xwt_wmma_q4_k_512x1024() {
+    q4_k_case_rows(
+        "gemm_xwt_wmma_q4_k (512x4096 x 4096x1024)",
+        512,
+        1024,
+        4096,
+        226,
+    );
+}
+
+#[test]
+#[ignore]
+fn perf_probe_gemm_xwt_wmma_q6_k_512x1024() {
+    q6_k_case_rows(
+        "gemm_xwt_wmma_q6_k (512x4096 x 4096x1024)",
+        512,
+        1024,
+        4096,
+        227,
     );
 }
