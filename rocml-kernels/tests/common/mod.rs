@@ -263,12 +263,17 @@ pub fn expected_gemm_wmma(
     out
 }
 
-/// Uploads `w_bytes`/`x`, launches `gemm_xwt_wmma_<type>` (`kernel_name` from
-/// `hsaco`) with the fixed `TILE_ROWS=128`/`TILE_M=64`/`K_STAGE=16` tiling
-/// `gemm_xwt_quant_wmma.hip` requires (block=(32,16,1), grid=
-/// `(ceil(m/64), ceil(rows/128), 1)`, `2*(128+64)*16*sizeof(f16)` bytes of
-/// dynamic shared memory — the kernel double-buffers its LDS K-stage tiles,
-/// see its module doc), and downloads `out` (`rows x m`).
+/// Uploads `w_bytes`/`x`, launches `gemm_xwt_wmma_<type>` (`kernel_name`
+/// from `hsaco`) with the fixed `TILE_ROWS=128`/`K_STAGE=16` tiling every
+/// `gemm_xwt_wmma_impl.h` instantiation shares (block=(32,16,1), grid=
+/// `(ceil(m/tile_m), ceil(rows/128), 1)`, `2*(128+tile_m)*16*sizeof(f16)`
+/// bytes of dynamic shared memory — the kernel double-buffers its LDS
+/// K-stage tiles, see its module doc), and downloads `out` (`rows x m`).
+/// `tile_m` selects which tile config to launch as: 128 for the default
+/// `gemm_xwt_quant_wmma.hip` kernels, 64 for `gemm_xwt_quant_wmma_narrow.
+/// hip`'s (both configs use `WARPS_PER_BLOCK=16` — `4*4` and `8*2` — so
+/// `block` doesn't need to vary).
+#[allow(clippy::too_many_arguments)]
 pub fn run_gemm_wmma_kernel(
     hsaco: &[u8],
     kernel_name: &str,
@@ -277,6 +282,7 @@ pub fn run_gemm_wmma_kernel(
     rows: u32,
     m: u32,
     n: u32,
+    tile_m: u32,
 ) -> Vec<f32> {
     let _device = Device::new(0).expect("failed to select device 0");
     let module = Module::load_from_bytes(hsaco).expect("module load failed");
@@ -296,29 +302,25 @@ pub fn run_gemm_wmma_kernel(
     let mut params = kernel_params!(x_ptr, w_ptr, out_ptr, rows, m, n);
 
     const TILE_ROWS: u32 = 128;
-    // Per-wave-efficiency round: TILE_M doubled from 64 alongside the 2x2
-    // (subrow x subcol) per-warp accumulator tile (`WARPS_M=4, WARPS_N=4` in
-    // the kernel source, `WARPS_PER_BLOCK` unchanged at 16) — must match
-    // `gemm_xwt_quant_wmma.hip` exactly, or `threadIdx.y`/`blockIdx.x` run
-    // past the kernel's compiled-in tiling and read/write out-of-range slices.
-    const TILE_M: u32 = 128;
     const K_STAGE: u32 = 16;
     // LDS row-stride padding (lever 2) — must match the kernel's `LDS_PAD`.
     const LDS_PAD: u32 = 8;
     const WARPS_PER_BLOCK: u32 = 16;
     let cfg = LaunchConfig {
-        grid: (m.div_ceil(TILE_M), rows.div_ceil(TILE_ROWS), 1),
+        grid: (m.div_ceil(tile_m), rows.div_ceil(TILE_ROWS), 1),
         block: (32, WARPS_PER_BLOCK, 1),
         // x2: double-buffered LDS K-stage tiles (WMMA pipelining round).
         shared_mem_bytes: 2
-            * (TILE_ROWS + TILE_M)
+            * (TILE_ROWS + tile_m)
             * (K_STAGE + LDS_PAD)
             * std::mem::size_of::<u16>() as u32,
     };
     // SAFETY: params matches every gemm_xwt_wmma_<type> kernel's parameter
     // list (const float*, const void*, float*, unsigned x3) in order, and
     // all device buffers outlive this launch. block/grid/shared_mem_bytes
-    // match the kernel's fixed TILE_ROWS/TILE_M/K_STAGE tiling.
+    // match the caller-selected tile config exactly, or `threadIdx.y`/
+    // `blockIdx.x` run past the kernel's compiled-in tiling and read/write
+    // out-of-range slices.
     unsafe { function.launch(&cfg, &mut params, None) }.expect("kernel launch failed");
 
     let mut actual = vec![0.0f32; (rows * m) as usize];

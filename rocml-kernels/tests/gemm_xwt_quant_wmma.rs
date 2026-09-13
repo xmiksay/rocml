@@ -62,6 +62,7 @@ fn run_case(
     m: u32,
     n: u32,
     seed: u32,
+    tile_m: u32,
 ) {
     assert_eq!(
         n as usize % block_elems,
@@ -88,12 +89,12 @@ fn run_case(
         .collect();
 
     let expected = expected_gemm_wmma(dtype, &w_bytes, &x, rows as usize, m as usize, n as usize);
-    let actual = run_gemm_wmma_kernel(hsaco, kernel, &w_bytes, &x, rows, m, n);
+    let actual = run_gemm_wmma_kernel(hsaco, kernel, &w_bytes, &x, rows, m, n, tile_m);
     assert_close(&actual, &expected, &format!("gemm_xwt_wmma_{dtype:?}"));
 }
 
 macro_rules! quant_gemm_wmma_tests {
-    ($mod_name:ident, $dtype:expr, $hsaco:expr, $kernel:expr, $block_bytes:expr, $block_elems:expr) => {
+    ($mod_name:ident, $dtype:expr, $hsaco:expr, $kernel:expr, $block_bytes:expr, $block_elems:expr, $tile_m:expr, $cross_m:expr) => {
         mod $mod_name {
             use super::*;
 
@@ -109,6 +110,7 @@ macro_rules! quant_gemm_wmma_tests {
                     16,
                     $block_elems as u32,
                     1,
+                    $tile_m,
                 );
             }
 
@@ -127,6 +129,7 @@ macro_rules! quant_gemm_wmma_tests {
                     32,
                     2 * $block_elems as u32,
                     2,
+                    $tile_m,
                 );
             }
 
@@ -145,13 +148,16 @@ macro_rules! quant_gemm_wmma_tests {
                     48,
                     2 * $block_elems as u32,
                     3,
+                    $tile_m,
                 );
             }
 
             #[test]
             fn cols_crosses_tile_col_boundary() {
-                // TILE_M=64: m=80 forces grid.x=2, exercising the second
-                // workgroup's col-base offset and its out-of-range tail.
+                // `$cross_m` is chosen per tile config (128 for the default
+                // kernels, 64 for the narrow ones) to force grid.x=2,
+                // exercising the second workgroup's col-base offset and its
+                // out-of-range tail.
                 run_case(
                     $dtype,
                     $hsaco,
@@ -159,9 +165,10 @@ macro_rules! quant_gemm_wmma_tests {
                     $block_bytes,
                     $block_elems,
                     20,
-                    80,
+                    $cross_m,
                     2 * $block_elems as u32,
                     4,
+                    $tile_m,
                 );
             }
 
@@ -185,6 +192,7 @@ macro_rules! quant_gemm_wmma_tests {
                     32,
                     3 * $block_elems as u32,
                     5,
+                    $tile_m,
                 );
             }
 
@@ -200,6 +208,37 @@ macro_rules! quant_gemm_wmma_tests {
                     256,
                     8 * $block_elems as u32,
                     6,
+                    $tile_m,
+                );
+            }
+        }
+    };
+}
+
+// Narrow-kernel-only extra case: a partial *last* tile (unlike
+// `cols_crosses_tile_col_boundary`'s exactly-half-full second tile) —
+// m=96 with TILE_M=64 gives grid.x=2 where the second tile only has 32 of
+// its 64 columns valid, a genuinely unaligned partial-tile shape the wide
+// kernel's own `cols_crosses_tile_col_boundary` (m=144, TILE_M=128) doesn't
+// cover at this tile size.
+macro_rules! quant_gemm_wmma_narrow_partial_test {
+    ($mod_name:ident, $dtype:expr, $hsaco:expr, $kernel:expr, $block_bytes:expr, $block_elems:expr) => {
+        mod $mod_name {
+            use super::*;
+
+            #[test]
+            fn cols_partial_last_tile() {
+                run_case(
+                    $dtype,
+                    $hsaco,
+                    $kernel,
+                    $block_bytes,
+                    $block_elems,
+                    20,
+                    96,
+                    2 * $block_elems as u32,
+                    7,
+                    64,
                 );
             }
         }
@@ -212,7 +251,9 @@ quant_gemm_wmma_tests!(
     rocml_kernels::GEMM_XWT_WMMA_Q8_0_HSACO,
     rocml_kernels::GEMM_XWT_WMMA_Q8_0_KERNEL,
     Q8_0_BLOCK_BYTES,
-    Q8_0_BLOCK_ELEMS
+    Q8_0_BLOCK_ELEMS,
+    128,
+    144
 );
 quant_gemm_wmma_tests!(
     q4_k,
@@ -220,7 +261,9 @@ quant_gemm_wmma_tests!(
     rocml_kernels::GEMM_XWT_WMMA_Q4_K_HSACO,
     rocml_kernels::GEMM_XWT_WMMA_Q4_K_KERNEL,
     Q4_K_BLOCK_BYTES,
-    256
+    256,
+    128,
+    144
 );
 quant_gemm_wmma_tests!(
     q5_k,
@@ -228,13 +271,97 @@ quant_gemm_wmma_tests!(
     rocml_kernels::GEMM_XWT_WMMA_Q5_K_HSACO,
     rocml_kernels::GEMM_XWT_WMMA_Q5_K_KERNEL,
     Q5_K_BLOCK_BYTES,
-    256
+    256,
+    128,
+    144
 );
 quant_gemm_wmma_tests!(
     q6_k,
     GgmlDType::Q6_K,
     rocml_kernels::GEMM_XWT_WMMA_Q6_K_HSACO,
     rocml_kernels::GEMM_XWT_WMMA_Q6_K_KERNEL,
+    Q6_K_BLOCK_BYTES,
+    256,
+    128,
+    144
+);
+
+// Narrow (TILE_M=64) kernels — shape-aware dispatch round's `m < 2048`
+// dispatch target, `kernels/gemm_xwt_quant_wmma_narrow.hip`. Same
+// correctness contract as the default-width kernels above, verified
+// against the same CPU reference; `cols_crosses_tile_col_boundary`'s
+// `$cross_m` (80) is chosen to cross *this* config's TILE_M=64 boundary
+// instead of the default kernels' 128.
+quant_gemm_wmma_tests!(
+    q8_0_narrow,
+    GgmlDType::Q8_0,
+    rocml_kernels::GEMM_XWT_WMMA_Q8_0_NARROW_HSACO,
+    rocml_kernels::GEMM_XWT_WMMA_Q8_0_NARROW_KERNEL,
+    Q8_0_BLOCK_BYTES,
+    Q8_0_BLOCK_ELEMS,
+    64,
+    80
+);
+quant_gemm_wmma_tests!(
+    q4_k_narrow,
+    GgmlDType::Q4_K,
+    rocml_kernels::GEMM_XWT_WMMA_Q4_K_NARROW_HSACO,
+    rocml_kernels::GEMM_XWT_WMMA_Q4_K_NARROW_KERNEL,
+    Q4_K_BLOCK_BYTES,
+    256,
+    64,
+    80
+);
+quant_gemm_wmma_tests!(
+    q5_k_narrow,
+    GgmlDType::Q5_K,
+    rocml_kernels::GEMM_XWT_WMMA_Q5_K_NARROW_HSACO,
+    rocml_kernels::GEMM_XWT_WMMA_Q5_K_NARROW_KERNEL,
+    Q5_K_BLOCK_BYTES,
+    256,
+    64,
+    80
+);
+quant_gemm_wmma_tests!(
+    q6_k_narrow,
+    GgmlDType::Q6_K,
+    rocml_kernels::GEMM_XWT_WMMA_Q6_K_NARROW_HSACO,
+    rocml_kernels::GEMM_XWT_WMMA_Q6_K_NARROW_KERNEL,
+    Q6_K_BLOCK_BYTES,
+    256,
+    64,
+    80
+);
+
+quant_gemm_wmma_narrow_partial_test!(
+    q8_0_narrow_partial,
+    GgmlDType::Q8_0,
+    rocml_kernels::GEMM_XWT_WMMA_Q8_0_NARROW_HSACO,
+    rocml_kernels::GEMM_XWT_WMMA_Q8_0_NARROW_KERNEL,
+    Q8_0_BLOCK_BYTES,
+    Q8_0_BLOCK_ELEMS
+);
+quant_gemm_wmma_narrow_partial_test!(
+    q4_k_narrow_partial,
+    GgmlDType::Q4_K,
+    rocml_kernels::GEMM_XWT_WMMA_Q4_K_NARROW_HSACO,
+    rocml_kernels::GEMM_XWT_WMMA_Q4_K_NARROW_KERNEL,
+    Q4_K_BLOCK_BYTES,
+    256
+);
+quant_gemm_wmma_narrow_partial_test!(
+    q5_k_narrow_partial,
+    GgmlDType::Q5_K,
+    rocml_kernels::GEMM_XWT_WMMA_Q5_K_NARROW_HSACO,
+    rocml_kernels::GEMM_XWT_WMMA_Q5_K_NARROW_KERNEL,
+    Q5_K_BLOCK_BYTES,
+    256
+);
+quant_gemm_wmma_narrow_partial_test!(
+    q6_k_narrow_partial,
+    GgmlDType::Q6_K,
+    rocml_kernels::GEMM_XWT_WMMA_Q6_K_NARROW_HSACO,
+    rocml_kernels::GEMM_XWT_WMMA_Q6_K_NARROW_KERNEL,
     Q6_K_BLOCK_BYTES,
     256
 );
