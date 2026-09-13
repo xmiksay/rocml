@@ -26,6 +26,8 @@ rocml is a standalone Rust inference engine for Qwen3.5-hybrid/Ornith and dense 
 - `make clean` — `cargo clean`
 - `make serve` — run `rocml-serve` against `QWEN_MODEL` (defaults to the Qwen3.5-2B dev/test checkpoint; override with `QWEN_MODEL=/path/to.gguf make serve`)
 - `make bench` — run `rocml-cli bench` against `QWEN_MODEL`, JSON output
+- `make bench-profile` — profiled `bench` run, human-readable roofline table on stdout (`MODEL`/`DEPTH` override which checkpoint/context depth, e.g. `make bench-profile MODEL=ornith-9b DEPTH=8192`)
+- `make bench-profile-json` — same run, machine-readable roofline JSON written to `OUT` (default `bench/profile/$(DEPTH).json`) — see "Observability" below and `docs/prefill-gap-analysis.md`
 - `make eval` — run the agentic quality-eval harness (issue #15) for both `ornith-9b-q6` (Q6_K) and `ornith-9b` (Q4_K_M) at ctx 16384, writing `bench/eval/results/*.json`
 
 All cargo invocations are run with `CARGO_BUILD_JOBS=4` to avoid overloading the build machine.
@@ -87,26 +89,32 @@ A small, deterministic (greedy argmax, fixed everything) quality harness measuri
 
 Every scored scenario is written to `--out` immediately, so a run interrupted partway through (a 30-60 minute eval killed by, e.g., a wrapping timeout) can be resumed with `--resume`, which skips any scenario id already present in that file (and skips recomputing PPL if it's already recorded). `make eval` runs both the `ornith-9b-q6` (Q6_K) baseline and the `ornith-9b` (Q4_K_M) default at ctx 16384, `--resume` always on.
 
-## Observability
+## Observability (issue #5)
 
-`bench --profile` and `generate --profile` collect per-op, per-layer, per-phase (prefill vs. decode) instrumentation — bytes moved, FLOPs, wall time, and position relative to this card's roofline (~624 GB/s HBM, ~15-20 TFLOP/s fp16 on gfx1101) — and print a report after the run (`bench --profile --json` embeds the same data under a `"profile"` key instead).
+`bench --profile`/`--profile-json <path>` and `generate --profile` collect per-op, per-layer, per-phase (prefill vs. decode) instrumentation — bytes moved, FLOPs, wall time, and position relative to this card's roofline (~624 GB/s HBM, ~15-20 TFLOP/s fp16 practical scalar ceiling, 75 TFLOP/s f16 WMMA theoretical peak — all three in one place, `rocml/src/profile/roofline.rs`) — and print a human-readable report after the run (`--profile`) and/or write it as machine-readable JSON (`--profile-json <path>`; `--json` also embeds it under a `"profile"` key). Each row additionally carries an analytical min-time bound `t_min = max(bytes/BW, flops/practical_peak)`, `efficiency = t_min/actual`, and `wasted_ms = actual - t_min` — sort a `--profile-json` report's rows by `wasted_ms` to get a ranked optimization worklist (also printed as its own section in the human table).
 
 ```
 $ rocml-cli bench --model qwen3.5-2b --profile
 ...
 == decode phase: 842.31 ms profiled ==
 -- by op-kind --
-label                             n         ms     %time      GB/s   GFLOP/s %BWroof %FLroof
-ffn-gate-up                     127     312.040     37.0%     238.4      59.1   38.2%    0.3%
-qkv                             127     198.442     23.6%     181.9      45.3   29.2%    0.3%
+label                             n         ms     %time      GB/s   GFLOP/s %BWroof %FLroof   waste_ms
+ffn-gate-up                     127     312.040     37.0%     238.4      59.1   38.2%    0.3%    294.821
+qkv                             127     198.442     23.6%     181.9      45.3   29.2%    0.3%    186.203
 ...
 
 == top bottlenecks ==
 decode ffn-gate-up: 37.0% of decode time, 238.4 GB/s (38.2% of BW roofline), 59.1 GFLOP/s (0.3% of FLOP roofline)
 ...
+
+== optimization worklist (by wasted time) ==
+decode ffn-gate-up: 294.821 ms wasted (312.0 ms actual vs 17.2 ms t_min, 6% efficient)
+...
 ```
 
 Profiling is opt-in and costs nothing when off: every instrumented call site is `Profiler::scope(prof, ..., || { ... })`, a plain function call when `prof` is `None`. When on, per-op HIP events are recorded through the whole run and only synchronized once at the end (`Profiler::finish`), not inside the hot loop — see `rocml/src/profile/mod.rs`'s doc comment for the full design. The qwen35 hybrid architecture's prompt phase runs through a batched, chunked forward pass (issue #6) with full per-op granularity, one event set per chunk; the dense Qwen3 architecture's still-token-serial prefill instead times each layer as one coarse span (bounding event count at a long `--depth`). Decode keeps full per-op granularity on both architectures. Byte/FLOP counts are analytical (weight sizes, KV/state sizes, dtype-aware), not measured — see `rocml/src/profile/cost.rs`.
+
+For kernel-level ground truth (real measured kernel time, occupancy, VGPR/SGPR usage) instead of the analytical view above, see `docs/profiling.md` for the `rocprofv3` workflow. `docs/prefill-gap-analysis.md` is this round's worked example of both together: ranking ornith-9b's real prefill wasted-time ops, categorizing each gap, and an Amdahl-arithmetic lever list with estimated tok/s upside.
 
 ## rocml-serve
 

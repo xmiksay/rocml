@@ -1,2 +1,5 @@
 /target/
 *.hsaco
+# rocprofv3's own scratch directory (counter-collection cache files),
+# created wherever it's invoked from (docs/profiling.md's workflow).
+/.rocprofv3/
