@@ -290,6 +290,7 @@ impl QuantKernels {
     /// f16. This is a strictly larger precision change than the WMMA
     /// rounding above (int8 activations, not f16), so it is gated
     /// separately and never turned on just because WMMA already is.
+    /// `mmq_eligible=false` (`weights/linear.rs`'s `mmq_eligible_by_name`) forces WMMA/scalar.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn gemm(
         &self,
@@ -301,12 +302,13 @@ impl QuantKernels {
         m: u32,
         n: u32,
         mmq_scratch: MmqScratch,
+        mmq_eligible: bool,
     ) -> Result<(), RocmlError> {
         let wmma_eligible = rows >= GEMM_WMMA_TILE_ROWS
             && m >= GEMM_WMMA_TILE_M
             && m.is_multiple_of(16)
             && n.is_multiple_of(16);
-        if wmma_eligible && self.mmq_enabled && MmqKernels::supports(dtype) {
+        if wmma_eligible && self.mmq_enabled && mmq_eligible && MmqKernels::supports(dtype) {
             self.mmq.gemm(dtype, x, w, out, rows, m, n, mmq_scratch)
         } else if wmma_eligible {
             self.gemm_wmma(dtype, x, w, out, rows, m, n)

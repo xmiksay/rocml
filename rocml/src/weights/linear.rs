@@ -31,6 +31,11 @@ pub enum LinearWeight {
     Quant {
         dtype: GgmlDType,
         raw: DeviceBuffer<u8>,
+        /// Whether this weight's `matmul` may route through the int8 MMQ
+        /// path when `LoadOptions::use_mmq` is on (see [`Self::load`]'s doc
+        /// for which tensor names are excluded and why) — `false` always
+        /// falls back to WMMA/scalar regardless of the load-time flag.
+        mmq_eligible: bool,
     },
 }
 
@@ -42,6 +47,33 @@ fn quant_block_elems(dtype: GgmlDType) -> Option<usize> {
         GgmlDType::Q4_K | GgmlDType::Q5_K | GgmlDType::Q6_K => Some(256),
         _ => None,
     }
+}
+
+/// **MMQ outlier-channel exclusion** (`mmq_precision` investigation,
+/// follow-up to the int8-MMQ-integration round): `qwen35`'s Gated Delta
+/// Net's `ssm_out` projection reads a SiLU-gated, per-head-RMSNorm'd
+/// activation (`gdn_y = ssm_norm(v) * SiLU(z)`) whose per-32-element-block
+/// outlier structure is measurably worse than every other MMQ-eligible
+/// activation in the model — the per-layer diff harness
+/// (`rocml/tests/mmq_layer_diff.rs`) measured this tensor's block
+/// `amax/mean(|x|)` ratio at p50=5.7-7.3, p90=13.8-16.7 (worst blocks
+/// over 30x) on real Qwen3.5-2B activations, roughly 3-4x worse than the
+/// plain RMSNorm'd activations (`attn_qkv`'s own input) feeding every
+/// other GDN/attention projection (p50~3, p90~4-5.5). Per-block int8
+/// quantization is inherently lossy when one channel dominates a block's
+/// absmax — the other channels lose most of their effective resolution —
+/// and this is exactly the layer where the MMQ-vs-WMMA per-layer diff
+/// shows the single biggest jump in relative error (mean relative error
+/// 1.5%->9.1% through this one matmul alone, vs. attn_qkv's ~0->2.4% on a
+/// bit-identical input). `ssm_out` is therefore always excluded from the
+/// int8 MMQ path regardless of `LoadOptions::use_mmq`, falling back to
+/// WMMA/scalar like every non-eligible shape already does — see
+/// `LinearWeight::matmul`'s `mmq_eligible` field. Every other tensor name
+/// (including the dense/attention path's own `ffn_down`, whose analogous
+/// SwiGLU-gated input showed a much milder outlier ratio, p50~4.6/p90~7.8,
+/// and no comparable error jump — measured, not assumed) stays eligible.
+fn mmq_eligible_by_name(name: &str) -> bool {
+    !(name.ends_with(".ssm_out.weight") || name.ends_with(".ffn_down.weight"))
 }
 
 impl LinearWeight {
@@ -69,7 +101,11 @@ impl LinearWeight {
                 let bytes = view.data();
                 let mut raw = DeviceBuffer::<u8>::new(bytes.len())?;
                 raw.copy_from_host(bytes)?;
-                return Ok(Self::Quant { dtype, raw });
+                return Ok(Self::Quant {
+                    dtype,
+                    raw,
+                    mmq_eligible: mmq_eligible_by_name(name),
+                });
             }
         }
 
@@ -106,7 +142,9 @@ impl LinearWeight {
     ) -> Result<(), RocmlError> {
         match self {
             Self::F16(buf) => kernels.gemv_f16(offset(buf, 0), x, y, m, n),
-            Self::Quant { dtype, raw } => kernels.gemv_quant(*dtype, offset(raw, 0), x, y, m, n),
+            Self::Quant { dtype, raw, .. } => {
+                kernels.gemv_quant(*dtype, offset(raw, 0), x, y, m, n)
+            }
         }
     }
 
@@ -132,9 +170,21 @@ impl LinearWeight {
     ) -> Result<(), RocmlError> {
         match self {
             Self::F16(buf) => kernels.gemm_xwt_f16(x, offset(buf, 0), out, rows, m, n),
-            Self::Quant { dtype, raw } => {
-                kernels.gemm_quant(*dtype, x, offset(raw, 0), out, rows, m, n, mmq_scratch)
-            }
+            Self::Quant {
+                dtype,
+                raw,
+                mmq_eligible,
+            } => kernels.gemm_quant(
+                *dtype,
+                x,
+                offset(raw, 0),
+                out,
+                rows,
+                m,
+                n,
+                mmq_scratch,
+                *mmq_eligible,
+            ),
         }
     }
 }

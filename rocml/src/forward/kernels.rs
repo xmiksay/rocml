@@ -365,8 +365,10 @@ impl Kernels {
         m: u32,
         n: u32,
         mmq_scratch: MmqScratch,
+        mmq_eligible: bool,
     ) -> Result<(), RocmlError> {
-        self.quant.gemm(dtype, x, w, out, rows, m, n, mmq_scratch)
+        self.quant
+            .gemm(dtype, x, w, out, rows, m, n, mmq_scratch, mmq_eligible)
     }
 
     /// `gemv_t_f32(a, x, y, rows, n)`: y = A^T * x, A row-major rows x n f32.
