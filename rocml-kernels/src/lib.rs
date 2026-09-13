@@ -305,3 +305,35 @@ pub const GDN_CW_OUTPUT_F32_HSACO: &[u8] = GDN_CW_PREP_F32_HSACO;
 pub const GDN_CW_OUTPUT_F32_KERNEL: &str = "gdn_chunkwise_output_f32";
 pub const GDN_CW_STATE_F32_HSACO: &[u8] = GDN_CW_PREP_F32_HSACO;
 pub const GDN_CW_STATE_F32_KERNEL: &str = "gdn_chunkwise_state_f32";
+
+/// `kernels/quantize_act_q8.hip`: per-32-element-block absmax int8
+/// quantizer for the int8 MMQ-style GEMM prototype below (WMMA-pipeline
+/// round, issue #6 lever 2) — llama.cpp Q8_1-style `(code, scale,
+/// running-sum)` output. Launch with `block = (32, warps_per_block, 1)`,
+/// `grid.x = ceil(rows * n/32 / warps_per_block)`; `n` must be a multiple
+/// of 32.
+pub const QUANTIZE_ACT_Q8_BLK_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/quantize_act_q8.hsaco"));
+pub const QUANTIZE_ACT_Q8_BLK_KERNEL: &str = "quantize_act_q8_blk";
+
+/// `kernels/gemm_xwt_quant_mmq.hip`: int8 MMQ-style prefill GEMM for Q8_0-
+/// and Q4_K-quantized weights (WMMA-pipeline round, issue #6 lever 2
+/// prototype — see the kernel source's module doc for why Q5_K/Q6_K aren't
+/// implemented here). Consumes `quantize_act_q8_blk`'s int8 code/scale/sum
+/// output directly (never a raw f32 `X`). Launch with `block = (32, 16,
+/// 1)`, `grid = (ceil(m/64), ceil(rows/128), 1)`; Q8_0's dynamic shared
+/// memory is `(128*32 + 64*32 + 128*4 + 64*4)` bytes, Q4_K's an extra
+/// `(128 + 64)*4` bytes for the two additional per-(row,col) scale/offset
+/// lookup tables (see the kernel source for the exact LDS layout).
+/// Correctness-tested (`rocml-kernels/tests/gemm_xwt_quant_mmq*.rs`) and
+/// perf-measured (`gemm_xwt_quant_mmq*_perf.rs`) standalone; **not yet
+/// wired into `Model`'s forward-pass dispatch** — see the WMMA-pipeline
+/// round's report for why (end-to-end integration needs new
+/// `ChunkScratch` buffers, a `LinearWeight::matmul` dispatch change, and a
+/// full parity/agentic-eval re-run this round didn't have budget left to
+/// do safely).
+pub const GEMM_XWT_MMQ_Q8_0_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_xwt_quant_mmq.hsaco"));
+pub const GEMM_XWT_MMQ_Q8_0_KERNEL: &str = "gemm_xwt_mmq_q8_0";
+pub const GEMM_XWT_MMQ_Q4_K_HSACO: &[u8] = GEMM_XWT_MMQ_Q8_0_HSACO;
+pub const GEMM_XWT_MMQ_Q4_K_KERNEL: &str = "gemm_xwt_mmq_q4_k";
