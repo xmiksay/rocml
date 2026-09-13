@@ -84,7 +84,14 @@ pub fn run(args: &EvalArgs) -> Result<(), RocmlError> {
     }
 
     eprintln!("loading {}... (ctx {ctx})", args.model_args.model);
-    let mut loaded = common::load(&resolved.path, LoadOptions { ctx, kv_cache })?;
+    let mut loaded = common::load(
+        &resolved.path,
+        LoadOptions {
+            ctx,
+            kv_cache,
+            use_mmq: args.model_args.mmq,
+        },
+    )?;
     eprintln!(
         "ready: {} layers, hidden={}, vocab={}",
         loaded.model.block_count(),

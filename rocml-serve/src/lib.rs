@@ -24,6 +24,10 @@ pub struct ServerConfig {
     /// KV cache storage/quantization policy (issue #2/#3) — see
     /// `rocml::KvCacheMode`.
     pub kv_cache: KvCacheMode,
+    /// Routes qwen35 hybrid chunked-prefill matmuls through the int8 MMQ
+    /// GEMM instead of f16 WMMA where eligible — see
+    /// `rocml::LoadOptions::use_mmq`'s doc comment. Off by default.
+    pub use_mmq: bool,
     pub max_tokens_default: usize,
     pub no_think: bool,
     /// Sampling defaults for requests that omit a field — from the resolved
@@ -71,6 +75,7 @@ pub fn build(config: ServerConfig) -> Result<(axum::Router, std::thread::JoinHan
     let load_opts = rocml::LoadOptions {
         ctx: config.ctx,
         kv_cache: config.kv_cache,
+        use_mmq: config.use_mmq,
     };
     let snapshot_config = worker::SnapshotConfig {
         ram_mb: config.snapshot_ram_mb,

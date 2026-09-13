@@ -59,7 +59,14 @@ pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
     let kv_cache: rocml::KvCacheMode = args.model_args.kv_cache.into();
     let ctx = common::resolve_ctx(args.ctx, spec, DEFAULT_CTX, &resolved.path, kv_cache)?;
     eprintln!("loading {}... (ctx {ctx})", args.model_args.model);
-    let mut loaded = common::load(&resolved.path, LoadOptions { ctx, kv_cache })?;
+    let mut loaded = common::load(
+        &resolved.path,
+        LoadOptions {
+            ctx,
+            kv_cache,
+            use_mmq: args.model_args.mmq,
+        },
+    )?;
     eprintln!(
         "ready: {} layers, hidden={}, vocab={}. Type a message and press enter \
          (Ctrl+D or /exit to quit).",

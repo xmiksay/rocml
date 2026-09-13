@@ -255,6 +255,9 @@ impl Model {
             lm_head_bytes,
             lm_head_flops,
             || {
+                // A plain `matvec` (single output row, never an MMQ-eligible
+                // shape) — see "Logits trap" above: only the chunk's last
+                // row ever reaches the lm-head, not a batched `matmul`.
                 self.weights.output.matvec(
                     &self.kernels,
                     offset(&self.chunk_scratch.xn, 0),

@@ -65,6 +65,19 @@ pub struct LoadOptions {
     /// pre-weights-upload VRAM picture.
     pub ctx: usize,
     pub kv_cache: KvCacheMode,
+    /// Whether the qwen35 hybrid architecture's chunked-prefill GEMM
+    /// dispatch (`forward::kernels_quant::QuantKernels::gemm`) may route a
+    /// WMMA-eligible quantized matmul through the int8 MMQ path
+    /// (`forward::kernels_mmq`) instead of f16 WMMA — issue #6's
+    /// int8-MMQ-integration round. Off by default: int8 activation
+    /// quantization is a real precision change beyond the WMMA f16
+    /// rounding every quantized chunked-prefill matmul already accepts,
+    /// and flips to on-by-default only once validated against the full
+    /// parity suite and the issue-15 agentic eval — see `.claude/CLAUDE.md`
+    /// for the current status. No effect on the dense `qwen3` architecture
+    /// (it never chunks prefill, so this dispatch is never reached) or on
+    /// decode (token-serial decode uses `matvec`, never `matmul`).
+    pub use_mmq: bool,
 }
 
 impl LoadOptions {
@@ -72,11 +85,17 @@ impl LoadOptions {
         Self {
             ctx,
             kv_cache: KvCacheMode::default(),
+            use_mmq: false,
         }
     }
 
     pub fn with_kv_cache(mut self, mode: KvCacheMode) -> Self {
         self.kv_cache = mode;
+        self
+    }
+
+    pub fn with_mmq(mut self, use_mmq: bool) -> Self {
+        self.use_mmq = use_mmq;
         self
     }
 }

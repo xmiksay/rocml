@@ -134,7 +134,7 @@ impl Model {
         }
 
         let cache = HybridCache::new(&config, ctx, opts.kv_cache)?;
-        let kernels = Kernels::load_all()?;
+        let kernels = Kernels::load_all(opts.use_mmq)?;
         let hybrid = HybridKernels::load_all()?;
         let mixed_kernels = MixedKernels::load_all()?;
         let flash_mixed_kernels = FlashPrefillMixedKernels::load_all()?;

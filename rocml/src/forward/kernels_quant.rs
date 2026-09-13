@@ -16,6 +16,7 @@ use rocml_core::quant::GgmlDType;
 use rocml_hip::{kernel_params, LaunchConfig, Module};
 
 use super::kernels::{load, DevPtr, REDUCE_BLOCK};
+use super::kernels_mmq::{MmqKernels, MmqScratch};
 use crate::error::RocmlError;
 
 /// Reduction elements staged into LDS per outer iteration by every
@@ -89,10 +90,16 @@ pub(crate) struct QuantKernels {
     gemm_wmma_q5_k_fn: rocml_hip::Function,
     _mod_gemm_wmma_q6_k: Module,
     gemm_wmma_q6_k_fn: rocml_hip::Function,
+    mmq: MmqKernels,
+    /// Load-time policy (`LoadOptions::with_mmq`, threaded down through
+    /// `Kernels::load_all`): whether `gemm` may route an MMQ-eligible call
+    /// through the int8 matrix-unit path at all. See this struct's `gemm`
+    /// doc for the full dispatch policy and why this defaults to off.
+    mmq_enabled: bool,
 }
 
 impl QuantKernels {
-    pub(crate) fn load_all() -> Result<Self, RocmlError> {
+    pub(crate) fn load_all(mmq_enabled: bool) -> Result<Self, RocmlError> {
         let (_mod_q8_0, q8_0_fn) = load(
             rocml_kernels::GEMV_Q8_0_HSACO,
             rocml_kernels::GEMV_Q8_0_KERNEL,
@@ -141,6 +148,7 @@ impl QuantKernels {
             rocml_kernels::GEMM_XWT_WMMA_Q6_K_HSACO,
             rocml_kernels::GEMM_XWT_WMMA_Q6_K_KERNEL,
         )?;
+        let mmq = MmqKernels::load_all()?;
 
         Ok(Self {
             _mod_q8_0,
@@ -167,6 +175,8 @@ impl QuantKernels {
             gemm_wmma_q5_k_fn,
             _mod_gemm_wmma_q6_k,
             gemm_wmma_q6_k_fn,
+            mmq,
+            mmq_enabled,
         })
     }
 
@@ -267,6 +277,19 @@ impl QuantKernels {
     /// shift. Left enabled and documented here per the issue's honest-
     /// reporting instruction, not resolved unilaterally by loosening either
     /// test's tolerance.
+    ///
+    /// **int8 MMQ (int8-MMQ-integration round)**: when `mmq_enabled` was
+    /// set at load time (`LoadOptions::with_mmq`, off by default — see this
+    /// module's own top-level report/`.claude/CLAUDE.md` for the validation
+    /// status that decides whether this ever flips to on by default) *and*
+    /// the shape is WMMA-eligible (every weight kind this dispatch handles
+    /// now has an MMQ kernel, so no further dtype gating is needed beyond
+    /// `MmqKernels::supports`), this routes to the int8 integer-matrix-unit
+    /// path instead of f16 WMMA — quantizing `x` on the fly
+    /// (`kernels_mmq.rs`'s `MmqKernels::gemm`) rather than rounding it to
+    /// f16. This is a strictly larger precision change than the WMMA
+    /// rounding above (int8 activations, not f16), so it is gated
+    /// separately and never turned on just because WMMA already is.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn gemm(
         &self,
@@ -277,12 +300,15 @@ impl QuantKernels {
         rows: u32,
         m: u32,
         n: u32,
+        mmq_scratch: MmqScratch,
     ) -> Result<(), RocmlError> {
-        if rows >= GEMM_WMMA_TILE_ROWS
+        let wmma_eligible = rows >= GEMM_WMMA_TILE_ROWS
             && m >= GEMM_WMMA_TILE_M
             && m.is_multiple_of(16)
-            && n.is_multiple_of(16)
-        {
+            && n.is_multiple_of(16);
+        if wmma_eligible && self.mmq_enabled && MmqKernels::supports(dtype) {
+            self.mmq.gemm(dtype, x, w, out, rows, m, n, mmq_scratch)
+        } else if wmma_eligible {
             self.gemm_wmma(dtype, x, w, out, rows, m, n)
         } else {
             self.gemm_scalar(dtype, x, w, out, rows, m, n)

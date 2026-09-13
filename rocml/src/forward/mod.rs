@@ -8,6 +8,7 @@ mod ffn;
 pub(crate) mod kernels;
 pub(crate) mod kernels_flash;
 pub(crate) mod kernels_kv;
+pub(crate) mod kernels_mmq;
 pub(crate) mod kernels_quant;
 mod scratch;
 
@@ -87,7 +88,12 @@ impl Model {
         }
 
         let cache = KvCache::new(&config, ctx, dtype)?;
-        let kernels = Kernels::load_all()?;
+        // `opts.use_mmq` is threaded through for consistency with the
+        // qwen35 hybrid loader, but is inert here: the dense architecture
+        // never chunks prefill (see `Model::forward_prompt`'s doc comment),
+        // so `LinearWeight::matmul`/the MMQ dispatch it can reach are never
+        // called on this path.
+        let kernels = Kernels::load_all(opts.use_mmq)?;
         let scratch = Scratch::new(&config)?;
 
         Ok(Self {

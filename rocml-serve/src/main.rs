@@ -59,6 +59,11 @@ struct Args {
     /// `rocml::KvCacheMode`. Default `fp16`; quantized modes are opt-in.
     #[arg(long, value_enum, default_value = "fp16")]
     kv_cache: KvCacheArg,
+    /// Routes qwen35 hybrid chunked-prefill matmuls through the int8 MMQ
+    /// GEMM instead of f16 WMMA where eligible — see
+    /// `rocml::LoadOptions::use_mmq`'s doc comment. Off by default.
+    #[arg(long)]
+    mmq: bool,
     #[arg(long = "max-tokens-default", default_value_t = 512)]
     max_tokens_default: usize,
     /// Pre-close the `<think>` block on every request (reasoning off).
@@ -130,6 +135,7 @@ async fn run(args: Args) -> Result<(), String> {
         model_path: resolved.path,
         ctx,
         kv_cache,
+        use_mmq: args.mmq,
         max_tokens_default: args.max_tokens_default,
         no_think,
         default_sampling,

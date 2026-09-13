@@ -19,7 +19,7 @@ use rocml_hip::DeviceBuffer;
 
 use super::matrix_dims;
 use crate::error::RocmlError;
-use crate::forward::kernels::{offset, DevPtr, Kernels};
+use crate::forward::kernels::{offset, DevPtr, Kernels, MmqScratch};
 
 /// One linear layer's weight matrix, ready for `y = W * x` via [`Self::matvec`].
 pub enum LinearWeight {
@@ -113,7 +113,12 @@ impl LinearWeight {
     /// `out[rows,m] = X[rows,n] * W^T`: the batched prefill-path sibling of
     /// [`Self::matvec`], dispatching to `gemm_xwt_f16`/`gemm_xwt_<quant>`.
     /// `m`/`n` must match the shape this weight was loaded with, same as
-    /// `matvec`.
+    /// `matvec`. `mmq_scratch` is only read for a `Quant` weight whose
+    /// shape/dtype/load-time flag route it through the int8 MMQ path
+    /// (`QuantKernels::gemm`'s dispatch) — every other case (including the
+    /// `F16` arm) ignores it; callers always pass their chunk's scratch
+    /// regardless, so every call site stays uniform (see
+    /// `qwen35::forward::chunk_scratch::ChunkScratch::mmq_scratch`).
     #[allow(clippy::too_many_arguments)]
     pub fn matmul(
         &self,
@@ -123,11 +128,12 @@ impl LinearWeight {
         rows: u32,
         m: u32,
         n: u32,
+        mmq_scratch: MmqScratch,
     ) -> Result<(), RocmlError> {
         match self {
             Self::F16(buf) => kernels.gemm_xwt_f16(x, offset(buf, 0), out, rows, m, n),
             Self::Quant { dtype, raw } => {
-                kernels.gemm_quant(*dtype, x, offset(raw, 0), out, rows, m, n)
+                kernels.gemm_quant(*dtype, x, offset(raw, 0), out, rows, m, n, mmq_scratch)
             }
         }
     }
@@ -200,7 +206,7 @@ mod tests {
         let (m, n) = (m as u32, n as u32);
 
         let weight = LinearWeight::load(&gguf, tensor_name, m, n).expect("LinearWeight::load");
-        let kernels = Kernels::load_all().expect("Kernels::load_all");
+        let kernels = Kernels::load_all(false).expect("Kernels::load_all");
 
         // Realistic activation magnitudes (rmsnorm output ranges to ~+-4).
         let x_host: Vec<f32> = (0..n).map(|i| ((i % 29) as f32) * 0.29 - 4.0).collect();

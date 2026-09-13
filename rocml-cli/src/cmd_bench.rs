@@ -81,7 +81,14 @@ pub fn run(args: &BenchArgs) -> Result<(), RocmlError> {
     let ctx_request = args.ctx.unwrap_or(needed).max(needed).max(1);
     let ctx = rocml::registry::clamp_ctx(ctx_request, &resolved.path, kv_cache)?;
     eprintln!("loading {}... (ctx {ctx})", args.model_args.model);
-    let mut loaded = common::load(&resolved.path, LoadOptions { ctx, kv_cache })?;
+    let mut loaded = common::load(
+        &resolved.path,
+        LoadOptions {
+            ctx,
+            kv_cache,
+            use_mmq: args.model_args.mmq,
+        },
+    )?;
     let prompt_len = args.depth.unwrap_or(args.prompt_tokens);
     let prompt_ids = synthetic_prompt(&loaded, prompt_len);
     eprintln!(

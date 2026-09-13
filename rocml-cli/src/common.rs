@@ -51,6 +51,15 @@ pub struct ModelArgs {
     /// a small, opt-in accuracy tradeoff.
     #[arg(long, value_enum, default_value = "fp16")]
     pub kv_cache: KvCacheArg,
+    /// Routes qwen35 hybrid chunked-prefill matmuls through the int8 MMQ
+    /// GEMM (issue #6's int8-MMQ-integration round) instead of f16 WMMA,
+    /// where the shape is eligible. Off by default: int8 activation
+    /// quantization is a real precision change beyond WMMA's f16 rounding,
+    /// validated separately — see `rocml::LoadOptions::use_mmq`'s doc
+    /// comment and `.claude/CLAUDE.md` for current status. No effect on
+    /// the dense `qwen3` architecture or on decode.
+    #[arg(long)]
+    pub mmq: bool,
 }
 
 impl ModelArgs {

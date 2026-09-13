@@ -16,6 +16,10 @@ use super::kernels_kv::{KvF16Kernels, ATTN_PREFILL_ROW_TILE};
 use super::kernels_quant::QuantKernels;
 use crate::error::RocmlError;
 
+/// Re-exported so `LinearWeight::matmul`/the qwen35 chunked-prefill layer
+/// files can name it without reaching into `kernels_mmq` directly.
+pub(crate) use super::kernels_mmq::MmqScratch;
+
 /// A raw device pointer, valid only as a kernel launch argument for as long
 /// as the buffer it was derived from is alive. See [`offset`].
 pub type DevPtr = *mut c_void;
@@ -136,7 +140,13 @@ pub(crate) fn load(hsaco: &[u8], name: &str) -> Result<(Module, rocml_hip::Funct
 }
 
 impl Kernels {
-    pub fn load_all() -> Result<Self, RocmlError> {
+    /// `mmq_enabled`: threaded from `LoadOptions::with_mmq` — whether
+    /// `gemm_quant` may dispatch a WMMA-eligible quantized matmul through
+    /// the int8 MMQ path instead of f16 WMMA (see `kernels_quant.rs`'s
+    /// `QuantKernels::gemm` for the full dispatch policy and why this is
+    /// off by default). Ignored by every other kernel this struct owns —
+    /// only `QuantKernels` cares.
+    pub fn load_all(mmq_enabled: bool) -> Result<Self, RocmlError> {
         let (_mod_embedding, embedding_fn) = load(
             rocml_kernels::EMBEDDING_F16_F32_HSACO,
             rocml_kernels::EMBEDDING_F16_F32_KERNEL,
@@ -189,7 +199,7 @@ impl Kernels {
             rocml_kernels::ATTN_PREFILL_F32_HSACO,
             rocml_kernels::ATTN_PREFILL_F32_KERNEL,
         )?;
-        let quant = QuantKernels::load_all()?;
+        let quant = QuantKernels::load_all(mmq_enabled)?;
         let kv_f16 = KvF16Kernels::load_all()?;
         let flash = FlashPrefillKernels::load_all()?;
 
@@ -363,8 +373,9 @@ impl Kernels {
         rows: u32,
         m: u32,
         n: u32,
+        mmq_scratch: MmqScratch,
     ) -> Result<(), RocmlError> {
-        self.quant.gemm(dtype, x, w, out, rows, m, n)
+        self.quant.gemm(dtype, x, w, out, rows, m, n, mmq_scratch)
     }
 
     /// `gemv_t_f32(a, x, y, rows, n)`: y = A^T * x, A row-major rows x n f32.

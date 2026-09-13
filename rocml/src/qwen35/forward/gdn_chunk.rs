@@ -67,6 +67,7 @@ pub(crate) fn gdn_chunk_step(
                 chunk_len,
                 gdn.conv_dim,
                 hidden,
+                scratch.mmq_scratch(),
             )?;
             layer.attn_gate.matmul(
                 kernels,
@@ -75,6 +76,7 @@ pub(crate) fn gdn_chunk_step(
                 chunk_len,
                 gdn.value_dim,
                 hidden,
+                scratch.mmq_scratch(),
             )?;
             layer.ssm_alpha.matmul(
                 kernels,
@@ -83,6 +85,7 @@ pub(crate) fn gdn_chunk_step(
                 chunk_len,
                 gdn.num_v_heads,
                 hidden,
+                scratch.mmq_scratch(),
             )?;
             layer.ssm_beta.matmul(
                 kernels,
@@ -91,6 +94,7 @@ pub(crate) fn gdn_chunk_step(
                 chunk_len,
                 gdn.num_v_heads,
                 hidden,
+                scratch.mmq_scratch(),
             )?;
 
             chunk.gdn_conv1d_chunk(
@@ -181,6 +185,7 @@ pub(crate) fn gdn_chunk_step(
                 chunk_len,
                 hidden,
                 gdn.value_dim,
+                scratch.mmq_scratch(),
             )?;
             kernels.add_inplace(
                 offset(&scratch.x, 0),

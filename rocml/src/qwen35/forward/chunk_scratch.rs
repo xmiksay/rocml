@@ -8,6 +8,7 @@ use rocml_hip::DeviceBuffer;
 
 use super::super::config::Qwen35Config;
 use crate::error::RocmlError;
+use crate::forward::kernels::{offset, MmqScratch};
 use crate::forward::kernels_flash::ATTN_PREFILL_FLASH_MAX_SPLITS;
 
 /// Upper bound on tokens processed by one chunked-prefill launch. The
@@ -82,6 +83,21 @@ pub struct ChunkScratch {
     pub ffn_gate: DeviceBuffer<f32>,
     pub ffn_up: DeviceBuffer<f32>,
     pub ffn_out: DeviceBuffer<f32>,
+
+    // int8 MMQ activation-quantization scratch (issue #6's
+    // int8-MMQ-integration round, `forward::kernels_mmq`): sized for
+    // `CHUNK_CAP` rows x `mmq_dim` columns, where `mmq_dim` is the largest
+    // `n` any chunked-prefill `LinearWeight::matmul` call uses (`hidden`
+    // for qkv/gate/ffn-gate-up projections, `feed_forward_length` for
+    // ffn-down — whichever is bigger). Always allocated regardless of
+    // `LoadOptions::use_mmq` (three small buffers; see
+    // `forward::kernels_mmq::MmqScratch`'s doc for why keeping every
+    // `matmul` call site uniform wins over an `Option`-gated allocation).
+    // `quantize_act_q8_blk`'s fixed 32-element block width sizes
+    // `mmq_x_scale`/`mmq_x_sum`.
+    pub mmq_x_codes: DeviceBuffer<i8>,
+    pub mmq_x_scale: DeviceBuffer<f32>,
+    pub mmq_x_sum: DeviceBuffer<f32>,
 }
 
 impl ChunkScratch {
@@ -102,6 +118,15 @@ impl ChunkScratch {
         let n_heads = config.head_count as usize;
         let head_dim = config.head_dim as usize;
         let max_splits = ATTN_PREFILL_FLASH_MAX_SPLITS as usize;
+        // Largest `n` any chunked-prefill `matmul` call uses — see the
+        // `mmq_x_*` fields' doc comment. `quantize_act_q8_blk`'s block
+        // width (32) must divide it evenly, which holds here since every
+        // `LinearWeight::Quant` tensor's `n` is already a multiple of 32
+        // (Q8_0) or 256 (Q4_K/Q5_K/Q6_K) by `LinearWeight::load`'s policy,
+        // and `hidden`/`ffn` are themselves always multiples of those
+        // block widths for any model this loader accepts.
+        let mmq_dim = hidden.max(ffn);
+        let mmq_blocks = mmq_dim.div_ceil(32);
 
         Ok(Self {
             x: DeviceBuffer::new(cap * hidden)?,
@@ -143,6 +168,22 @@ impl ChunkScratch {
             ffn_gate: DeviceBuffer::new(cap * ffn)?,
             ffn_up: DeviceBuffer::new(cap * ffn)?,
             ffn_out: DeviceBuffer::new(cap * hidden)?,
+
+            mmq_x_codes: DeviceBuffer::new(cap * mmq_dim)?,
+            mmq_x_scale: DeviceBuffer::new(cap * mmq_blocks)?,
+            mmq_x_sum: DeviceBuffer::new(cap * mmq_blocks)?,
         })
+    }
+
+    /// Device pointers into this chunk's MMQ activation-quantization
+    /// scratch, for `LinearWeight::matmul`'s `mmq_scratch` argument. Always
+    /// safe to pass regardless of whether the call ends up using MMQ (see
+    /// the `mmq_x_*` fields' doc comment).
+    pub fn mmq_scratch(&self) -> MmqScratch {
+        MmqScratch {
+            codes: offset(&self.mmq_x_codes, 0),
+            scale: offset(&self.mmq_x_scale, 0),
+            sum: offset(&self.mmq_x_sum, 0),
+        }
     }
 }
