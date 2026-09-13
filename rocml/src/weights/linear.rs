@@ -50,28 +50,35 @@ fn quant_block_elems(dtype: GgmlDType) -> Option<usize> {
 }
 
 /// **MMQ outlier-channel exclusion** (`mmq_precision` investigation,
-/// follow-up to the int8-MMQ-integration round): `qwen35`'s Gated Delta
-/// Net's `ssm_out` projection reads a SiLU-gated, per-head-RMSNorm'd
-/// activation (`gdn_y = ssm_norm(v) * SiLU(z)`) whose per-32-element-block
-/// outlier structure is measurably worse than every other MMQ-eligible
-/// activation in the model — the per-layer diff harness
-/// (`rocml/tests/mmq_layer_diff.rs`) measured this tensor's block
-/// `amax/mean(|x|)` ratio at p50=5.7-7.3, p90=13.8-16.7 (worst blocks
-/// over 30x) on real Qwen3.5-2B activations, roughly 3-4x worse than the
-/// plain RMSNorm'd activations (`attn_qkv`'s own input) feeding every
-/// other GDN/attention projection (p50~3, p90~4-5.5). Per-block int8
-/// quantization is inherently lossy when one channel dominates a block's
-/// absmax — the other channels lose most of their effective resolution —
-/// and this is exactly the layer where the MMQ-vs-WMMA per-layer diff
-/// shows the single biggest jump in relative error (mean relative error
-/// 1.5%->9.1% through this one matmul alone, vs. attn_qkv's ~0->2.4% on a
-/// bit-identical input). `ssm_out` is therefore always excluded from the
-/// int8 MMQ path regardless of `LoadOptions::use_mmq`, falling back to
-/// WMMA/scalar like every non-eligible shape already does — see
-/// `LinearWeight::matmul`'s `mmq_eligible` field. Every other tensor name
-/// (including the dense/attention path's own `ffn_down`, whose analogous
-/// SwiGLU-gated input showed a much milder outlier ratio, p50~4.6/p90~7.8,
-/// and no comparable error jump — measured, not assumed) stays eligible.
+/// follow-up to the int8-MMQ-integration round): two projections in every
+/// layer read a SiLU/SwiGLU-gated activation whose per-32-element-block
+/// outlier structure is measurably worse than the plain RMSNorm'd
+/// activations (`attn_qkv`'s own input) feeding every other MMQ-eligible
+/// projection (p50~3, p90~4-5.5) — the per-layer diff harness
+/// (`rocml/tests/mmq_layer_diff.rs`) measured real Qwen3.5-2B block
+/// `amax/mean(|x|)` ratios of p50=5.7-7.3/p90=13.8-16.7 (worst blocks over
+/// 30x) for `qwen35`'s Gated Delta Net `ssm_out` projection's input
+/// (`gdn_y = ssm_norm(v) * SiLU(z)`) and p50~4.6/p90~7.8 for `ffn_down`'s
+/// SwiGLU-gated input. Per-block int8 quantization is inherently lossy
+/// when one channel dominates a block's absmax — the other channels lose
+/// most of their effective resolution — and `ssm_out` is exactly where the
+/// MMQ-vs-WMMA per-layer diff shows the single biggest jump in relative
+/// error anywhere in the model (mean relative error 1.5%->9.1% through
+/// that one matmul alone, vs. `attn_qkv`'s ~0->2.4% on a bit-identical
+/// input). Both `ssm_out` and `ffn_down` are therefore always excluded
+/// from the int8 MMQ path regardless of `LoadOptions::use_mmq`, falling
+/// back to WMMA/scalar like every non-eligible shape already does — see
+/// `LinearWeight::matmul`'s `mmq_eligible` field. **Not sufficient on its
+/// own**: `mmq-endtoend-measure` shows excluding only `ssm_out` barely
+/// moves `qwen35_chunked_prefill_parity`'s own final-logits comparison
+/// (12.65%-14.91% max relative error vs. the unmodified path's
+/// 12.4%-15.1%); adding `ffn_down` helps more (8.46%-10.24%) but still
+/// leaves the error 8-10x over that gate's `1e-2` tolerance — every other
+/// MMQ-eligible matmul's own milder-but-nonzero outlier ratio compounds
+/// over 24 layers regardless. `LoadOptions::use_mmq`/`--mmq` stays off by
+/// default; this exclusion is a real, zero-risk-by-default precision
+/// improvement for whichever future round revisits MMQ, not a fix for the
+/// underlying regression.
 fn mmq_eligible_by_name(name: &str) -> bool {
     !(name.ends_with(".ssm_out.weight") || name.ends_with(".ffn_down.weight"))
 }
