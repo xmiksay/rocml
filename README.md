@@ -49,16 +49,16 @@ Sampling and thinking defaults are each model family's own documented recommenda
 
 `rocml::registry::resolve(name_or_path, download)` turns a `--model` argument into a path: anything containing `/`, ending in `.gguf`, or that already exists as a file is treated as a path outright (no preset applied); anything else is looked up by name. A registry hit whose file is missing under the checkpoint dir (`$ROCML_CHECKPOINT_DIR`, else `$HOME/checkpoints` — see `rocml_core::testpaths`) is downloaded via the `hf` CLI unless `--no-download` is passed, in which case the error names the exact missing path, the source repo, and both remedies.
 
-**Override precedence**: every flag a preset can supply (`--ctx`, `--kv-cache`, `-t/--temperature`, `--top-p`, `--top-k`, `--seed`, `--no-think`) is optional — an unset flag falls through to the resolved model's preset, then (for a path with no preset) the engine's pre-registry default; an explicit flag always wins. `--ctx` now sizes the KV cache directly rather than a hardcoded cap (issue #3): a preset's `default_ctx` (or an explicit `--ctx`) above this checkpoint's estimated VRAM budget is clamped down with a warning naming the budget breakdown and a suggested max ctx (`rocml::registry::clamp_ctx`); `Model::load` performs the authoritative post-weights-load check and errors with the same breakdown if reality doesn't fit. `--kv-cache fp16|q8|q4-mixed` (default `fp16`) picks the KV cache's storage/quantization policy — `fp16` halves the cache vs. the pre-issue-#3 f32-only cache at negligible quality cost; `q8`/`q4-mixed` (issue #2, KIVI-style: fp16 attention sinks + recent window, quantized bulk, boundary attention layers left fp16) shrink it further and stay opt-in until the #15 agentic eval judges their accuracy tradeoff.
+**Override precedence**: every flag a preset can supply (`--ctx`, `--kv-cache`, `-t/--temperature`, `--top-p`, `--top-k`, `--seed`, `--no-think`) is optional — an unset flag falls through to the resolved model's preset, then (for a path with no preset) the engine's pre-registry default; an explicit flag always wins. `--ctx` now sizes the KV cache directly rather than a hardcoded cap (issue #3): a preset's `default_ctx` (or an explicit `--ctx`) above this checkpoint's estimated VRAM budget is clamped down with a warning naming the budget breakdown and a suggested max ctx (`rocml::registry::clamp_ctx`); `Model::load` performs the authoritative post-weights-load check and errors with the same breakdown if reality doesn't fit. `--kv-cache fp16|q8|q4-mixed` (default `fp16`) picks the KV cache's storage/quantization policy — `fp16` halves the cache vs. the pre-issue-#3 f32-only cache at negligible quality cost; `q8`/`q4-mixed` (issue #2, KIVI-style: fp16 attention sinks + recent window, quantized bulk, boundary attention layers left fp16) shrink it further and stay opt-in until the #15 agentic eval judges their accuracy tradeoff. `--mmq` (default off) routes the qwen35 hybrid architecture's chunked-prefill matmuls through an int8 MMQ GEMM instead of f16 WMMA where the shape is eligible — kept experimental: it measurably fails the chunked-prefill parity suite (up to ~15% max relative logit deviation, and a real exact-greedy divergence on the mixed-KV-cache path), so it stays off by default pending further work (see `.claude/CLAUDE.md`'s "Chunked prefill" section for the full validation writeup).
 
 `rocml-cli models` lists the registry with each entry's on-disk presence under the resolved checkpoint dir.
 
 ## rocml-cli
 
 ```
-rocml-cli chat --model <name-or-gguf> [--no-download] [--kv-cache fp16|q8|q4-mixed] [--no-think] [-t/--temperature] [--top-p] [--top-k] [--seed] [--max-tokens] [--ctx]
-rocml-cli bench --model <name-or-gguf> [--no-download] [--kv-cache fp16|q8|q4-mixed] [--prompt-tokens N] [--decode-tokens N] [--runs N] [--depth N] [--ctx N] [--profile] [--json]
-rocml-cli generate --model <name-or-gguf> --prompt <text> [--no-download] [--kv-cache fp16|q8|q4-mixed] [--raw] [--no-think] [-n N] [--ctx N] [--profile]
+rocml-cli chat --model <name-or-gguf> [--no-download] [--kv-cache fp16|q8|q4-mixed] [--mmq] [--no-think] [-t/--temperature] [--top-p] [--top-k] [--seed] [--max-tokens] [--ctx]
+rocml-cli bench --model <name-or-gguf> [--no-download] [--kv-cache fp16|q8|q4-mixed] [--mmq] [--prompt-tokens N] [--decode-tokens N] [--runs N] [--depth N] [--ctx N] [--profile] [--json]
+rocml-cli generate --model <name-or-gguf> --prompt <text> [--no-download] [--kv-cache fp16|q8|q4-mixed] [--mmq] [--raw] [--no-think] [-n N] [--ctx N] [--profile]
 rocml-cli models
 ```
 
@@ -111,7 +111,7 @@ Profiling is opt-in and costs nothing when off: every instrumented call site is 
 ## rocml-serve
 
 ```
-rocml-serve --model <name-or-gguf> [--no-download] [--host 127.0.0.1] [--port 8080] [--ctx N] [--kv-cache fp16|q8|q4-mixed] [--max-tokens-default N] [--no-think] [--debug-endpoints]
+rocml-serve --model <name-or-gguf> [--no-download] [--host 127.0.0.1] [--port 8080] [--ctx N] [--kv-cache fp16|q8|q4-mixed] [--mmq] [--max-tokens-default N] [--no-think] [--debug-endpoints]
 ```
 
 OpenAI-compatible `POST /v1/chat/completions` (streaming via SSE, tool calls via the `tools`/`tool_calls` fields, `reasoning_content` as the de-facto extension carrying stripped `<think>` content) and `GET /v1/models` (reports the resolved registry name, e.g. `qwen3.5-2b`, when `--model` was a registry hit; otherwise the GGUF file's stem). Requests are served by a single dedicated worker thread that owns the model's GPU state and processes one request at a time — no batching or concurrent decode in this version. See `rocml-serve/src/worker.rs` for why the model can't just live behind a `Mutex` on a thread pool instead (HIP state isn't treated as `Send` in this codebase).
