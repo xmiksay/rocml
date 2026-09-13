@@ -66,6 +66,7 @@ pub(crate) fn ffn_chunk_step(
                 ffn_dim,
                 hidden,
                 scratch.mmq_scratch(),
+                scratch.splitk_scratch(),
             )?;
             ffn.up.matmul(
                 kernels,
@@ -75,6 +76,7 @@ pub(crate) fn ffn_chunk_step(
                 ffn_dim,
                 hidden,
                 scratch.mmq_scratch(),
+                scratch.splitk_scratch(),
             )?;
             kernels.silu_mul(
                 offset(&scratch.ffn_gate, 0),
@@ -105,6 +107,7 @@ pub(crate) fn ffn_chunk_step(
                 hidden,
                 ffn_dim,
                 scratch.mmq_scratch(),
+                scratch.splitk_scratch(),
             )
         },
     )?;

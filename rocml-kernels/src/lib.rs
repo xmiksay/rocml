@@ -4,6 +4,9 @@
 //! kernels directly — no runtime dependency on `hipcc` or the `kernels/`
 //! sources being present on the machine that runs it.
 
+mod gemm_wmma_kernels;
+pub use gemm_wmma_kernels::*;
+
 /// `kernels/smoke.hip`: elementwise `out[i] = a[i] + b[i]`.
 pub const VEC_ADD_F32_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smoke.hsaco"));
 pub const VEC_ADD_F32_KERNEL: &str = "vec_add_f32";
@@ -139,62 +142,6 @@ pub const GEMV_Q5_K_KERNEL: &str = "gemv_q5_k";
 /// of 256.
 pub const GEMV_Q6_K_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_q6_k.hsaco"));
 pub const GEMV_Q6_K_KERNEL: &str = "gemv_q6_k";
-
-/// `kernels/gemm_xwt_quant.hip`: batched prefill-path linear layer for
-/// GGUF-quantized weights, `out[rows,m] = X[rows,n] * dequant(W)^T` — the
-/// batched sibling of `gemv_q*` (which stays the fast path for rows==1
-/// decode). One weight row shared by 8 output rows per workgroup; launch
-/// with block = (32, 8, 1) and `256 * sizeof(f32)` bytes of dynamic shared
-/// memory (see the kernel source's module doc for the tiling design). All
-/// four dtypes share one code object.
-pub const GEMM_XWT_Q8_0_HSACO: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_xwt_quant.hsaco"));
-pub const GEMM_XWT_Q8_0_KERNEL: &str = "gemm_xwt_q8_0";
-pub const GEMM_XWT_Q4_K_HSACO: &[u8] = GEMM_XWT_Q8_0_HSACO;
-pub const GEMM_XWT_Q4_K_KERNEL: &str = "gemm_xwt_q4_k";
-pub const GEMM_XWT_Q5_K_HSACO: &[u8] = GEMM_XWT_Q8_0_HSACO;
-pub const GEMM_XWT_Q5_K_KERNEL: &str = "gemm_xwt_q5_k";
-pub const GEMM_XWT_Q6_K_HSACO: &[u8] = GEMM_XWT_Q8_0_HSACO;
-pub const GEMM_XWT_Q6_K_KERNEL: &str = "gemm_xwt_q6_k";
-
-/// `kernels/gemm_xwt_quant_wmma.hip`: WMMA matrix-core version of
-/// `gemm_xwt_q*` (issue #6's follow-up) — same `out[rows,m] = X[rows,n] *
-/// dequant(W)^T` contract, but feeds gfx11's wave32 matrix unit instead of
-/// scalar FMA. Launch with block = (32, 8, 1) and `(TILE_ROWS + TILE_M) *
-/// K_STAGE * sizeof(f16)` bytes of dynamic shared memory (see the kernel
-/// source's module doc for the tile sizes and fragment layout); grid =
-/// `(ceil(m/TILE_M), ceil(rows/TILE_ROWS), 1)`. Requires `m` and `n`
-/// multiples of 16 and `rows >= 16` to be worth it — the scalar
-/// `gemm_xwt_q*` kernels above stay the dispatch fallback otherwise. All
-/// four dtypes share one code object.
-pub const GEMM_XWT_WMMA_Q8_0_HSACO: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_xwt_quant_wmma.hsaco"));
-pub const GEMM_XWT_WMMA_Q8_0_KERNEL: &str = "gemm_xwt_wmma_q8_0";
-pub const GEMM_XWT_WMMA_Q4_K_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_HSACO;
-pub const GEMM_XWT_WMMA_Q4_K_KERNEL: &str = "gemm_xwt_wmma_q4_k";
-pub const GEMM_XWT_WMMA_Q5_K_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_HSACO;
-pub const GEMM_XWT_WMMA_Q5_K_KERNEL: &str = "gemm_xwt_wmma_q5_k";
-pub const GEMM_XWT_WMMA_Q6_K_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_HSACO;
-pub const GEMM_XWT_WMMA_Q6_K_KERNEL: &str = "gemm_xwt_wmma_q6_k";
-
-/// `kernels/gemm_xwt_quant_wmma_narrow.hip`: same contract as the
-/// `GEMM_XWT_WMMA_Q*` kernels above, but built with the narrower
-/// TILE_M=64/WARPS_M=8/WARPS_N=2 tile config (the original 1x2-fragment
-/// layout, before the per-wave-efficiency round's TILE_M=128 rewrite) —
-/// see that file's module doc for the shape-aware dispatch round's
-/// measured `m`-crossover. `rocml/src/forward/kernels_quant.rs` dispatches
-/// here for `m < 2048`.
-pub const GEMM_XWT_WMMA_Q8_0_NARROW_HSACO: &[u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/gemm_xwt_quant_wmma_narrow.hsaco"
-));
-pub const GEMM_XWT_WMMA_Q8_0_NARROW_KERNEL: &str = "gemm_xwt_wmma_q8_0_narrow";
-pub const GEMM_XWT_WMMA_Q4_K_NARROW_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_NARROW_HSACO;
-pub const GEMM_XWT_WMMA_Q4_K_NARROW_KERNEL: &str = "gemm_xwt_wmma_q4_k_narrow";
-pub const GEMM_XWT_WMMA_Q5_K_NARROW_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_NARROW_HSACO;
-pub const GEMM_XWT_WMMA_Q5_K_NARROW_KERNEL: &str = "gemm_xwt_wmma_q5_k_narrow";
-pub const GEMM_XWT_WMMA_Q6_K_NARROW_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_NARROW_HSACO;
-pub const GEMM_XWT_WMMA_Q6_K_NARROW_KERNEL: &str = "gemm_xwt_wmma_q6_k_narrow";
 
 /// `kernels/chunk_reshape.hip`: small batched reshape/broadcast kernels the
 /// chunked-prefill forward pass needs (per-head extraction, batched KV-cache

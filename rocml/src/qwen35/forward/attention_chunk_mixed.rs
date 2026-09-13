@@ -92,6 +92,7 @@ pub(crate) fn attention_chunk_step_mixed(
             q_out,
             hidden,
             scratch.mmq_scratch(),
+            scratch.splitk_scratch(),
         )?;
         layer.attn_k.matmul(
             kernels,
@@ -101,6 +102,7 @@ pub(crate) fn attention_chunk_step_mixed(
             kv_dim,
             hidden,
             scratch.mmq_scratch(),
+            scratch.splitk_scratch(),
         )?;
         layer.attn_v.matmul(
             kernels,
@@ -110,6 +112,7 @@ pub(crate) fn attention_chunk_step_mixed(
             kv_dim,
             hidden,
             scratch.mmq_scratch(),
+            scratch.splitk_scratch(),
         )?;
 
         let stride = if layer.has_output_gate {
@@ -256,6 +259,7 @@ pub(crate) fn attention_chunk_step_mixed(
                 hidden,
                 q_dim,
                 scratch.mmq_scratch(),
+                scratch.splitk_scratch(),
             )?;
             kernels.add_inplace(
                 offset(&scratch.x, 0),

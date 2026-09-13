@@ -11,6 +11,7 @@ pub(crate) mod kernels_kv;
 pub(crate) mod kernels_mmq;
 pub(crate) mod kernels_quant;
 mod kernels_quant_dispatch;
+pub(crate) mod kernels_splitk;
 mod scratch;
 
 use std::path::Path;

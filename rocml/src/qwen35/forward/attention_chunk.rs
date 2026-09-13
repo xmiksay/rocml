@@ -88,6 +88,7 @@ pub(crate) fn attention_chunk_step(
             q_out,
             hidden,
             scratch.mmq_scratch(),
+            scratch.splitk_scratch(),
         )?;
         layer.attn_k.matmul(
             kernels,
@@ -97,6 +98,7 @@ pub(crate) fn attention_chunk_step(
             kv_dim,
             hidden,
             scratch.mmq_scratch(),
+            scratch.splitk_scratch(),
         )?;
         layer.attn_v.matmul(
             kernels,
@@ -106,6 +108,7 @@ pub(crate) fn attention_chunk_step(
             kv_dim,
             hidden,
             scratch.mmq_scratch(),
+            scratch.splitk_scratch(),
         )?;
 
         // Per-head extraction batched over the whole chunk (the decode path's
@@ -301,6 +304,7 @@ pub(crate) fn attention_chunk_step(
                 hidden,
                 q_dim,
                 scratch.mmq_scratch(),
+                scratch.splitk_scratch(),
             )?;
             kernels.add_inplace(
                 offset(&scratch.x, 0),

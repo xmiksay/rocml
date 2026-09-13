@@ -21,6 +21,7 @@ use rocml_hip::{kernel_params, LaunchConfig, Module};
 
 use super::kernels::{load, DevPtr, REDUCE_BLOCK};
 use super::kernels_mmq::MmqKernels;
+use super::kernels_splitk::SplitKKernels;
 use crate::error::RocmlError;
 
 /// Output rows one `gemv_q*` workgroup owns — mirrors every `gemv_q*.hip`
@@ -78,6 +79,10 @@ pub(crate) struct QuantKernels {
     /// `kernels_quant_dispatch.rs`'s `gemm` doc for the full dispatch policy
     /// and why this defaults to off.
     pub(super) mmq_enabled: bool,
+    /// Split-K WMMA GEMM (issue #6's split-K follow-up) — see
+    /// `kernels_quant_dispatch.rs`'s `gemm` doc for the eligibility/
+    /// `num_splits` policy.
+    pub(super) splitk: SplitKKernels,
 }
 
 impl QuantKernels {
@@ -147,6 +152,7 @@ impl QuantKernels {
             rocml_kernels::GEMM_XWT_WMMA_Q6_K_NARROW_KERNEL,
         )?;
         let mmq = MmqKernels::load_all()?;
+        let splitk = SplitKKernels::load_all()?;
 
         Ok(Self {
             _mod_q8_0,
@@ -183,6 +189,7 @@ impl QuantKernels {
             gemm_wmma_q6_k_narrow_fn,
             mmq,
             mmq_enabled,
+            splitk,
         })
     }
 

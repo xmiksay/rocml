@@ -15,6 +15,7 @@ use super::kernels_flash::FlashPrefillKernels;
 use super::kernels_kv::{KvF16Kernels, ATTN_PREFILL_ROW_TILE};
 pub(crate) use super::kernels_mmq::MmqScratch;
 use super::kernels_quant::QuantKernels;
+pub(crate) use super::kernels_splitk::SplitKScratch;
 use crate::error::RocmlError;
 
 /// A raw device pointer, valid only as a kernel launch argument for as long
@@ -366,9 +367,20 @@ impl Kernels {
         n: u32,
         mmq_scratch: MmqScratch,
         mmq_eligible: bool,
+        splitk_scratch: SplitKScratch,
     ) -> Result<(), RocmlError> {
-        self.quant
-            .gemm(dtype, x, w, out, rows, m, n, mmq_scratch, mmq_eligible)
+        self.quant.gemm(
+            dtype,
+            x,
+            w,
+            out,
+            rows,
+            m,
+            n,
+            mmq_scratch,
+            mmq_eligible,
+            splitk_scratch,
+        )
     }
 
     /// `gemv_t_f32(a, x, y, rows, n)`: y = A^T * x, A row-major rows x n f32.

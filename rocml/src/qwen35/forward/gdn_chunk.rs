@@ -73,6 +73,7 @@ pub(crate) fn gdn_chunk_step(
                 gdn.conv_dim,
                 hidden,
                 scratch.mmq_scratch(),
+                scratch.splitk_scratch(),
             )?;
             if let (Some(cap), Some(li)) = (capture.as_deref_mut(), layer_idx) {
                 cap.record(li, "gdn_qkv_raw", &scratch.gdn_qkv, chunk_len, gdn.conv_dim)?;
@@ -85,6 +86,7 @@ pub(crate) fn gdn_chunk_step(
                 gdn.value_dim,
                 hidden,
                 scratch.mmq_scratch(),
+                scratch.splitk_scratch(),
             )?;
             layer.ssm_alpha.matmul(
                 kernels,
@@ -94,6 +96,7 @@ pub(crate) fn gdn_chunk_step(
                 gdn.num_v_heads,
                 hidden,
                 scratch.mmq_scratch(),
+                scratch.splitk_scratch(),
             )?;
             layer.ssm_beta.matmul(
                 kernels,
@@ -103,6 +106,7 @@ pub(crate) fn gdn_chunk_step(
                 gdn.num_v_heads,
                 hidden,
                 scratch.mmq_scratch(),
+                scratch.splitk_scratch(),
             )?;
 
             chunk.gdn_conv1d_chunk(
@@ -197,6 +201,7 @@ pub(crate) fn gdn_chunk_step(
                 hidden,
                 gdn.value_dim,
                 scratch.mmq_scratch(),
+                scratch.splitk_scratch(),
             )?;
             if let (Some(cap), Some(li)) = (capture, layer_idx) {
                 cap.record(li, "gdn_ssm_out_raw", &scratch.gdn_out, chunk_len, hidden)?;

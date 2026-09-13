@@ -8,8 +8,9 @@ use rocml_hip::DeviceBuffer;
 
 use super::super::config::Qwen35Config;
 use crate::error::RocmlError;
-use crate::forward::kernels::{offset, MmqScratch};
+use crate::forward::kernels::{offset, MmqScratch, SplitKScratch};
 use crate::forward::kernels_flash::ATTN_PREFILL_FLASH_MAX_SPLITS;
+use crate::forward::kernels_splitk::SPLITK_MAX_SPLITS;
 
 /// Upper bound on tokens processed by one chunked-prefill launch. The
 /// `generate` loop picks the actual per-call `chunk_len` (`<= CHUNK_CAP`) by
@@ -98,6 +99,21 @@ pub struct ChunkScratch {
     pub mmq_x_codes: DeviceBuffer<i8>,
     pub mmq_x_scale: DeviceBuffer<f32>,
     pub mmq_x_sum: DeviceBuffer<f32>,
+
+    // Split-K WMMA GEMM partial-sum scratch (issue #6's split-K follow-up,
+    // `forward::kernels_splitk`): `[SPLITK_MAX_SPLITS, CHUNK_CAP, hidden]`
+    // f32. `hidden` is the widest output any narrow-grid (split-K-candidate)
+    // projection ever produces in this architecture (ffn-down, attn-out,
+    // ssm_out all project back to `hidden`; the FFN gate/up projections,
+    // `m=feed_forward_length`, are always wide-grid already — see
+    // `kernels_quant_dispatch.rs`'s `splitk_num_splits` for the `m <=
+    // max_m` guard this sizing exists to make safe). Always allocated
+    // regardless of whether any call ends up using split-K (same
+    // uniform-call-site rationale as `mmq_x_*` above).
+    pub gemm_splitk_partial: DeviceBuffer<f32>,
+    /// This model's `hidden` — see `gemm_splitk_partial`'s doc comment and
+    /// `splitk_scratch`'s `max_m`.
+    splitk_max_m: u32,
 }
 
 impl ChunkScratch {
@@ -172,6 +188,9 @@ impl ChunkScratch {
             mmq_x_codes: DeviceBuffer::new(cap * mmq_dim)?,
             mmq_x_scale: DeviceBuffer::new(cap * mmq_blocks)?,
             mmq_x_sum: DeviceBuffer::new(cap * mmq_blocks)?,
+
+            gemm_splitk_partial: DeviceBuffer::new(SPLITK_MAX_SPLITS as usize * cap * hidden)?,
+            splitk_max_m: hidden as u32,
         })
     }
 
@@ -184,6 +203,19 @@ impl ChunkScratch {
             codes: offset(&self.mmq_x_codes, 0),
             scale: offset(&self.mmq_x_scale, 0),
             sum: offset(&self.mmq_x_sum, 0),
+        }
+    }
+
+    /// Device pointer + capacity for `LinearWeight::matmul`'s
+    /// `splitk_scratch` argument. Always safe to pass regardless of whether
+    /// the call ends up using split-K (see the `gemm_splitk_partial` field's
+    /// doc comment); `max_m` is this model's `hidden` (embedding_length,
+    /// captured at `ChunkScratch::new` time), read back by
+    /// `kernels_quant_dispatch.rs`'s eligibility check.
+    pub fn splitk_scratch(&self) -> SplitKScratch {
+        SplitKScratch {
+            partial: offset(&self.gemm_splitk_partial, 0),
+            max_m: self.splitk_max_m,
         }
     }
 }

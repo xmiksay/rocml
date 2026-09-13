@@ -11,6 +11,7 @@ use rocml_hip::{kernel_params, Function, LaunchConfig};
 use super::kernels::DevPtr;
 use super::kernels_mmq::{MmqKernels, MmqScratch};
 use super::kernels_quant::QuantKernels;
+use super::kernels_splitk::SplitKScratch;
 use crate::error::RocmlError;
 
 /// Reduction elements staged into LDS per outer iteration by every
@@ -72,6 +73,91 @@ const GEMM_WMMA_NARROW_TILE_M: u32 = 64;
 /// shape on the default one.
 const GEMM_WMMA_NARROW_THRESHOLD_M: u32 = 2048;
 
+/// Split-K WMMA GEMM (issue #6's split-K follow-up): adds a `blockIdx.z`
+/// grid dimension to the default-tile (`TILE_M`=128) WMMA kernel that splits
+/// the K reduction into independent partial sums, multiplying grid block
+/// count by `num_splits` — a lever completely orthogonal to `m`/tile width,
+/// so it applies to *any* WMMA-eligible shape whose plain grid
+/// (`m.div_ceil(GEMM_WMMA_TILE_M) * rows.div_ceil(GEMM_WMMA_TILE_ROWS)`,
+/// always computed against the *default* tile regardless of which plain
+/// kernel this shape would otherwise use) is narrow. ffn-down's class
+/// (`m=hidden, n=intermediate`, e.g. ornith-9b's m=4096/n=12288: grid.x=32,
+/// only 128 blocks at rows=512 against gfx1101's 60 CUs) is the motivating
+/// shape — see `rocml-kernels/kernels/gemm_xwt_wmma_splitk_impl.h`'s module
+/// doc for the full diagnosis.
+///
+/// Measured via a same-process interleaved harness
+/// (`rocml-kernels/tests/gemm_xwt_wmma_splitk_perf.rs`, rows=512, q4_k,
+/// median of 5 interleaved rounds — this machine's ambient GPU clock state
+/// swings enough between separate `cargo test` invocations to make
+/// cross-process comparisons unusable, per `gemm_xwt_quant_wmma_perf.rs`'s
+/// module doc, so every number below comes from one process):
+///
+/// | shape (m/n)           | plain-grid blocks | plain GFLOP/s | split(4) GFLOP/s | split(4) wins by |
+/// |------------------------|--------------------|----------------|--------------------|--------------------|
+/// | 4096/12288 (ffn-down)  | 128                | 14242.6        | 17104.2            | +20.1%             |
+/// | 2048/4096              | 64                 | 12202.2        | 16635.3            | +36.3%             |
+/// | 1024/4096              | 32                 | 7523.0         | 12962.3            | +72.3%             |
+///
+/// Every shape the issue asked to measure wins, and the win *grows* as the
+/// plain grid narrows — the opposite of a lever that only helps at one
+/// specific shape. This is why `splitk_num_splits` has no lower `m` bound
+/// tied to `GEMM_WMMA_NARROW_THRESHOLD_M`: at `m=1024` (this codebase's only
+/// real production shape below that threshold, ornith-9b's attn_k/attn_v),
+/// split-K on the *default* tile (12962.3 GFLOP/s) also beats the narrow-
+/// tile (`TILE_M`=64) kernel production currently dispatches there
+/// (10100.2 GFLOP/s, same harness/session) by +28.3% — so split-K
+/// eligibility is checked *before* the narrow-vs-default fork below, and
+/// wins it outright wherever it applies. The narrow-tile kernel itself
+/// stays as the fallback for any `m` too narrow for split-K to reach 2/4-way
+/// alignment (see `SPLITK_CANDIDATE_SPLITS`) or whose grid already clears
+/// `SPLITK_BLOCK_THRESHOLD`.
+const SPLITK_BLOCK_THRESHOLD: u32 = 240;
+/// Minimum reduction depth (`n`) for split-K to be worth its extra
+/// reduce-pass launch and scratch round-trip. Every `n` this dispatch ever
+/// sees in production is either `hidden` or `feed_forward_length` (each at
+/// least 4096 on every registry model), and `n=4096` already shows the largest
+/// measured win of the three crossover shapes at `m=1024` (+72.3%, see
+/// `SPLITK_BLOCK_THRESHOLD`'s table) — no measured shape came anywhere close
+/// to a break-even point, so this is set structurally (`2 *
+/// GEMM_WMMA_K_STAGE * 4`, i.e. "large enough that even a 4-way split still
+/// stages a real multi-iteration K reduction per split") rather than at a
+/// measured crossover that was never observed to exist within real shapes.
+const SPLITK_MIN_N: u32 = 256;
+/// Fixed split counts split-K ever picks, tried widest-first — `n` must
+/// divide evenly by `splits * GEMM_WMMA_K_STAGE` for every split's
+/// `[k_start, k_end)` range to stay `K_STAGE`-aligned (see the split-K
+/// kernel header's module doc for why that alignment matters: it's what
+/// lets the kernel skip the short-stage zero-pad path entirely). A given
+/// `(m, n)` shape always resolves to the same split count on every call —
+/// the "fixed split count per shape" determinism the issue's numerics
+/// section requires.
+const SPLITK_CANDIDATE_SPLITS: [u32; 2] = [4, 2];
+
+/// Picks a fixed, deterministic split count for `(m, n, rows)` — `1` means
+/// "don't split" (falls back to the narrow/default WMMA dispatch below,
+/// unchanged). Pure function of the shape, so the same GEMM call always
+/// resolves to the same split count and therefore the same summation order
+/// run to run (this function has no runtime/scheduling input). `max_m` is
+/// `SplitKScratch`'s allocated capacity (this model's `hidden`) — a shape
+/// wider than that can never split regardless of its grid width, since
+/// there's no scratch to hold its partials safely.
+fn splitk_num_splits(m: u32, n: u32, rows: u32, max_m: u32) -> u32 {
+    if m > max_m || n < SPLITK_MIN_N {
+        return 1;
+    }
+    let plain_blocks = m.div_ceil(GEMM_WMMA_TILE_M) * rows.div_ceil(GEMM_WMMA_TILE_ROWS);
+    if plain_blocks >= SPLITK_BLOCK_THRESHOLD {
+        return 1;
+    }
+    for splits in SPLITK_CANDIDATE_SPLITS {
+        if n.is_multiple_of(splits * GEMM_WMMA_K_STAGE) {
+            return splits;
+        }
+    }
+    1
+}
+
 impl QuantKernels {
     /// `gemm_xwt_<dtype>(x, w, out, rows, m, n)`: `out[rows,m] = X[rows,n] *
     /// dequant(W)^T`, the batched prefill-path sibling of
@@ -99,7 +185,11 @@ impl QuantKernels {
     /// grid dimension, giving `m=32` still 32+ independent blocks) stays
     /// the fallback — this is the same reasoning the prefill-cleanup
     /// round's original `m >= TILE_M` clause established for Ornith's GDN
-    /// per-head alpha/beta gate projections (`m = num_v_heads = 32`).
+    /// per-head alpha/beta gate projections (`m = num_v_heads = 32`). The
+    /// split-K round (below) checks its own eligibility *ahead* of this
+    /// fork and, when it applies, wins outright at every `m` measured
+    /// (including below `GEMM_WMMA_NARROW_THRESHOLD_M`) — this fork is only
+    /// ever reached once split-K has already declined the shape.
     ///
     /// Known numeric consequence (measured, not a bug — see the kernel
     /// source's module doc and issue #6's synthetic correctness tests for
@@ -132,6 +222,15 @@ impl QuantKernels {
     /// MMQ always uses the default (non-narrow) tile width — it was never
     /// swept against the narrow config, and MMQ stays off by default
     /// regardless (see its own validation-ladder writeup).
+    ///
+    /// **Split-K (split-K round)**: ahead of the plain default-tile WMMA
+    /// path (below MMQ in priority — MMQ is a strictly different, opt-in
+    /// numeric path and this dispatch never second-guesses it once enabled),
+    /// `splitk_num_splits` picks a fixed split count from `(m, n, rows)`
+    /// alone. `> 1` routes to `SplitKKernels::gemm` (the split-K WMMA pass
+    /// plus its deterministic ascending-order reduce pass); `1` falls
+    /// through to the narrow/default WMMA dispatch below unchanged. See
+    /// `SPLITK_BLOCK_THRESHOLD`'s doc for the measured crossover.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn gemm(
         &self,
@@ -144,13 +243,22 @@ impl QuantKernels {
         n: u32,
         mmq_scratch: MmqScratch,
         mmq_eligible: bool,
+        splitk_scratch: SplitKScratch,
     ) -> Result<(), RocmlError> {
         let wmma_eligible = rows >= GEMM_WMMA_TILE_ROWS
             && m >= GEMM_WMMA_NARROW_TILE_M
             && m.is_multiple_of(16)
             && n.is_multiple_of(16);
+        let num_splits = if wmma_eligible {
+            splitk_num_splits(m, n, rows, splitk_scratch.max_m)
+        } else {
+            1
+        };
         if wmma_eligible && self.mmq_enabled && mmq_eligible && MmqKernels::supports(dtype) {
             self.mmq.gemm(dtype, x, w, out, rows, m, n, mmq_scratch)
+        } else if wmma_eligible && num_splits > 1 {
+            self.splitk
+                .gemm(dtype, x, w, out, rows, m, n, num_splits, splitk_scratch)
         } else if wmma_eligible && m < GEMM_WMMA_NARROW_THRESHOLD_M {
             self.gemm_wmma_cfg(
                 self.wmma_narrow_fn(dtype)?,

@@ -19,7 +19,7 @@ use rocml_hip::DeviceBuffer;
 
 use super::matrix_dims;
 use crate::error::RocmlError;
-use crate::forward::kernels::{offset, DevPtr, Kernels, MmqScratch};
+use crate::forward::kernels::{offset, DevPtr, Kernels, MmqScratch, SplitKScratch};
 
 /// One linear layer's weight matrix, ready for `y = W * x` via [`Self::matvec`].
 pub enum LinearWeight {
@@ -164,6 +164,10 @@ impl LinearWeight {
     /// `F16` arm) ignores it; callers always pass their chunk's scratch
     /// regardless, so every call site stays uniform (see
     /// `qwen35::forward::chunk_scratch::ChunkScratch::mmq_scratch`).
+    /// `splitk_scratch` is the same always-pass-it-uniformly story for the
+    /// split-K WMMA path (`ChunkScratch::splitk_scratch`) — only read when
+    /// the shape's grid is narrow enough for `QuantKernels::gemm`'s dispatch
+    /// to pick a split count `> 1`.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul(
         &self,
@@ -174,6 +178,7 @@ impl LinearWeight {
         m: u32,
         n: u32,
         mmq_scratch: MmqScratch,
+        splitk_scratch: SplitKScratch,
     ) -> Result<(), RocmlError> {
         match self {
             Self::F16(buf) => kernels.gemm_xwt_f16(x, offset(buf, 0), out, rows, m, n),
@@ -191,6 +196,7 @@ impl LinearWeight {
                 n,
                 mmq_scratch,
                 *mmq_eligible,
+                splitk_scratch,
             ),
         }
     }
