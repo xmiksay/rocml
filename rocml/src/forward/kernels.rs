@@ -13,12 +13,9 @@ use rocml_hip::{kernel_params, DeviceBuffer, LaunchConfig, Module};
 
 use super::kernels_flash::FlashPrefillKernels;
 use super::kernels_kv::{KvF16Kernels, ATTN_PREFILL_ROW_TILE};
+pub(crate) use super::kernels_mmq::MmqScratch;
 use super::kernels_quant::QuantKernels;
 use crate::error::RocmlError;
-
-/// Re-exported so `LinearWeight::matmul`/the qwen35 chunked-prefill layer
-/// files can name it without reaching into `kernels_mmq` directly.
-pub(crate) use super::kernels_mmq::MmqScratch;
 
 /// A raw device pointer, valid only as a kernel launch argument for as long
 /// as the buffer it was derived from is alive. See [`offset`].
@@ -140,12 +137,6 @@ pub(crate) fn load(hsaco: &[u8], name: &str) -> Result<(Module, rocml_hip::Funct
 }
 
 impl Kernels {
-    /// `mmq_enabled`: threaded from `LoadOptions::with_mmq` — whether
-    /// `gemm_quant` may dispatch a WMMA-eligible quantized matmul through
-    /// the int8 MMQ path instead of f16 WMMA (see `kernels_quant.rs`'s
-    /// `QuantKernels::gemm` for the full dispatch policy and why this is
-    /// off by default). Ignored by every other kernel this struct owns —
-    /// only `QuantKernels` cares.
     pub fn load_all(mmq_enabled: bool) -> Result<Self, RocmlError> {
         let (_mod_embedding, embedding_fn) = load(
             rocml_kernels::EMBEDDING_F16_F32_HSACO,
