@@ -9,6 +9,7 @@ use super::attention_chunk_mixed::attention_chunk_step_mixed;
 use super::chunk_scratch::CHUNK_CAP;
 use super::ffn_chunk::ffn_chunk_step;
 use super::gdn_chunk::gdn_chunk_step;
+use super::layer_capture::LayerCapture;
 use super::Model;
 use crate::error::RocmlError;
 use crate::forward::kernels::offset;
@@ -56,6 +57,29 @@ impl Model {
         prompt_ids: &[u32],
         prof: Option<&Profiler>,
     ) -> Result<Vec<f32>, RocmlError> {
+        self.forward_prompt_chunked_inner(prompt_ids, prof, None)
+    }
+
+    /// Issue #10's per-layer diff harness: identical to
+    /// [`Self::forward_prompt_chunked`], but records the final chunk's
+    /// post-layer residual stream into `capture` (see
+    /// `layer_capture::LayerCapture`) as it goes. Only ever meant for the
+    /// diagnostic test/tool driving it — not on any hot path.
+    pub fn forward_prompt_chunked_captured(
+        &mut self,
+        prompt_ids: &[u32],
+        prof: Option<&Profiler>,
+        capture: &mut LayerCapture,
+    ) -> Result<Vec<f32>, RocmlError> {
+        self.forward_prompt_chunked_inner(prompt_ids, prof, Some(capture))
+    }
+
+    fn forward_prompt_chunked_inner(
+        &mut self,
+        prompt_ids: &[u32],
+        prof: Option<&Profiler>,
+        mut capture: Option<&mut LayerCapture>,
+    ) -> Result<Vec<f32>, RocmlError> {
         if prompt_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -65,7 +89,12 @@ impl Model {
         while i < prompt_ids.len() {
             let end = (i + chunk_size).min(prompt_ids.len());
             let is_last_chunk = end == prompt_ids.len();
-            if let Some(l) = self.forward_chunk(&prompt_ids[i..end], is_last_chunk, prof)? {
+            if let Some(l) = self.forward_chunk(
+                &prompt_ids[i..end],
+                is_last_chunk,
+                prof,
+                capture.as_deref_mut(),
+            )? {
                 logits = l;
             }
             i = end;
@@ -86,6 +115,7 @@ impl Model {
         token_ids: &[u32],
         want_logits: bool,
         prof: Option<&Profiler>,
+        mut capture: Option<&mut LayerCapture>,
     ) -> Result<Option<Vec<f32>>, RocmlError> {
         let chunk_len = token_ids.len() as u32;
         if chunk_len == 0 {
@@ -142,6 +172,7 @@ impl Model {
                         chunk_len,
                         prof,
                         Some(layer_idx_u32),
+                        capture.as_deref_mut(),
                     )?;
                     ffn_chunk_step(
                         &self.kernels,
@@ -154,6 +185,7 @@ impl Model {
                         chunk_len,
                         prof,
                         Some(layer_idx_u32),
+                        capture.as_deref_mut(),
                     )?;
                 }
                 (LayerWeights::Attention(attn_weights), LayerKind::FullAttention) => {
@@ -206,12 +238,28 @@ impl Model {
                         chunk_len,
                         prof,
                         Some(layer_idx_u32),
+                        capture.as_deref_mut(),
                     )?;
                 }
                 _ => {
                     return Err(RocmlError::Config(format!(
                         "layer {layer_idx}: weight/kind mismatch (internal bug)"
                     )))
+                }
+            }
+            // Issue #10's per-layer diff harness: only the final chunk's
+            // residual stream is comparable to the logits divergence this
+            // was built to localize (see `layer_capture`'s module doc), and
+            // `want_logits` is exactly "is this the prompt's last chunk".
+            if want_logits {
+                if let Some(cap) = capture.as_deref_mut() {
+                    cap.record(
+                        layer_idx_u32,
+                        "resid_post",
+                        &self.chunk_scratch.x,
+                        chunk_len,
+                        hidden,
+                    )?;
                 }
             }
         }

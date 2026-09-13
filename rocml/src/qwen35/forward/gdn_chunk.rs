@@ -11,6 +11,7 @@ use super::chunk_kernels::ChunkKernels;
 use super::chunk_scratch::ChunkScratch;
 use super::gdn_chunkwise::gdn_chunkwise_step;
 use super::gdn_chunkwise_kernels::GdnChunkwiseKernels;
+use super::layer_capture::LayerCapture;
 use crate::error::RocmlError;
 use crate::forward::kernels::{offset, Kernels};
 use crate::profile::{self, OpKind, Profiler};
@@ -30,6 +31,7 @@ pub(crate) fn gdn_chunk_step(
     chunk_len: u32,
     prof: Option<&Profiler>,
     layer_idx: Option<u32>,
+    mut capture: Option<&mut LayerCapture>,
 ) -> Result<(), RocmlError> {
     let hidden = config.embedding_length;
     let gdn: &GdnConfig = &config.gdn;
@@ -51,6 +53,9 @@ pub(crate) fn gdn_chunk_step(
             )
         },
     )?;
+    if let (Some(cap), Some(li)) = (capture.as_deref_mut(), layer_idx) {
+        cap.record(li, "gdn_xn", &scratch.xn, chunk_len, hidden)?;
+    }
 
     let (conv_bytes, conv_flops) = gdn_conv_chunk_cost(gdn, hidden, layer, chunk_len);
     Profiler::scope(
@@ -69,6 +74,9 @@ pub(crate) fn gdn_chunk_step(
                 hidden,
                 scratch.mmq_scratch(),
             )?;
+            if let (Some(cap), Some(li)) = (capture.as_deref_mut(), layer_idx) {
+                cap.record(li, "gdn_qkv_raw", &scratch.gdn_qkv, chunk_len, gdn.conv_dim)?;
+            }
             layer.attn_gate.matmul(
                 kernels,
                 offset(&scratch.xn, 0),
@@ -177,6 +185,9 @@ pub(crate) fn gdn_chunk_step(
                 offset(&scratch.gdn_y, 0),
                 chunk_len * gdn.value_dim,
             )?;
+            if let (Some(cap), Some(li)) = (capture.as_deref_mut(), layer_idx) {
+                cap.record(li, "gdn_y_silu", &scratch.gdn_y, chunk_len, gdn.value_dim)?;
+            }
 
             layer.ssm_out.matmul(
                 kernels,
@@ -187,6 +198,9 @@ pub(crate) fn gdn_chunk_step(
                 gdn.value_dim,
                 scratch.mmq_scratch(),
             )?;
+            if let (Some(cap), Some(li)) = (capture, layer_idx) {
+                cap.record(li, "gdn_ssm_out_raw", &scratch.gdn_out, chunk_len, hidden)?;
+            }
             kernels.add_inplace(
                 offset(&scratch.x, 0),
                 offset(&scratch.gdn_out, 0),

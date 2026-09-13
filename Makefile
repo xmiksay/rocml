@@ -7,7 +7,7 @@ ROCML_CHECKPOINT_DIR ?= $(HOME)/checkpoints
 # Dev/test model (fast); override to point at a different checkpoint.
 QWEN_MODEL ?= $(ROCML_CHECKPOINT_DIR)/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf
 
-.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench eval
+.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench eval mmq-layer-diff mmq-endtoend-measure
 
 build:
 	cargo build --workspace
@@ -95,3 +95,21 @@ eval:
 		--label ornith-q4km-fp16kv \
 		--out bench/eval/results/ornith-q4km-fp16kv.json \
 		--resume
+
+# Issue #10's per-layer diff harness (`rocml/tests/mmq_layer_diff.rs`):
+# runs Qwen3.5-2B's chunked-prefill path with MMQ off vs on over the same
+# real-text prompt and reports per-layer max/mean relative error, worst
+# first — the localization step for the int8-MMQ precision investigation.
+# Diagnostic tool, not a correctness gate, hence `--ignored`.
+mmq-layer-diff:
+	cargo test --release -p rocml --test mmq_layer_diff -- --ignored --nocapture
+
+# End-to-end companion to mmq-layer-diff (`rocml/tests/mmq_endtoend_measure.rs`):
+# measures (never asserts — the real gate is qwen35_chunked_prefill_parity,
+# left untouched) chunked-vs-token-serial final-logits max relative error
+# and out-of-tolerance fraction with MMQ off and on, at the gate's own
+# prompt lengths — how the int8-MMQ-integration round's 12.4%-15.1% figures
+# and this round's `mmq_eligible_by_name` exclusion's real-world effect on
+# them were reproduced.
+mmq-endtoend-measure:
+	cargo test --release -p rocml --test mmq_endtoend_measure -- --ignored --nocapture

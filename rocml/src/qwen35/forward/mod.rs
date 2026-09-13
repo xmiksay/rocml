@@ -19,6 +19,7 @@ mod gdn_chunkwise_kernels;
 mod kernels;
 pub(crate) mod kernels_flash_mixed;
 pub(crate) mod kernels_mixed;
+pub mod layer_capture;
 mod scratch;
 mod snapshot;
 
