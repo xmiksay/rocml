@@ -7,7 +7,7 @@ ROCML_CHECKPOINT_DIR ?= $(HOME)/checkpoints
 # Dev/test model (fast); override to point at a different checkpoint.
 QWEN_MODEL ?= $(ROCML_CHECKPOINT_DIR)/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf
 
-.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench bench-profile bench-profile-json eval mmq-layer-diff mmq-endtoend-measure kv-head-error-measure gdn-wmma-lds-perf gdn-uvvnew-perf
+.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench bench-profile bench-profile-json eval mmq-layer-diff mmq-endtoend-measure mmq-calibrate mmq-smoothquant-measure kv-head-error-measure gdn-wmma-lds-perf gdn-uvvnew-perf
 
 build:
 	cargo build --workspace
@@ -144,6 +144,22 @@ mmq-layer-diff:
 # them were reproduced.
 mmq-endtoend-measure:
 	cargo test --release -p rocml --test mmq_endtoend_measure -- --ignored --nocapture
+
+# Issue #17's calibration harness (`rocml/tests/mmq_calibrate.rs`): captures
+# per-input-channel amax for every MMQ-eligible matmul input over a real-text
+# calibration run on Ornith-1.0-9B-Q4_K_M, persisted as a JSON sidecar under
+# the OS temp dir for `mmq-smoothquant-measure` to read back.
+mmq-calibrate:
+	cargo test --release -p rocml --test mmq_calibrate -- --ignored --nocapture
+
+# Issue #17's standalone SmoothQuant-style measurement
+# (`rocml/tests/mmq_smoothquant_measure.rs`): CPU-only, reads the calibration
+# sidecar `mmq-calibrate` produced plus real GGUF weight bytes, measures
+# activation flatness / weight requant error / single-matmul output error at
+# alpha in {0.5, 0.65, 0.8} for ssm_out and ffn_down, before deciding whether
+# smoothing is worth integrating. Requires `mmq-calibrate` to have run first.
+mmq-smoothquant-measure:
+	cargo test --release -p rocml --test mmq_smoothquant_measure -- --ignored --nocapture
 
 # Issue #2's per-head boundary-skip measurement (`rocml/tests/kv_head_error_measure.rs`):
 # runs Ornith-1.0-9B's fp16-KV decode path over a real prompt, captures the
