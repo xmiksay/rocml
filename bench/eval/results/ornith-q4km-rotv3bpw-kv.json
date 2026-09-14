@@ -1,0 +1,208 @@
+{
+  "label": "ornith-q4km-rotv3bpw-kv",
+  "timestamp_unix": 1789393670,
+  "git_rev": "a117c37",
+  "model_path": "/home/miksa/checkpoints/Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf",
+  "engine_config": {
+    "ctx": 16384,
+    "kv_cache": "q8",
+    "max_gen_tokens": 2048,
+    "sampling": {
+      "temperature": 0.0,
+      "top_k": null,
+      "top_p": null,
+      "seed": 0
+    }
+  },
+  "per_scenario": [
+    {
+      "id": "weather_prague",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user is asking about the current weather in Prague. I have a tool available called \"get_weather\" that can provide current weather information for a location. I should call this tool with \"Prague\" as the location parameter. The \"unit\" parameter is optional, so I won't specify it unless asked.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=location>\nPrague\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 2.988877221
+    },
+    {
+      "id": "send_email_basic",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user wants me to send an email with specific details:\n- To: boss@example.com\n- Subject: Status Update\n- Body: The deployment finished successfully.\n\nI have the send_email function available with the required parameters: to, subject, and body. I have all the information needed to make this call.\n</think>\n\n<tool_call>\n<function=send_email>\n<parameter=to>\nboss@example.com\n</parameter>\n<parameter=subject>\nStatus Update\n</parameter>\n<parameter=body>\nThe deployment finished successfully.\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 3.3166747340000002
+    },
+    {
+      "id": "currency_convert",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user wants to convert 250 US dollars to Japanese yen. I have a convert_currency tool that can do this. I need to provide the amount (250), from currency (USD), and to currency (JPY).\n</think>\n\n<tool_call>\n<function=convert_currency>\n<parameter=amount>\n250\n</parameter>\n<parameter=from>\nUSD\n</parameter>\n<parameter=to>\nJPY\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 2.890020101
+    },
+    {
+      "id": "calendar_event",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user wants me to schedule a calendar event with the following details:\n- Title: \"Q3 Planning\"\n- Date: 2026-09-20\n- Time: 14:00\n\nI have the `create_calendar_event` function available which takes three required parameters: title, date, and time. All the information I need is provided by the user, so I can proceed with the function call.\n</think>\n\n<tool_call>\n<function=create_calendar_event>\n<parameter=title>\nQ3 Planning\n</parameter>\n<parameter=date>\n2026-09-20\n</parameter>\n<parameter=time>\n14:00\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 4.04839536
+    },
+    {
+      "id": "stock_price",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user is asking for the current stock price of NVIDIA with ticker NVDA. I have a tool called \"get_stock_price\" that can retrieve this information. I should call this tool with the ticker \"NVDA\".\n</think>\n\n<tool_call>\n<function=get_stock_price>\n<parameter=ticker>\nNVDA\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 2.220414314
+    },
+    {
+      "id": "translate_text",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user wants to translate \"good morning\" into French. I can use the translate_text function for this.\n</think>\n\n<tool_call>\n<function=translate_text>\n<parameter=text>\ngood morning\n</parameter>\n<parameter=target_language>\nFrench\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 1.892464047
+    },
+    {
+      "id": "set_reminder_quoted",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user wants me to set a reminder for 15 minutes from now with the text \"call the dentist\". I have the set_reminder tool available which takes a \"text\" parameter and a \"minutes_before\" parameter. I should use this to set the reminder.\n</think>\n\n<tool_call>\n<function=set_reminder>\n<parameter=text>\ncall the dentist\n</parameter>\n<parameter=minutes_before>\n15\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 2.73686924
+    },
+    {
+      "id": "control_light",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user wants me to turn on the kitchen lights and set them to 80% brightness. I have a `control_smart_light` function that can do this. Let me check the parameters:\n\n- room: \"kitchen\" (required)\n- state: \"on\" (required)\n- brightness: 80 (optional, but user specified it)\n\nI have all the required parameters and the optional one the user wants. I'll make the function call.\n</think>\n\n<tool_call>\n<function=control_smart_light>\n<parameter=room>\nkitchen\n</parameter>\n<parameter=state>\non\n</parameter>\n<parameter=brightness>\n80\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 3.950322287
+    },
+    {
+      "id": "capital_of_france",
+      "kind": "no_tool",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user is asking a simple factual question about the capital of France. This is basic knowledge that doesn't require any tools. The capital of France is Paris. They want the answer in one word.\n</think>\n\nParis",
+      "wall_seconds": 1.49681715
+    },
+    {
+      "id": "http_meaning",
+      "kind": "no_tool",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user is asking about the acronym HTTP. This is a well-known fact that doesn't require any external information or tools. HTTP stands for Hypertext Transfer Protocol. I can answer this directly without using any tools.\n</think>\n\nHTTP stands for Hypertext Transfer Protocol.",
+      "wall_seconds": 1.706823754
+    },
+    {
+      "id": "count_continents",
+      "kind": "no_tool",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user is asking about how many continents there are on Earth. This is a general knowledge question that doesn't require any tools. The answer depends on the model being used, but the most commonly accepted answer is 7 continents: Africa, Antarctica, Asia, Europe, North America, Oceania (Australia), and South America. Some models use 6 (combining Europe and Asia as Eurasia), and some use 5 (combining North and South America as Americas). I'll provide the most widely accepted answer.\n</think>\n\nThere are **7 continents** on Earth, according to the most widely accepted model:\n\n1. **Africa**\n2. **Antarctica**\n3. **Asia**\n4. **Europe**\n5. **North America**\n6. **Oceania** (also called Australia)\n7. **South America**\n\nSome models use different groupings:\n- **6 continents**: Europe and Asia are combined as \"Eurasia\"\n- **5 continents**: North and South America are combined as \"the Americas\"\n\nThe 7-continent model is the most commonly used in English-speaking countries and international education.",
+      "wall_seconds": 5.817057723
+    },
+    {
+      "id": "weather_then_advice",
+      "kind": "multi_turn",
+      "pass": true,
+      "detail": "turn 1: ok; turn 2: ok",
+      "raw_output": "[turn 1]\nThe user is asking about the weather in London right now. I have a tool called \"get_weather\" that can get the current weather for a location. I need to call this tool with \"London\" as the location parameter.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=location>\nLondon\n</parameter>\n</function>\n</tool_call>\n\n[turn 2]\nThe user is asking about the weather in London. I just got the weather data back. Let me summarize it clearly.\n</think>\n\nThe weather in London right now is:\n\n- **Condition:** Light rain\n- **Temperature:** 14°C",
+      "wall_seconds": 3.640986904
+    },
+    {
+      "id": "stock_lookup_then_report",
+      "kind": "multi_turn",
+      "pass": true,
+      "detail": "turn 1: ok; turn 2: ok",
+      "raw_output": "[turn 1]\nThe user is asking for the current price of AAPL stock. I have a tool called \"get_stock_price\" that can retrieve the current stock price for a given ticker. I need to call this tool with \"AAPL\" as the ticker parameter.\n</think>\n\n<tool_call>\n<function=get_stock_price>\n<parameter=ticker>\nAAPL\n</parameter>\n</function>\n</tool_call>\n\n[turn 2]\nThe user is asking for the current price of AAPL stock. I just retrieved the information and it shows $227.35. I should present this clearly to the user.\n</think>\n\nThe current price of AAPL (Apple Inc.) is **$227.35 USD**.",
+      "wall_seconds": 4.060926345
+    },
+    {
+      "id": "email_then_confirm",
+      "kind": "multi_turn",
+      "pass": true,
+      "detail": "turn 1: ok; turn 2: ok",
+      "raw_output": "[turn 1]\nThe user wants me to send an email with specific details:\n- To: alice@example.com\n- Subject: Lunch\n- Body: Are you free for lunch tomorrow?\n\nI have the send_email function available with parameters: to, subject, and body. All required parameters are provided, so I can proceed with the function call.\n</think>\n\n<tool_call>\n<function=send_email>\n<parameter=to>\nalice@example.com\n</parameter>\n<parameter=subject>\nLunch\n</parameter>\n<parameter=body>\nAre you free for lunch tomorrow?\n</parameter>\n</function>\n</tool_call>\n\n[turn 2]\nThe email has been sent successfully. I should confirm this to the user.\n</think>\n\nDone! The email has been sent to alice@example.com with the subject \"Lunch\" and the message \"Are you free for lunch tomorrow?\"",
+      "wall_seconds": 4.985952276
+    },
+    {
+      "id": "two_city_weather",
+      "kind": "multi_turn",
+      "pass": false,
+      "detail": "turn 1: expected exactly 1 tool call, got 2",
+      "raw_output": "The user wants to check the weather in two locations: London and Paris. I have a get_weather function that takes a location parameter. I'll need to make two separate function calls, one for each city.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=location>\nLondon\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 2.543468666
+    },
+    {
+      "id": "currency_then_advice",
+      "kind": "multi_turn",
+      "pass": true,
+      "detail": "turn 1: ok; turn 2: ok",
+      "raw_output": "[turn 1]\nThe user wants to convert 500 EUR to GBP. I have a convert_currency tool that can handle this. I need to provide the amount (500), from currency (EUR), and to currency (GBP).\n</think>\n\n<tool_call>\n<function=convert_currency>\n<parameter=amount>\n500\n</parameter>\n<parameter=from>\nEUR\n</parameter>\n<parameter=to>\nGBP\n</parameter>\n</function>\n</tool_call>\n\n[turn 2]\nThe user asked to convert 500 EUR to GBP. I used the convert_currency tool and got the result of 430.15 GBP. I should present this clearly to the user.\n</think>\n\n500 EUR is approximately **430.15 GBP**.",
+      "wall_seconds": 4.726053572
+    },
+    {
+      "id": "needle_4k_early",
+      "kind": "long_context",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "Thinking Process:\n\n1.  **Analyze the Request:** The user wants to find a specific piece of information (\"secret laboratory access code\") embedded within a large block of seemingly random text. The instruction is to reply with *just the code*.\n\n2.  **Scan the Text:** I need to read through the provided text specifically looking for keywords like \"secret\", \"laboratory\", \"access code\", or patterns that look like codes (e.g., alphanumeric strings).\n\n3.  **Execute Search:**\n    *   Scanning...\n    *   ... \"The secret laboratory.\" -> Found \"secret laboratory\".\n    *   Immediately following that sentence: \"Access code is ZQ-7734.\"\n\n4.  **Verify:**\n    *   Text segment: \"The secret laboratory. Access code is ZQ-7734.\"\n    *   Code: ZQ-7734.\n\n5.  **Formulate Output:** The user requested \"just the code\".\n\n6.  **Final Answer:** ZQ-7734.cw\n</think>\n\nZQ-7734",
+      "wall_seconds": 10.817631074
+    },
+    {
+      "id": "needle_4k_late",
+      "kind": "long_context",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "Thinking Process:\n\n1.  **Analyze the Request:** The user is asking for the password to the vault based on the provided text.\n\n2.  **Scan the Text:** I need to read through the provided text to find any mention of a \"password\" or \"vault\". The text appears to be a long, nonsensical stream of words (possibly generated or obfuscated), but I need to look for specific keywords.\n\n3.  **Keyword Search:**\n    *   \"password\"\n    *   \"vault\"\n    *   \"Falcon\"\n    *   \"Nine\"\n    *   \"Echo\"\n\n4.  **Locate the Information:**\n    *   Scanning through the middle-to-late section of the text...\n    *   Found this sentence: \"Mountains gates birds seeking The password to the vault. Is Falcon-Nine-Echo. sing wait under market lazy wrapped fresh.\"\n\n5.  **Extract the Answer:** The text explicitly states: \"The password to the vault. Is Falcon-Nine-Echo.\"\n\n6.  **Formulate the Output:** State the password clearly as found in the text.\n\n7.  **Final Verification:** Does the text say anything else? No, that specific sentence is the only one mentioning the vault password. The answer is \"Falcon-Nine-Echo\".\n</think>\n\nBased on the text provided, the password to the vault is **Falcon-Nine-Echo**.\n\nThis is found in the sentence: \"Mountains gates birds seeking The password to the vault. Is Falcon-Nine-Echo.\"",
+      "wall_seconds": 12.765245959
+    },
+    {
+      "id": "needle_8k_middle",
+      "kind": "long_context",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user is asking for specific information from the provided text: \"Where and when is Agent Whitmore's rendezvous?\"\n\n1.  **Scan the text for keywords:** I need to look for \"Agent Whitmore\", \"rendezvous\", \"where\", \"when\", \"Pier\", \"Midnight\", etc.\n2.  **Locate the relevant sentence:** Scanning through the generated text...\n    *   Most of the text is a stream of random words (nonsense/garbled).\n    *   I see a sentence that stands out: \"Goods Agent Whitmore's rendezvous point is Pier 19 at. Midnight.\"\n    *   Let me find this exact string in the provided text.\n    *   Searching... \"Goods Agent Whitmore's rendezvous point is Pier 19 at. Midnight.\"\n    *   It appears in the block: \"...Clear seeking shopkeepers mountains carries arrange toward fresh garden. Dog town streets school arm rises birds librarians arrange. Pages dog garden bridge play classroom toward birds gather. Arrange exchange questions quiet gather fresh runs goods town. Fully wait quiet cloth shelves morning scent brown shopkeepers. Old old past wait sky old wind jumps open. Travelers cloth front arrange bread teachers garden classroom stone. Fully doors vegetables school tall wait hurry answers lazy. Questions fresh morning patiently school down narrow lunch while. Market sing trees quick clear wrapped goods tall rises. Librarians runs valley wrapped day cloth old town vegetables. Classroom stone goods stories fresh vegetables under gates students. Grain wrapped farmers quietly goods market wrapped sing stories. The factory garden sky head day mountains old travelers. While readers under under gather rises gates the carries. Children cloth from stories school stories narrow clear ahead. Travelers play lunch readers questions tall carts day librarians. Under bread seeking through exchange students dog bridge morning. Gather arm wrapped morning rises carrying goods questions students. Stories birds workers town wind toward vegetables jumps from. Classroom pages mountains early head pages while sun bridge. Seeking stories fresh brown walk exchange lunc... [truncated]",
+      "wall_seconds": 60.068609931
+    },
+    {
+      "id": "needle_8k_early",
+      "kind": "long_context",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "Thinking Process:\n\n1.  **Analyze the Request:** The user is asking for a specific piece of information (\"winning lottery number combination\") that was stated earlier in the provided text.\n\n2.  **Scan the Text:** I need to read through the provided text to locate the lottery numbers. The text is a long, somewhat nonsensical paragraph (resembling a \"gibberish\" or \"stream of consciousness\" style, possibly generated for a specific task like a needle-in-a-haystack search).\n\n3.  **Search Strategy:** I will look for keywords like \"lottery\", \"number\", \"combination\", \"winning\", \"draw\".\n\n4.  **Execution:**\n    *   Scanning...\n    *   Found segment: \"Readers doors The winning lottery number combination is 14-27-33-49-52..\"\n    *   This is located roughly in the middle of the first large block of text.\n\n5.  **Extract Information:** The numbers are 14-27-33-49-52.\n\n6.  **Formulate Output:** State the numbers clearly as requested.\n\n7.  **Final Verification:** Does the text explicitly say \"The winning lottery number combination is 14-27-33-49-52.\"? Yes.\n\n    *   Context: \"Readers doors The winning lottery number combination is 14-27-33-49-52.. Rises shelves town morning birds front trees under doors.\"\n\n8.  **Construct Final Response:** The winning lottery number combination stated in the text is 14-27-33-49-52.cw\n</think>\n\nThe winning lottery number combination stated in the text is **14-27-33-49-52**.",
+      "wall_seconds": 21.125206313
+    }
+  ],
+  "aggregates": {
+    "overall_total": 20,
+    "overall_passed": 19,
+    "overall_fraction": 0.95,
+    "by_kind": {
+      "long_context": {
+        "total": 4,
+        "passed": 4,
+        "fraction": 1.0
+      },
+      "multi_turn": {
+        "total": 5,
+        "passed": 4,
+        "fraction": 0.8
+      },
+      "no_tool": {
+        "total": 3,
+        "passed": 3,
+        "fraction": 1.0
+      },
+      "tool_choice": {
+        "total": 8,
+        "passed": 8,
+        "fraction": 1.0
+      }
+    }
+  },
+  "ppl": 1.0858284744305893,
+  "ppl_wall_seconds": 47.413505836
+}

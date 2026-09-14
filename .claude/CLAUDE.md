@@ -229,6 +229,116 @@ The dense `qwen3` architecture (`rocml/src/forward/`) now supports `--kv-cache q
 - **ctx budget**: Qwen3-0.6B's own declared `context_length` (40960) already caps it well below what either KV dtype's VRAM budget allows, but the VRAM-only `max_ctx()` figures show the expected win: ~135K tokens fp16 vs ~311K tokens q4-mixed (2.3x) at this checkpoint's shape on a 16GB card.
 - **Bench** (`bench --depth 2048`, single run): Qwen3-0.6B prefill 113.0 (fp16) -> 109.7 tok/s q4-mixed (-2.9%), decode 106.4 -> 102.4 tok/s (-3.8%) — small, expected overhead, consistent with the hybrid architecture's own measured mixed-cache tax. Confirmed **zero regression** to existing paths: ornith-9b @ depth 8192 unchanged (688.7/44.1 tok/s prefill/decode vs. the pre-existing 688/44.3 baseline, both well within noise), qwen3.5-2b @ depth 2048 fp16-vs-q4-mixed unchanged (3456.3/114.6 vs. 3388.3/113.0, ~2%/~1.4% — matches this section's own previously-measured figures), `--kv-cache q4-mixed --ctx 140000` on ornith-9b still loads and runs.
 
+### Rotational KV quantization (issue #14, phase 2) — measured, STOP
+
+Phase 2's decision gate: does block-diagonal 2D Givens rotation + a
+precomputed Lloyd-Max scalar codebook (2-3.5 bpw) hold up on real tasks
+well enough to justify phase 3's fast HIP kernels? `rocml::kv_quant::rotational`
+(pure CPU reference: `rotate.rs` — pairing + Givens forward/inverse rotation
++ per-pair calibration; `lloyd.rs` — classic Lloyd-Max scalar quantizer;
+`sidecar.rs` — per-tensor-kind calibration bundle, embedded at compile time
+from `rocml/data/rotational_kv_calibration.json`) plus a debug model-level
+simulation (`LoadOptions::kv_rot_sim`/`kv_rot_sim_k`, `MixedAttnPlane`'s
+eviction hook in `qwen35/cache_mixed/rot_sim.rs`: round-trips V, optionally
+K, through the reference at every window eviction before the real Q8/Q4
+production encode runs on the already-corrupted result — no new kernel, no
+new bulk storage format, performance irrelevant by design).
+
+**Calibration measurement** (`make rotational-kv-calibrate`, real Ornith-1.0-9B-Q4_K_M
+K/V, 80/20 train/holdout split): searched `Adjacent`/`SplitHalf` pairing x
+per-pair-calibrated/fixed-45-degree angles, picked by holdout round-trip
+RMSE at 3 bpw. **`SplitHalf` + fixed-45-degree won for both K and V** —
+per-pair calibration (zeroing each pair's cross-covariance) measured
+*worse* than the free fixed-angle baseline (K: 0.230 calibrated vs 0.216
+fixed; V: 0.427 vs 0.390) — a real, measured negative for the "calibrate
+the rotation" hypothesis on this data.
+
+**Tensor-level table** (`make rotational-kv-measure`, same held-out real
+K/V, vs the current scalar encoding):
+
+| tensor | encoding | vec RMSE | attn-metric RMSE |
+|---|---|---|---|
+| K | scalar-q8 (production) | 0.0055 | 0.00038 (softmax-weight) |
+| K | rotational-4bpw | 0.117 | 0.0098 |
+| K | rotational-3bpw | 0.216 | 0.0148 |
+| K | rotational-2bpw | 0.384 | 0.0204 |
+| V | scalar-q8 | 0.0197 | 0.0068 (attn-output rel) |
+| V | scalar-q4 (production `q4-mixed`) | 0.298 | 0.122 |
+| V | rotational-4bpw | 0.122 | 0.0835 |
+| V | rotational-3bpw | 0.390 | 0.172 |
+| V | rotational-2bpw | 0.540 | 0.317 |
+
+K: rotational is **20-70x worse** than the existing per-channel Q8 encoding
+at every bpw tried — never a candidate for K. V: rotational roughly
+matches/beats scalar Q4 at 4 bpw (same byte budget), but is clearly worse
+than Q4 at the 3 bpw headline despite using fewer bytes — the byte savings
+come at a real quality cost, not "free" the way the plan's Beta-distribution
+hypothesis implied. Likely root cause (not fixed this round, flagged for any
+future attempt): a block-diagonal rotation only decorrelates *within* each
+channel pair — it doesn't flatten variance *across* the 128 pairs the way a
+global Hadamard transform would, so a single shared/pooled Lloyd-Max
+codebook (the plan's own design, since post-rotation coordinates are
+assumed interchangeable) is a worse fit than intended.
+
+**Model-level results** — sim-parity (informational, `make rotational-kv-sim-parity`,
+Qwen3.5-2B synthetic prompt, q8 baseline vs `--kv-rot-sim {2,3,4}`): max
+relative logit diff 1.79/0.97/0.65 at 2/3/4 bpw, but **zero greedy
+divergence** over 200 decode steps at any bpw — this synthetic prompt's
+argmax turned out to be robust to even a large logit perturbation, so the
+informative signal came from the real-task eval below instead, not this
+gate. **The decision gate** (`make eval-rotational-v3`, Ornith-1.0-9B-Q4_K_M,
+ctx 16384, K left at real production Q8):
+
+| config | agentic (20 scenarios) | PPL | Δ PPL vs fp16-Q4_K_M |
+|---|---|---|---|
+| fp16 KV (Q6_K) | 19/20 | 1.08003 | — |
+| fp16 KV (Q4_K_M) | 19/20 | 1.08070 | baseline |
+| V rotational 3bpw, K real q8 | 19/20 | 1.0828 | +0.0021 (+0.19%) |
+| V **and** K rotational 3bpw | 19/20 | 1.0858 | +0.0159 (+1.47%) |
+
+Every config fails the identical single scenario (`two_city_weather`,
+"expected exactly 1 tool call, got 2") — a pre-existing model quirk, not a
+regression from this technique; the 20-scenario pass/fail metric doesn't
+discriminate at all between fp16 and either rotational config. **PPL does**:
+it rises monotonically with how much of the cache is rotationally
+quantized, and the V-only PPL delta (+0.19%) is ~4x the delta already
+accepted between fp16 and production `q4-mixed` KV (1.08070 -> ~1.0812,
++0.05%) — a real, if modest, quality cost, not the near-zero the phase 2
+acceptance bar asks for. The V+K variant (the configuration that would
+actually unlock a large byte win) shows a clearly non-negligible +1.47% PPL
+increase, confirming the tensor-level table's prediction.
+
+**Bytes/token projection** (Ornith: 4 kv heads x 6 mixed-eligible layers,
+2 boundary layers always fp16 regardless of encoding): production
+`q4-mixed` ≈ 17696 B/token (K q8 264 B/head + V q4 132 B/head, mixed
+portion, plus the 2 boundary layers' fixed 8192 B/token fp16 cost).
+V-only-rotational-3bpw (the only variant this measurement can recommend) ≈
+16880 B/token — a **4.6% total reduction** (8.6% of the mixed portion
+alone: V's own 132 -> 98 B/head). At 150K context that's ~2.53 GB vs
+~2.65 GB, ~120 MB saved — nowhere near the plan's "2-3.5bpw K+V, 3.2GB vs
+16.4GB fp16 at 262K" motivating hypothesis, since K cannot safely use this
+technique with the current design. The K+V-both variant that *would* reach
+a large win (≈12896 B/token, -27%, ~720MB at 150K) is exactly the one the
+quality measurement above rejects.
+
+**Verdict: STOP.** Neither variant clears "near-zero loss": V-only's PPL
+cost is small but real and larger than an already-accepted quantization
+delta, and the only variant with a byte win worth phase 3's three-kernel
+investment (K+V) shows a clearly measurable quality regression. Not
+implemented further — no fast kernels, no production `KvCacheMode`
+integration. Kept in the tree as a decision record: the CPU reference
+(`kv_quant::rotational`), the calibration/measurement harness (`make
+rotational-kv-calibrate`/`rotational-kv-measure`/`rotational-kv-sim-parity`),
+and the debug `--kv-rot-sim` simulation flag, all inert by default
+(`kv_rot_sim: None`) and fully covered by the existing parity suite
+(`mixed_kv_parity`/`dense_mixed_kv_parity`/`kv_dtype_parity`/
+`mixed_kv_chunked_prefill_parity`/`snapshot_equivalence`/`ornith_e2e`, all
+still pass unmodified). Closes issue #14 as measured-out-of-scope for now,
+per the issue's own protocol; the pooled-codebook root cause above is a
+concrete lead for a future attempt (per-channel/per-pair codebooks instead
+of one shared LUT, or revisiting the global Hadamard alternative the issue
+set aside for RDNA3-hardware reasons) but out of this round's scope.
+
 ## Conversation-state snapshots (issue #1)
 
 `rocml/src/snapshot/` is an immutable checkpoint store for the qwen35 hybrid architecture's full decode state (GDN recurrence + linear full-attention KV) at a token position, addressed by an exact token-id prefix match — the point being that agentic workloads re-send a growing conversation every turn, and GDN state is O(1) in position, so restoring a snapshot and prefilling only the new suffix turns per-turn prefill from O(conversation) into O(new tokens). **Dense `qwen3` is out of scope**: its KV cache is O(position) per layer with no fixed-size state to make a cheap mid-conversation checkpoint interesting — this is unaffected by issue #16's dense chunked-prefill port (below), which added no `LayerCapture`-style snapshot hook; `crate::model::Model::as_hybrid`/`as_hybrid_mut` is how every integration point (below) detects the architecture and skips snapshot logic entirely for `Dense`.
