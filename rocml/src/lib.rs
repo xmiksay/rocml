@@ -15,6 +15,7 @@ pub mod kv_quant;
 mod load_opts;
 mod model;
 pub mod profile;
+pub mod quant_policy;
 pub mod qwen35;
 pub mod registry;
 pub mod sample;

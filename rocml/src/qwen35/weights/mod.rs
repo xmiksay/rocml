@@ -30,6 +30,9 @@ pub struct ModelWeights {
 
 impl ModelWeights {
     pub fn load(gguf: &GgufFile, config: &Qwen35Config) -> Result<Self, RocmlError> {
+        crate::quant_policy::audit(gguf, crate::quant_policy::ArchFamily::Qwen35Hybrid)
+            .warn_violations();
+
         let token_embd = load_matrix_f16(
             gguf,
             "token_embd.weight",
