@@ -1,12 +1,14 @@
 //! LDS-staged WMMA variant of the chunkwise GPU pipeline runner
-//! (gdn-wmma-lds round, issue #6): identical to [`super::wmma`]'s
-//! `run_chunkwise_gpu_wmma` except stages B (`ut_build`) and F (`output`)
-//! route through `kernels/gdn_chunkwise_{ut_build,output}_wmma_lds.hip`
-//! instead of the naive per-16x16-tile kernels — see those files' module
-//! docs for the LDS-staging design. G (`state_update`) is unchanged (already
-//! wired into production dispatch by the gdn-wmma round). A separate file
-//! (not folded into `wmma.rs`) for the same 400-line-cap reason that file
-//! isn't folded into `mod.rs`.
+//! (gdn-wmma-lds round, issue #6; extended by the gdn-uvvnew round):
+//! identical to [`super::wmma`]'s `run_chunkwise_gpu_wmma` except stages B
+//! (`ut_build`), D+E (`uv_vnew`), and F (`output`) route through
+//! `kernels/gdn_chunkwise_{ut_build,uv_vnew,output}_wmma_lds.hip` instead of
+//! the naive per-16x16-tile/scalar kernels — see those files' module docs for
+//! the LDS-staging design (and `uv_vnew`'s own doc for the derived algebra
+//! and its mid-kernel-accumulator-to-LDS pattern). G (`state_update`) is
+//! unchanged (already wired into production dispatch by the gdn-wmma round).
+//! A separate file (not folded into `wmma.rs`) for the same 400-line-cap
+//! reason that file isn't folded into `mod.rs`.
 use std::ffi::c_void;
 
 use rocml_hip::{kernel_params, DeviceBuffer, LaunchConfig, Module};
@@ -29,7 +31,7 @@ pub struct ChunkwiseWmmaLdsKernels {
     _m3: Module,
     tinv: rocml_hip::Function,
     _m4: Module,
-    uv_vnew: rocml_hip::Function,
+    uv_vnew_lds: rocml_hip::Function,
     _m6: Module,
     output_lds: rocml_hip::Function,
     _m7: Module,
@@ -54,9 +56,9 @@ impl ChunkwiseWmmaLdsKernels {
             rocml_kernels::GDN_CW_TINV_F32_HSACO,
             rocml_kernels::GDN_CW_TINV_F32_KERNEL,
         );
-        let (_m4, uv_vnew) = load(
-            rocml_kernels::GDN_CW_UV_VNEW_F32_HSACO,
-            rocml_kernels::GDN_CW_UV_VNEW_F32_KERNEL,
+        let (_m4, uv_vnew_lds) = load(
+            rocml_kernels::GDN_CW_UV_VNEW_WMMA_LDS_F32_HSACO,
+            rocml_kernels::GDN_CW_UV_VNEW_WMMA_LDS_F32_KERNEL,
         );
         let (_m6, output_lds) = load(
             rocml_kernels::GDN_CW_OUTPUT_WMMA_LDS_F32_HSACO,
@@ -76,7 +78,7 @@ impl ChunkwiseWmmaLdsKernels {
             _m3,
             tinv,
             _m4,
-            uv_vnew,
+            uv_vnew_lds,
             _m6,
             output_lds,
             _m7,
@@ -138,7 +140,7 @@ pub fn run_chunkwise_gpu_wmma_lds(
     let vnew_p: *mut c_void = v_new.device_ptr();
     let y_p: *mut c_void = y.device_ptr();
 
-    // A1/A2/C/D+E: identical to the scalar pipeline (`run_chunkwise_gpu`).
+    // A1/A2/C: identical to the scalar pipeline (`run_chunkwise_gpu`).
     {
         let cfg = LaunchConfig {
             grid: (h, t, 1),
@@ -183,18 +185,20 @@ pub fn run_chunkwise_gpu_wmma_lds(
         let mut params = kernel_params!(kb_p, h, t);
         unsafe { k.tinv.launch(&cfg, &mut params, None) }.expect("tinv launch failed");
     }
+    // D+E (fused): uv_vnew, LDS-staged WMMA — one workgroup per head, block
+    // (32,16,1).
     {
-        let block = sk.max(sv);
         let cfg = LaunchConfig {
-            grid: (h, t, 1),
-            block: (block, 1, 1),
-            shared_mem_bytes: sk * 4,
+            grid: (h, 1, 1),
+            block: (32, 16, 1),
+            shared_mem_bytes: 3 * LDS_TILE_BYTES,
         };
         let mut params = kernel_params!(
             kb_p, conv_out_p, beta_p, k_beta_p, cde_p, state_p, vnew_p, h, hk, sk, sv, conv_dim,
             key_dim, t
         );
-        unsafe { k.uv_vnew.launch(&cfg, &mut params, None) }.expect("uv_vnew launch failed");
+        unsafe { k.uv_vnew_lds.launch(&cfg, &mut params, None) }
+            .expect("uv_vnew_lds launch failed");
     }
     // F: output, LDS-staged WMMA — one workgroup per head, block (32,16,1).
     {

@@ -19,7 +19,13 @@
 // both comfortably under the cap without needing double-buffering (this
 // pipeline's whole reduction axis is <=128 elements, 1-2 `K_SLICE` steps, so
 // there's little steady-state latency to hide compared to the main GEMM's
-// up-to-12288-deep reduction). `LDS_FREE`=128 is a **correctness precondition
+// up-to-12288-deep reduction). `gdn_chunkwise_uv_vnew_wmma_lds_f32` (gdn-uvvnew
+// round, issue #6) also stages 3 operands at a time (48KB, same as
+// `ut_build`) but reuses two of those three LDS slots for a *second* phase —
+// see that kernel's own doc comment for why materializing its own
+// mid-kernel accumulator into one of the freed slots (rather than routing it
+// through global memory) is the novel step this round adds on top of the
+// existing contig/transposed staging helpers below. `LDS_FREE`=128 is a **correctness precondition
 // of this path**, not just a tuning choice — a `tile_len`/`head_k_dim`/
 // `head_v_dim` bigger than 128 would silently leave part of the output
 // uncomputed (the fixed `WARPS_M*WARPS_N` tiling below only ever covers a
@@ -93,10 +99,15 @@ __device__ __forceinline__ void stage_contig_slice(
 // `base` is `[>=k_dim rows, >=n_free cols]` row-major (free = column axis,
 // contraction = row axis) — the transposing counterpart of
 // `stage_contig_slice` above. `k_scale`, if given, folds a bounded
-// per-contraction-step decay factor into the f16 rounding.
+// per-contraction-step decay factor into the f16 rounding; `scale_stride`
+// (default 1) lets that scale array live in a *token-major* buffer instead of
+// a contiguous per-head slice — `gdn_chunkwise_uv_vnew_wmma_lds.hip`'s `beta`
+// operand is `[tile_len, num_v_heads]` (see that kernel's own doc comment),
+// so its per-head scale column is strided by `num_v_heads`, not contiguous
+// like every other bounded factor this header's callers have folded so far.
 __device__ __forceinline__ void stage_transposed_slice(
     _Float16* lds, const float* base, unsigned ld, unsigned n_free, unsigned k_dim, unsigned k0,
-    unsigned tid, unsigned nthreads, const float* k_scale) {
+    unsigned tid, unsigned nthreads, const float* k_scale, unsigned scale_stride = 1) {
     unsigned lim = (k_dim > k0) ? min(K_SLICE, k_dim - k0) : 0;
     for (unsigned idx = tid; idx < LDS_FREE * K_SLICE; idx += nthreads) {
         // `free` varies fastest so consecutive threads read consecutive
@@ -107,7 +118,7 @@ __device__ __forceinline__ void stage_transposed_slice(
         float v = 0.0f;
         if (free < n_free && k < lim) {
             unsigned kk = k0 + k;
-            float s = k_scale ? k_scale[kk] : 1.0f;
+            float s = k_scale ? k_scale[kk * scale_stride] : 1.0f;
             v = base[(size_t)kk * ld + free] * s;
         }
         lds[(size_t)free * K_SLICE + k] = (_Float16)v;

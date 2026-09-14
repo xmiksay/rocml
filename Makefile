@@ -7,7 +7,7 @@ ROCML_CHECKPOINT_DIR ?= $(HOME)/checkpoints
 # Dev/test model (fast); override to point at a different checkpoint.
 QWEN_MODEL ?= $(ROCML_CHECKPOINT_DIR)/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf
 
-.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench bench-profile bench-profile-json eval mmq-layer-diff mmq-endtoend-measure gdn-wmma-lds-perf
+.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench bench-profile bench-profile-json eval mmq-layer-diff mmq-endtoend-measure gdn-wmma-lds-perf gdn-uvvnew-perf
 
 build:
 	cargo build --workspace
@@ -139,3 +139,10 @@ mmq-endtoend-measure:
 # gdn_chunkwise_wmma_lds.rs for the correctness gate).
 gdn-wmma-lds-perf:
 	cargo test --release -p rocml-kernels --test gdn_chunkwise_wmma_lds_perf -- --ignored --nocapture
+
+# gdn-uvvnew round (issue #6): same-process interleaved scalar/LDS-staged-WMMA
+# comparison for GDN chunkwise stage D+E (uv_vnew) at Ornith-1.0-9B's real
+# shape. Informational, not a gate (see gdn_chunkwise_wmma_lds.rs for the
+# correctness gate, including the 64-tile long-chain compounding check).
+gdn-uvvnew-perf:
+	cargo test --release -p rocml-kernels --test gdn_chunkwise_uv_vnew_wmma_lds_perf -- --ignored --nocapture

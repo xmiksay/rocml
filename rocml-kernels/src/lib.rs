@@ -308,6 +308,19 @@ pub const GDN_CW_UT_BUILD_WMMA_LDS_F32_HSACO: &[u8] = include_bytes!(concat!(
 ));
 pub const GDN_CW_UT_BUILD_WMMA_LDS_F32_KERNEL: &str = "gdn_chunkwise_ut_build_wmma_lds_f32";
 
+/// `kernels/gdn_chunkwise_uv_vnew_wmma_lds.hip` (gdn-uvvnew round, issue #6):
+/// LDS-staged WMMA variant of fused stages D+E, closing the structured
+/// prefill worklist (`tinv` stays scalar, rejected for rewrite twice — see
+/// that kernel's own doc). See the kernel source's module doc for the
+/// derived algebra and the mid-kernel-accumulator-to-LDS staging pattern,
+/// and `gdn_chunkwise.rs`'s dispatch gate for the eligibility bound
+/// (`head_k_dim`/`head_v_dim` both multiples of 16 *and* <=128).
+pub const GDN_CW_UV_VNEW_WMMA_LDS_F32_HSACO: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/gdn_chunkwise_uv_vnew_wmma_lds.hsaco"
+));
+pub const GDN_CW_UV_VNEW_WMMA_LDS_F32_KERNEL: &str = "gdn_chunkwise_uv_vnew_wmma_lds_f32";
+
 /// `kernels/quantize_act_q8.hip`: per-32-element-block absmax int8
 /// quantizer for the int8 MMQ-style GEMM prototype below (WMMA-pipeline
 /// round, issue #6 lever 2) — llama.cpp Q8_1-style `(code, scale,
