@@ -75,9 +75,15 @@ pub struct LoadOptions {
     /// rounding every quantized chunked-prefill matmul already accepts,
     /// and flips to on-by-default only once validated against the full
     /// parity suite and the issue-15 agentic eval — see `.claude/CLAUDE.md`
-    /// for the current status. No effect on the dense `qwen3` architecture
-    /// (it never chunks prefill, so this dispatch is never reached) or on
-    /// decode (token-serial decode uses `matvec`, never `matmul`).
+    /// for the current status. As of issue #16's dense chunked-prefill
+    /// port, this now also gates the dense `qwen3` architecture's own
+    /// chunked-prefill `matmul` dispatch (`forward::chunk_forward` reuses
+    /// the identical `Kernels`/`QuantKernels` type) — it was never
+    /// separately re-validated for the dense path's activation shapes
+    /// (which have no GDN-style SiLU-gated recurrence output, the qwen35
+    /// hybrid path's own documented MMQ failure mode), so it stays off by
+    /// default here too. No effect on decode (token-serial decode uses
+    /// `matvec`, never `matmul`).
     pub use_mmq: bool,
     /// Attention-sink length for a quantized (`Q8`/`Q4Mixed`) mixed KV
     /// layer — issue #2 leftovers' `--kv-sink`. Defaults to

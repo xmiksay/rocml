@@ -67,27 +67,20 @@ impl Model {
     }
 
     /// Processes a whole (non-empty) prompt and returns the logits for its
-    /// last token. The hybrid (qwen35) architecture processes `prompt_ids`
-    /// in batched chunks (issue #6 — see
-    /// `qwen35::forward::Model::forward_prompt`), including for the mixed/
-    /// quantized KV cache modes (issue #2's chunked-prefill follow-up — no
-    /// token-serial fallback remains); the dense architecture doesn't yet
-    /// have a chunked forward pass, so it falls back to the original
-    /// token-serial loop (out of scope for issue #6, which targets the
-    /// hybrid models `bench`/the parity suites cover).
+    /// last token. Both architectures now process `prompt_ids` in batched
+    /// chunks: the hybrid (qwen35) since issue #6 (see
+    /// `qwen35::forward::Model::forward_prompt`), the dense (qwen3)
+    /// architecture since issue #16's dense chunked-prefill port (see
+    /// `forward::Model::forward_prompt_chunked`) — both including the mixed/
+    /// quantized KV cache modes, with no token-serial fallback on either
+    /// path.
     pub fn forward_prompt(
         &mut self,
         prompt_ids: &[u32],
         prof: Option<&Profiler>,
     ) -> Result<Vec<f32>, RocmlError> {
         match self {
-            Self::Dense(m) => {
-                let mut logits = Vec::new();
-                for &id in prompt_ids {
-                    logits = m.forward_token_profiled(id, prof)?;
-                }
-                Ok(logits)
-            }
+            Self::Dense(m) => m.forward_prompt_chunked(prompt_ids, prof),
             Self::Hybrid(m) => m.forward_prompt(prompt_ids, prof),
         }
     }
@@ -139,11 +132,14 @@ impl Model {
 
     /// The snapshot layer (issue #1) only supports the qwen35 hybrid
     /// architecture — see `crate::snapshot`'s module doc for why (dense
-    /// `qwen3`'s KV cache has no GDN-style fixed-size state to make a cheap
-    /// mid-conversation checkpoint interesting, and no chunked prefill to
-    /// hook capture into). Callers use these to detect which architecture
-    /// they have and skip snapshot lookup/capture entirely for `Dense`,
-    /// rather than this dispatch type growing snapshot-specific error arms.
+    /// `qwen3`'s KV cache is O(position) per layer with no GDN-style
+    /// fixed-size state to make a cheap mid-conversation checkpoint
+    /// interesting; as of issue #16 it does have a chunked-prefill path,
+    /// see `forward::chunk_forward`, but nothing wires a `LayerCapture`-style
+    /// hook into it, unlike the hybrid path's snapshot restore/capture
+    /// integration). Callers use these to detect which architecture they
+    /// have and skip snapshot lookup/capture entirely for `Dense`, rather
+    /// than this dispatch type growing snapshot-specific error arms.
     pub fn as_hybrid(&self) -> Option<&crate::qwen35::forward::Model> {
         match self {
             Self::Hybrid(m) => Some(m),

@@ -86,10 +86,11 @@ impl Model {
     /// budget-check-then-allocate flow, with `n_cache_layers` counting only
     /// this architecture's full-attention layers (GDN layers' state is O(1)
     /// in context length, see `HybridCache`). Issue #2's quantized modes
-    /// (`Q8`/`Q4Mixed`) are only implemented for this hybrid architecture,
-    /// not the dense one — see `HybridCache::new`'s doc comment for the
-    /// boundary-layer-skip rule this budget calculation must also account
-    /// for (`mixed_kv_bytes_per_token` takes the boundary-layer count).
+    /// (`Q8`/`Q4Mixed`) were ported to the dense `qwen3` architecture too
+    /// (issue #2 leftovers/#16 prep, see `crate::cache::DenseAttnCache`) —
+    /// see `HybridCache::new`'s doc comment for the boundary-layer-skip rule
+    /// this budget calculation must also account for (`mixed_kv_bytes_per_token`
+    /// takes the boundary-layer count).
     pub fn load(gguf_path: impl AsRef<Path>, opts: LoadOptions) -> Result<Self, RocmlError> {
         let device = Device::new(0)?;
         let gguf = GgufFile::open(gguf_path)?;

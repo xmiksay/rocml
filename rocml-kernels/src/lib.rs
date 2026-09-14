@@ -42,6 +42,10 @@ pub const ROPE_NEOX_F32_KERNEL: &str = "rope_neox_f32";
 /// `kernels/silu_mul.hip`: `out = silu(gate) * up`, elementwise.
 pub const SILU_MUL_F32_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul.hsaco"));
 pub const SILU_MUL_F32_KERNEL: &str = "silu_mul_f32";
+/// `kernels/silu_mul.hip`'s other kernel (same file/code object): `out =
+/// gelu_tanh(gate) * up`, elementwise (issue #16's config-driven-activation
+/// seam — see `Kernels::gelu_mul`'s doc comment).
+pub const GELU_MUL_F32_KERNEL: &str = "gelu_mul_f32";
 
 /// `kernels/softmax.hip`: per-row scaled softmax over the first
 /// `valid_len[row]` columns, zeroing the rest. One block per row; block size

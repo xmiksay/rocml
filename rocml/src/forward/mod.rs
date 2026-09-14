@@ -1,16 +1,22 @@
 //! Single-token decode-style forward pass: embedding lookup, N transformer
-//! layers (attention.rs + ffn.rs), final norm, logits. Prompt processing
-//! reuses this exact path one token at a time — batched prefill (a fused
-//! multi-token gemm path) is a later performance milestone, not this one
-//! (see `crate::model::Model::forward_prompt`'s doc comment for why this
-//! also means there's no separate "chunked-prefill" cache dispatch path to
-//! port for issue #2/#16's dense mixed-KV work below: prefill and decode
-//! already share this one token-serial path, so the Dense/Mixed per-layer
-//! dispatch `attention::attention_step` performs covers both for free).
+//! layers (attention.rs + ffn.rs), final norm, logits. Decode (and a
+//! prompt's own last, possibly-partial chunk when it's short) can still run
+//! one token at a time, but prompt processing now goes through
+//! `chunk_forward`'s batched multi-token path (issue #16's dense
+//! chunked-prefill port) — see `crate::model::Model::forward_prompt`'s doc
+//! comment. The Dense/Mixed per-layer cache dispatch `attention::
+//! attention_step` (decode) and `attention_chunk::attention_chunk_step`
+//! (prefill) both reuse the same `AttnLayerCache` type and mixed-cache
+//! kernels issue #2/#16's dense mixed-KV work landed.
 
 mod attention;
+mod attention_chunk;
+mod chunk_forward;
+mod chunk_scratch;
 mod ffn;
+mod ffn_chunk;
 pub(crate) mod kernels;
+pub(crate) mod kernels_act;
 pub(crate) mod kernels_flash;
 pub(crate) mod kernels_kv;
 pub(crate) mod kernels_mmq;
@@ -21,7 +27,9 @@ mod scratch;
 
 use std::path::Path;
 
+use chunk_scratch::ChunkScratch;
 use kernels::{offset, Kernels};
+use kernels_act::ActivationKernels;
 use rocml_core::gguf::GgufFile;
 use rocml_hip::{Device, MemoryInfo};
 use scratch::Scratch;
@@ -35,6 +43,8 @@ use crate::error::RocmlError;
 use crate::kv_quant::validate_sink_window;
 use crate::load_opts::LoadOptions;
 use crate::profile::{self, OpKind, Phase, Profiler};
+use crate::qwen35::forward::chunk_kernels::ChunkKernels;
+use crate::qwen35::forward::kernels_flash_mixed::FlashPrefillMixedKernels;
 use crate::qwen35::forward::kernels_mixed::MixedKernels;
 use crate::weights::ModelWeights;
 
@@ -53,7 +63,24 @@ pub struct Model {
     /// `mixed_kernels` field for the same reason (cheap, keeps `Model`
     /// shape independent of the chosen mode).
     mixed_kernels: MixedKernels,
+    /// Chunked-prefill sibling of `mixed_kernels`' decode-attention kernel
+    /// (issue #16, mirroring the qwen35 hybrid path's identical field) —
+    /// see `kernels_flash_mixed.rs`'s module doc. Loaded unconditionally
+    /// alongside `mixed_kernels` for the same reason.
+    flash_mixed_kernels: FlashPrefillMixedKernels,
+    /// GeGLU activation kernel (issue #16's config-driven-activation seam)
+    /// — a separate field from `kernels` rather than nested inside it, so
+    /// `kernels.rs` (already well past the 400-line cap) never grows to add
+    /// it; see `kernels_act.rs`'s module doc.
+    act: ActivationKernels,
     scratch: Scratch,
+    /// Chunked-prefill-only kernels/scratch (issue #16's dense chunked-
+    /// prefill port) — see `chunk_forward::forward_chunk`. `ChunkKernels`
+    /// is reused as-is from the qwen35 hybrid path (architecture-generic,
+    /// see `attention_chunk.rs`'s module doc), loaded unconditionally at
+    /// model load like `scratch` always is.
+    chunk_kernels: ChunkKernels,
+    chunk_scratch: ChunkScratch,
     pos: u32,
 }
 
@@ -141,14 +168,13 @@ impl Model {
         }
 
         let cache = DenseAttnCache::new(&config, ctx, opts.kv_cache, opts.kv_sink, opts.kv_window)?;
-        // `opts.use_mmq` is threaded through for consistency with the
-        // qwen35 hybrid loader, but is inert here: the dense architecture
-        // never chunks prefill (see `Model::forward_prompt`'s doc comment),
-        // so `LinearWeight::matmul`/the MMQ dispatch it can reach are never
-        // called on this path.
         let kernels = Kernels::load_all(opts.use_mmq)?;
         let mixed_kernels = MixedKernels::load_all()?;
+        let flash_mixed_kernels = FlashPrefillMixedKernels::load_all()?;
+        let act = ActivationKernels::load_all()?;
         let scratch = Scratch::new(&config)?;
+        let chunk_kernels = ChunkKernels::load_all()?;
+        let chunk_scratch = ChunkScratch::new(&config)?;
 
         Ok(Self {
             _device: device,
@@ -157,7 +183,11 @@ impl Model {
             cache,
             kernels,
             mixed_kernels,
+            flash_mixed_kernels,
+            act,
             scratch,
+            chunk_kernels,
+            chunk_scratch,
             pos: 0,
         })
     }
@@ -262,6 +292,7 @@ impl Model {
                         )?;
                         ffn::ffn_step(
                             &self.kernels,
+                            &self.act,
                             &self.config,
                             layer,
                             &mut self.scratch,
@@ -285,6 +316,7 @@ impl Model {
                 )?;
                 ffn::ffn_step(
                     &self.kernels,
+                    &self.act,
                     &self.config,
                     layer,
                     &mut self.scratch,

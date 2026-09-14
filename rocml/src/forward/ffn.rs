@@ -1,15 +1,22 @@
-//! One layer's SwiGLU FFN: rmsnorm -> gate/up projections -> silu*up ->
-//! down projection -> residual add.
+//! One layer's gated FFN: rmsnorm -> gate/up projections -> act(gate)*up ->
+//! down projection -> residual add. `act` is `config.activation`-driven
+//! (issue #16), not hardcoded to SwiGLU — see `crate::config::Activation`'s
+//! doc comment. `act_kernels` is a separate parameter from `kernels`
+//! (`Kernels`, already well past the 400-line cap) rather than a field on
+//! it — see `kernels_act.rs`'s module doc.
 
 use super::kernels::{offset, Kernels};
+use super::kernels_act::ActivationKernels;
 use super::scratch::Scratch;
-use crate::config::ModelConfig;
+use crate::config::{Activation, ModelConfig};
 use crate::error::RocmlError;
 use crate::profile::{self, OpKind, Profiler};
 use crate::weights::LayerWeights;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ffn_step(
     kernels: &Kernels,
+    act_kernels: &ActivationKernels,
     config: &ModelConfig,
     layer: &LayerWeights,
     scratch: &mut Scratch,
@@ -61,14 +68,23 @@ pub(crate) fn ffn_step(
                 ffn,
                 hidden,
             )?;
-            // In place: silu_mul_f32 only ever reads gate[i]/up[i] before
-            // writing out[i], so aliasing out == gate is safe per-element.
-            kernels.silu_mul(
-                offset(&scratch.gate, 0),
-                offset(&scratch.up, 0),
-                offset(&scratch.gate, 0),
-                ffn,
-            )
+            // In place: both activation kernels only ever read gate[i]/up[i]
+            // before writing out[i], so aliasing out == gate is safe
+            // per-element.
+            match config.activation {
+                Activation::SiLu => kernels.silu_mul(
+                    offset(&scratch.gate, 0),
+                    offset(&scratch.up, 0),
+                    offset(&scratch.gate, 0),
+                    ffn,
+                ),
+                Activation::Gelu => act_kernels.gelu_mul(
+                    offset(&scratch.gate, 0),
+                    offset(&scratch.up, 0),
+                    offset(&scratch.gate, 0),
+                    ffn,
+                ),
+            }
         },
     )?;
 

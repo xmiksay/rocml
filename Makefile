@@ -22,6 +22,8 @@ test:
 		--skip qwen35_2b_hybrid_greedy_matches_crane_gpu_reference \
 		--skip ornith_9b_greedy_decode_is_well_formed_and_deterministic \
 		--skip qwen35_2b_chunked_prefill_matches_token_serial \
+		--skip qwen3_0_6b_chunked_prefill_matches_token_serial \
+		--skip qwen3_0_6b_chunked_prefill_matches_token_serial_mixed_kv \
 		--skip fp16_kv_matches_f32_kv_logits_and_greedy_decode \
 		--skip q8_mixed_kv_vs_fp16_logits_and_greedy_stability \
 		--skip q4_mixed_kv_vs_fp16_logits_and_greedy_stability \
@@ -65,6 +67,7 @@ test-model:
 	cargo test --release -p rocml --test mixed_kv_parity
 	cargo test --release -p rocml --test mixed_kv_chunked_prefill_parity -- --test-threads=1
 	cargo test --release -p rocml --test dense_mixed_kv_parity
+	cargo test --release -p rocml --test dense_chunked_prefill_parity
 	cargo test --release -p rocml --test snapshot_equivalence
 	cargo test --release -p rocml --test ornith_e2e -- --test-threads=1
 	cargo test --release -p rocml-serve --test server_e2e

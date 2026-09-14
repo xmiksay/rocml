@@ -9,6 +9,25 @@ use crate::error::RocmlError;
 
 const ARCH: &str = "qwen3";
 
+/// Gated-FFN elementwise activation function (issue #16's config-driven-
+/// activation seam). GGUF carries no generic metadata key for this —
+/// llama.cpp itself infers it from `general.architecture`, not a per-model
+/// field — so `ModelConfig::from_gguf` sets it from the (currently single)
+/// `ARCH` this loader accepts rather than reading it off the file; a future
+/// dense family whose FFN activation differs (e.g. gemma's `gelu_pytorch_
+/// tanh`) would add its own arm here rather than this becoming a "keep
+/// guessing SiLU" default that quietly miscompiles a new architecture's FFN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activation {
+    /// `silu(gate) * up` — Qwen3's SwiGLU FFN.
+    SiLu,
+    /// `gelu_tanh(gate) * up` — not selected by any architecture this
+    /// loader accepts yet; landed ahead of an actual gemma-family loader
+    /// (see `.claude/CLAUDE.md`'s multiarch audit) so the kernel/dispatch
+    /// seam exists and is unit-tested before it's needed.
+    Gelu,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub block_count: u32,
@@ -29,6 +48,9 @@ pub struct ModelConfig {
     /// GGUF doesn't carry vocab size directly, and the embedding table's own
     /// shape is the ground truth the tokenizer's vocab must agree with.
     pub vocab_size: u32,
+    /// Gated-FFN activation — see [`Activation`]'s doc comment for why this
+    /// is set from `ARCH`, not read off the GGUF.
+    pub activation: Activation,
 }
 
 impl ModelConfig {
@@ -102,6 +124,9 @@ impl ModelConfig {
             rms_eps,
             context_length,
             vocab_size,
+            // The only architecture this loader accepts (`ARCH` == "qwen3")
+            // uses SwiGLU — see `Activation`'s doc comment.
+            activation: Activation::SiLu,
         })
     }
 

@@ -20,13 +20,17 @@
 //! the hybrid architecture, where at most a handful of full-attention
 //! layers are ever adjacent).
 //!
-//! **No separate chunked-prefill gate**: unlike the qwen35 hybrid
-//! architecture, the dense forward pass has no batched/chunked prefill path
-//! at all — `crate::model::Model::forward_prompt`'s `Dense` arm is a plain
-//! token-serial loop over `forward_token_profiled` (see that function's own
-//! doc comment), identical in shape to decode. So there is nothing separate
-//! to gate: every test below already exercises "prefill" and "decode"
-//! identically, through the one path the dense architecture has.
+//! **Decode-path-only, by design**: every test below drives both models
+//! token-by-token via `forward_token` directly (never `forward_prompt`), so
+//! it exercises the mixed-cache append/attend kernels identically regardless
+//! of whether the dense architecture's prefill phase is token-serial or
+//! chunked. As of issue #16's dense chunked-prefill port,
+//! `crate::model::Model::forward_prompt`'s `Dense` arm *does* batch the
+//! prompt into `PREFILL_CHUNK_SIZE`-token chunks (`forward::chunk_forward`,
+//! reusing the same `AttnLayerCache`/mixed-cache dispatch this file's
+//! `forward_token`-driven tests already cover) — see
+//! `dense_chunked_prefill_parity.rs` for the chunked-vs-token-serial gate
+//! itself, including for the mixed KV cache modes.
 //!
 //! **Methodology difference from `mixed_kv_parity.rs`, and why**: that
 //! suite's q4-mixed gate asserts `divergence_count == 0` over 200 self-driven

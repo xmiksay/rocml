@@ -1,0 +1,190 @@
+//! `Model::forward_chunk`: processes a whole prefill chunk of tokens through
+//! the batched kernel paths (`attention_chunk`/`ffn_chunk`) instead of
+//! `forward_token_profiled`'s one-token-at-a-time loop (issue #16's dense
+//! chunked-prefill port — see `.claude/CLAUDE.md`'s "Chunked prefill"
+//! section for the qwen35 hybrid design this mirrors, and this module's own
+//! doc comments for what's simpler here: no GDN layers, so every layer runs
+//! the same batched full-attention step; no fused Q+gate, so no
+//! `extract_heads` call; full rope, not partial).
+
+use super::attention_chunk::attention_chunk_step;
+use super::chunk_scratch::CHUNK_CAP;
+use super::ffn_chunk::ffn_chunk_step;
+use super::kernels::offset;
+use super::Model;
+use crate::error::RocmlError;
+use crate::profile::{self, OpKind, Profiler};
+
+/// Prompt-chunk size `generate` drives this forward pass with. Matches the
+/// qwen35 hybrid path's `PREFILL_CHUNK_SIZE` (512) — not independently
+/// re-swept for this architecture (same underlying GEMM/attention kernels,
+/// same chunk-width tuning already done for them); see
+/// `.claude/CLAUDE.md`'s "Chunked prefill" section for that history.
+pub const PREFILL_CHUNK_SIZE: u32 = 512;
+
+impl Model {
+    /// Splits `prompt_ids` (non-empty) into `PREFILL_CHUNK_SIZE`-token
+    /// chunks and runs each through [`Self::forward_chunk`], requesting
+    /// logits only from the final chunk. Advances `self.position()` by
+    /// `prompt_ids.len()` overall, identically to `prompt_ids.len()` calls
+    /// to `forward_token_profiled` (see
+    /// `tests/dense_chunked_prefill_parity.rs` for the equivalence this is
+    /// held to).
+    pub fn forward_prompt_chunked(
+        &mut self,
+        prompt_ids: &[u32],
+        prof: Option<&Profiler>,
+    ) -> Result<Vec<f32>, RocmlError> {
+        if prompt_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let chunk_size = (PREFILL_CHUNK_SIZE.min(CHUNK_CAP)) as usize;
+        let mut logits = Vec::new();
+        let mut i = 0;
+        while i < prompt_ids.len() {
+            let end = (i + chunk_size).min(prompt_ids.len());
+            let is_last_chunk = end == prompt_ids.len();
+            if let Some(l) = self.forward_chunk(&prompt_ids[i..end], is_last_chunk, prof)? {
+                logits = l;
+            }
+            i = end;
+        }
+        Ok(logits)
+    }
+
+    /// Processes `token_ids` (`1..=CHUNK_CAP` tokens, positions
+    /// `self.position()..self.position()+token_ids.len()`) through every
+    /// layer in one batched pass each, advancing the cache exactly as
+    /// `token_ids.len()` calls to `forward_token_profiled` would. Returns
+    /// logits for the chunk's last token only when `want_logits` is set
+    /// (issue #3's "prefill logits trap": a full `[chunk_len, vocab]`
+    /// intermediate is never materialized).
+    pub fn forward_chunk(
+        &mut self,
+        token_ids: &[u32],
+        want_logits: bool,
+        prof: Option<&Profiler>,
+    ) -> Result<Option<Vec<f32>>, RocmlError> {
+        let chunk_len = token_ids.len() as u32;
+        if chunk_len == 0 {
+            return Ok(None);
+        }
+        if chunk_len > CHUNK_CAP {
+            return Err(RocmlError::Config(format!(
+                "forward_chunk: chunk_len {chunk_len} exceeds CHUNK_CAP {CHUNK_CAP}"
+            )));
+        }
+        let pos_base = self.pos;
+        let max_seq = self.cache.max_seq();
+        if pos_base + chunk_len > max_seq {
+            return Err(RocmlError::ContextOverflow {
+                requested: pos_base + chunk_len,
+                max_seq,
+            });
+        }
+        let hidden = self.config.embedding_length;
+
+        self.chunk_scratch
+            .token_ids
+            .copy_prefix_from_host(token_ids)?;
+        Profiler::scope(
+            prof,
+            None,
+            OpKind::Embed,
+            profile::embed_bytes(hidden) * chunk_len as u64,
+            0,
+            || {
+                self.kernels.embedding(
+                    offset(&self.chunk_scratch.token_ids, 0),
+                    offset(&self.weights.token_embd, 0),
+                    offset(&self.chunk_scratch.x, 0),
+                    chunk_len,
+                    hidden,
+                )
+            },
+        )?;
+
+        for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+            let layer_idx_u32 = layer_idx as u32;
+            let plane = self.cache.attn_mut(layer_idx)?;
+            attention_chunk_step(
+                &self.kernels,
+                &self.chunk_kernels,
+                &self.mixed_kernels,
+                &self.flash_mixed_kernels,
+                &self.config,
+                layer,
+                plane,
+                max_seq,
+                &mut self.chunk_scratch,
+                pos_base,
+                chunk_len,
+                prof,
+                Some(layer_idx_u32),
+            )?;
+            ffn_chunk_step(
+                &self.kernels,
+                &self.act,
+                &self.config,
+                layer,
+                &mut self.chunk_scratch,
+                chunk_len,
+                prof,
+                Some(layer_idx_u32),
+            )?;
+        }
+
+        self.pos += chunk_len;
+
+        if !want_logits {
+            return Ok(None);
+        }
+
+        // Logits trap: normalize and project only the last row of the
+        // chunk's residual stream, never the whole [chunk_len, hidden].
+        let last_row = (chunk_len - 1) as usize * hidden as usize;
+        Profiler::scope(
+            prof,
+            None,
+            OpKind::Norm,
+            profile::norm_bytes(1, hidden),
+            profile::norm_flops(1, hidden),
+            || {
+                self.kernels.rmsnorm(
+                    offset(&self.chunk_scratch.x, last_row),
+                    offset(&self.weights.output_norm, 0),
+                    offset(&self.chunk_scratch.xn, 0),
+                    1,
+                    hidden,
+                    self.config.rms_eps,
+                )
+            },
+        )?;
+        let lm_head_bytes = profile::matvec_bytes(
+            self.weights.output.byte_size(),
+            self.config.vocab_size,
+            hidden,
+        );
+        let lm_head_flops = profile::matvec_flops(self.config.vocab_size, hidden);
+        Profiler::scope(
+            prof,
+            None,
+            OpKind::LmHead,
+            lm_head_bytes,
+            lm_head_flops,
+            || {
+                self.weights.output.matvec(
+                    &self.kernels,
+                    offset(&self.chunk_scratch.xn, 0),
+                    offset(&self.chunk_scratch.logits, 0),
+                    self.config.vocab_size,
+                    hidden,
+                )
+            },
+        )?;
+
+        let mut logits = vec![0.0f32; self.config.vocab_size as usize];
+        self.chunk_scratch.logits.copy_to_host(&mut logits)?;
+        Ok(Some(logits))
+    }
+}
