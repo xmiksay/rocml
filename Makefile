@@ -7,7 +7,7 @@ ROCML_CHECKPOINT_DIR ?= $(HOME)/checkpoints
 # Dev/test model (fast); override to point at a different checkpoint.
 QWEN_MODEL ?= $(ROCML_CHECKPOINT_DIR)/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf
 
-.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench bench-profile bench-profile-json eval mmq-layer-diff mmq-endtoend-measure gdn-wmma-lds-perf gdn-uvvnew-perf
+.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench bench-profile bench-profile-json eval mmq-layer-diff mmq-endtoend-measure kv-head-error-measure gdn-wmma-lds-perf gdn-uvvnew-perf
 
 build:
 	cargo build --workspace
@@ -26,8 +26,12 @@ test:
 		--skip q8_mixed_kv_vs_fp16_logits_and_greedy_stability \
 		--skip q4_mixed_kv_vs_fp16_logits_and_greedy_stability \
 		--skip q4_mixed_kv_greedy_divergence_is_a_near_tie_when_it_happens \
+		--skip q4_mixed_kv_vs_fp16_at_non_default_sink_window \
 		--skip q8_mixed_chunked_prefill_matches_token_serial \
 		--skip q4_mixed_chunked_prefill_matches_token_serial \
+		--skip dense_fp16_kv_matches_f32_kv_logits_and_greedy_decode \
+		--skip dense_q8_mixed_kv_vs_fp16_logits_and_greedy_stability \
+		--skip dense_q4_mixed_kv_vs_fp16_logits_and_greedy_stability \
 		--skip chat_completions_end_to_end \
 		--skip two_turn_conversation_matches_output_with_snapshots_disabled \
 		--skip qwen35_snapshot_equivalence \
@@ -48,6 +52,10 @@ test-integration:
 # own `cargo test` invocation (see the test's own doc comment) — it and the
 # plain server_e2e test both load a model onto the same GPU and would
 # compete for VRAM if run concurrently in the same test binary.
+# mixed_kv_chunked_prefill_parity's three tests each load two full
+# Qwen3.5-2B models (serial + chunked) — --test-threads=1 avoids up to six
+# concurrent model loads exceeding a 16GB card's VRAM under cargo's default
+# parallel test harness.
 test-model:
 	cargo test --release -p rocml --test greedy_parity
 	cargo test --release -p rocml --test qwen35_cpu_reference
@@ -55,7 +63,8 @@ test-model:
 	cargo test --release -p rocml --test qwen35_chunked_prefill_parity
 	cargo test --release -p rocml --test kv_dtype_parity
 	cargo test --release -p rocml --test mixed_kv_parity
-	cargo test --release -p rocml --test mixed_kv_chunked_prefill_parity
+	cargo test --release -p rocml --test mixed_kv_chunked_prefill_parity -- --test-threads=1
+	cargo test --release -p rocml --test dense_mixed_kv_parity
 	cargo test --release -p rocml --test snapshot_equivalence
 	cargo test --release -p rocml --test ornith_e2e -- --test-threads=1
 	cargo test --release -p rocml-serve --test server_e2e
@@ -132,6 +141,17 @@ mmq-layer-diff:
 # them were reproduced.
 mmq-endtoend-measure:
 	cargo test --release -p rocml --test mmq_endtoend_measure -- --ignored --nocapture
+
+# Issue #2's per-head boundary-skip measurement (`rocml/tests/kv_head_error_measure.rs`):
+# runs Ornith-1.0-9B's fp16-KV decode path over a real prompt, captures the
+# exact K/V vectors via the snapshot layer, and measures the per-(layer,head)
+# K/V quantization error the production mixed cache would introduce (against
+# the same CPU reference the kernels are checked against) — the "does a
+# small subset of heads dominate quantization error" measurement the issue
+# asked for before implementing a per-head fp16-skip bitmask. Diagnostic
+# tool, not a correctness gate, hence `--ignored`.
+kv-head-error-measure:
+	cargo test --release -p rocml --test kv_head_error_measure -- --ignored --nocapture
 
 # gdn-wmma-lds round (issue #6): same-process interleaved scalar/naive-WMMA/
 # LDS-staged-WMMA comparison for GDN chunkwise stages B (ut_build) and F
