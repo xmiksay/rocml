@@ -44,6 +44,82 @@ impl CapturedTensor {
         let cols = self.cols as usize;
         &self.values[r * cols..(r + 1) * cols]
     }
+
+    /// Per-column max(|x|) over every captured row — the calibration
+    /// statistic issue #17's SmoothQuant-style rebalancing needs (per-INPUT-
+    /// channel amax, since a linear layer's input columns are what a
+    /// per-32-block activation-quantizer block and a K-quant sub-block both
+    /// slice along).
+    pub fn channel_amax(&self) -> ChannelAmax {
+        let cols = self.cols as usize;
+        let mut amax = vec![0f32; cols];
+        for r in 0..self.rows as usize {
+            for (a, &v) in amax.iter_mut().zip(self.row(r)) {
+                *a = a.max(v.abs());
+            }
+        }
+        ChannelAmax {
+            channels: self.cols,
+            amax,
+        }
+    }
+}
+
+/// Per-input-channel absolute-value max of one captured tensor, over
+/// whatever rows (tokens) it was captured from — issue #17's calibration
+/// statistic. `amax.len() == channels as usize`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelAmax {
+    pub channels: u32,
+    pub amax: Vec<f32>,
+}
+
+/// `"{layer_idx}:{tensor}"` -> per-channel amax, the calibration sidecar
+/// persisted by `make mmq-calibrate` (`rocml/tests/mmq_calibrate.rs`).
+/// Deliberately built from whatever a [`LayerDump`] happened to capture
+/// (issue #16: generic by tensor name, no architecture-specific tensor list
+/// baked in here) rather than accumulated online during the forward pass —
+/// a single real-text prompt shorter than `PREFILL_CHUNK_SIZE` already
+/// covers "a few hundred tokens" of calibration data in one chunk, so
+/// `LayerCapture`'s existing final-chunk-only recording is already the
+/// calibration run, not just a diagnostic sample of it.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct CalibrationDump {
+    pub channels: BTreeMap<String, ChannelAmax>,
+}
+
+impl CalibrationDump {
+    pub fn from_layer_dump(dump: &LayerDump) -> Self {
+        Self {
+            channels: dump
+                .tensors
+                .iter()
+                .map(|(key, t)| (key.clone(), t.channel_amax()))
+                .collect(),
+        }
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, RocmlError> {
+        let bytes = std::fs::read(path.as_ref()).map_err(|e| {
+            RocmlError::Config(format!(
+                "calibration dump: read {}: {e}",
+                path.as_ref().display()
+            ))
+        })?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| RocmlError::Config(format!("calibration dump: parse json: {e}")))
+    }
+
+    pub fn write_json(&self, path: impl AsRef<Path>) -> Result<(), RocmlError> {
+        let json = serde_json::to_string(self)
+            .map_err(|e| RocmlError::Config(format!("calibration dump: serialize json: {e}")))?;
+        std::fs::write(path.as_ref(), json).map_err(|e| {
+            RocmlError::Config(format!(
+                "calibration dump: write {}: {e}",
+                path.as_ref().display()
+            ))
+        })
+    }
 }
 
 /// `"{layer_idx}:{tensor}"` -> tensor, `BTreeMap` for deterministic JSON key
@@ -60,6 +136,20 @@ impl LayerDump {
         })?;
         serde_json::from_slice(&bytes)
             .map_err(|e| RocmlError::Config(format!("layer dump: parse json: {e}")))
+    }
+
+    /// Symmetric with [`Self::load`] — lets a caller build a `LayerDump`
+    /// directly (e.g. a filtered subset of another dump's tensors, as
+    /// `mmq_calibrate.rs` does) without going through a live [`LayerCapture`].
+    pub fn write_json(&self, path: impl AsRef<Path>) -> Result<(), RocmlError> {
+        let json = serde_json::to_string(self)
+            .map_err(|e| RocmlError::Config(format!("layer dump: serialize json: {e}")))?;
+        std::fs::write(path.as_ref(), json).map_err(|e| {
+            RocmlError::Config(format!(
+                "layer dump: write {}: {e}",
+                path.as_ref().display()
+            ))
+        })
     }
 }
 
@@ -112,14 +202,7 @@ impl LayerCapture {
     }
 
     pub fn write_json(&self, path: impl AsRef<Path>) -> Result<(), RocmlError> {
-        let json = serde_json::to_string(&self.dump)
-            .map_err(|e| RocmlError::Config(format!("layer capture: serialize json: {e}")))?;
-        std::fs::write(path.as_ref(), json).map_err(|e| {
-            RocmlError::Config(format!(
-                "layer capture: write {}: {e}",
-                path.as_ref().display()
-            ))
-        })
+        self.dump.write_json(path)
     }
 }
 
