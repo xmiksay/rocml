@@ -25,6 +25,16 @@ use crate::qwen35::config::GdnConfig;
 
 const L2_NORM_EPS: f32 = 1e-6;
 
+/// Per-model WMMA dispatch decisions, computed once per [`gdn_chunkwise_step`]
+/// call (not per tile) from `GdnConfig`'s load-time-constant head dims — see
+/// that function's doc comment for each flag's eligibility bound.
+#[derive(Clone, Copy)]
+struct WmmaDispatch {
+    state: bool,
+    output: bool,
+    ut_build: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gdn_chunkwise_step(
     cw: &GdnChunkwiseKernels,
@@ -34,20 +44,33 @@ pub(crate) fn gdn_chunkwise_step(
     scratch: &mut ChunkScratch,
     chunk_len: u32,
 ) -> Result<(), RocmlError> {
-    // gdn-wmma round: only stage G (state update) routes through the
-    // matrix-core kernel, and only when this model's head dims are both
-    // multiples of 16 (a per-model load-time constant, checked once per
-    // call rather than per tile). Stages B (`ut_build`)/F (`output`) also
-    // have WMMA kernels (`kernels/gdn_chunkwise_wmma.hip`), correctness-
-    // proven against the f64 reference, but measured *slower* than scalar
-    // on ornith-9b's real shape — see `gdn_chunkwise_kernels_wmma.rs`'s
-    // module doc for the numbers and root cause. Kept scalar here.
+    // gdn-wmma round: stage G (state update) routes through the matrix-core
+    // kernel whenever this model's head dims are both multiples of 16 (a
+    // per-model load-time constant, checked once per call rather than per
+    // tile).
     let use_wmma = gdn.head_k_dim.is_multiple_of(16) && gdn.head_v_dim.is_multiple_of(16);
+    // gdn-wmma-lds round: stages B (`ut_build`)/F (`output`) also have WMMA
+    // kernels now, but the naive (`gdn_chunkwise_wmma.hip`) ones measured
+    // slower than scalar — only the LDS-staged follow-up
+    // (`gdn_chunkwise_{output,ut_build}_wmma_lds.hip`) is wired in below, and
+    // only within its LDS design's correctness bound: `LDS_FREE`(128) caps
+    // the free axis of every operand it stages (see
+    // `gdn_chunkwise_wmma_lds_common.h`'s module doc) — `head_k_dim`/
+    // `head_v_dim` bigger than that would silently leave part of the output
+    // uncomputed, so this is a dispatch-time correctness gate, not a perf
+    // tuning knob. `tile_len` itself is architecturally always <=128
+    // (`GDN_RECUR_TILE` above) so it never needs its own check here.
+    const LDS_MAX_DIM: u32 = 128;
+    let dispatch = WmmaDispatch {
+        state: use_wmma,
+        output: use_wmma && gdn.head_k_dim <= LDS_MAX_DIM && gdn.head_v_dim <= LDS_MAX_DIM,
+        ut_build: gdn.head_k_dim.is_multiple_of(16) && gdn.head_k_dim <= LDS_MAX_DIM,
+    };
     let mut tile_start = 0u32;
     while tile_start < chunk_len {
         let tile_len = (chunk_len - tile_start).min(GDN_RECUR_TILE);
         run_tile(
-            cw, cw_wmma, use_wmma, gdn, state, scratch, tile_start, tile_len,
+            cw, cw_wmma, dispatch, gdn, state, scratch, tile_start, tile_len,
         )?;
         tile_start += tile_len;
     }
@@ -58,7 +81,7 @@ pub(crate) fn gdn_chunkwise_step(
 fn run_tile(
     cw: &GdnChunkwiseKernels,
     cw_wmma: &GdnChunkwiseWmmaKernels,
-    use_wmma: bool,
+    dispatch: WmmaDispatch,
     gdn: &GdnConfig,
     state: &mut GdnLayerState,
     scratch: &mut ChunkScratch,
@@ -103,7 +126,11 @@ fn run_tile(
         L2_NORM_EPS,
     )?;
     cw.prep_cumsum(g, g_cum, cum_decay_exp, state_decay, h, tile_len)?;
-    cw.ut_build(q_norm, k_norm, k_beta, g_cum, kb, kq, h, sk, tile_len)?;
+    if dispatch.ut_build {
+        cw_wmma.ut_build_lds(q_norm, k_norm, k_beta, g_cum, kb, kq, h, sk, tile_len)?;
+    } else {
+        cw.ut_build(q_norm, k_norm, k_beta, g_cum, kb, kq, h, sk, tile_len)?;
+    }
     cw.tinv(kb, h, tile_len)?;
     cw.uv_vnew(
         kb, // now Tinv, in place
@@ -121,19 +148,34 @@ fn run_tile(
         key_dim,
         tile_len,
     )?;
-    cw.output(
-        q_norm,
-        cum_decay_exp,
-        state_ptr,
-        kq,
-        v_new,
-        y,
-        h,
-        sk,
-        sv,
-        tile_len,
-    )?;
-    if use_wmma {
+    if dispatch.output {
+        cw_wmma.output_lds(
+            q_norm,
+            cum_decay_exp,
+            state_ptr,
+            kq,
+            v_new,
+            y,
+            h,
+            sk,
+            sv,
+            tile_len,
+        )?;
+    } else {
+        cw.output(
+            q_norm,
+            cum_decay_exp,
+            state_ptr,
+            kq,
+            v_new,
+            y,
+            h,
+            sk,
+            sv,
+            tile_len,
+        )?;
+    }
+    if dispatch.state {
         cw_wmma.state_update(
             k_norm,
             cum_decay_exp,
