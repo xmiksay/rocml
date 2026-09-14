@@ -28,6 +28,10 @@ pub struct ServerConfig {
     /// GEMM instead of f16 WMMA where eligible — see
     /// `rocml::LoadOptions::use_mmq`'s doc comment. Off by default.
     pub use_mmq: bool,
+    /// Attention-sink/recent-window lengths for a quantized `kv_cache` mode
+    /// (issue #2 leftovers) — see `rocml::LoadOptions::kv_sink`/`kv_window`.
+    pub kv_sink: u32,
+    pub kv_window: u32,
     pub max_tokens_default: usize,
     pub no_think: bool,
     /// Sampling defaults for requests that omit a field — from the resolved
@@ -76,6 +80,8 @@ pub fn build(config: ServerConfig) -> Result<(axum::Router, std::thread::JoinHan
         ctx: config.ctx,
         kv_cache: config.kv_cache,
         use_mmq: config.use_mmq,
+        kv_sink: config.kv_sink,
+        kv_window: config.kv_window,
     };
     let snapshot_config = worker::SnapshotConfig {
         ram_mb: config.snapshot_ram_mb,

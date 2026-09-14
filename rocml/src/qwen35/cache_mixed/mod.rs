@@ -19,7 +19,7 @@ use rocml_hip::DeviceBuffer;
 use super::forward::kernels_mixed::MixedKernels;
 use crate::error::RocmlError;
 use crate::forward::kernels::{offset, DevPtr, Kernels};
-use crate::kv_quant::{MixedLayout, SINK_LEN, WINDOW_LEN};
+use crate::kv_quant::MixedLayout;
 use crate::snapshot::AttnLayerBytes;
 
 /// Raw device pointers plus the shape/state scalars
@@ -59,27 +59,35 @@ pub struct MixedAttnPlane {
     v_bits: u8,
     n_kv_heads: u32,
     head_dim: u32,
+    sink_len: u32,
+    window_len: u32,
     bulk_cap: u32,
     num_blocks_total: u32,
 }
 
 impl MixedAttnPlane {
     /// `max_seq` is this cache's overall context budget — sizes the bulk
-    /// region's capacity (rounded up to a whole number of `WINDOW_LEN`
+    /// region's capacity (rounded up to a whole number of `window_len`
     /// blocks) so every position past the sink can eventually be evicted
-    /// into it.
+    /// into it. `sink_len`/`window_len` are issue #2 leftovers'
+    /// `LoadOptions::kv_sink`/`kv_window` (defaulting to
+    /// `crate::kv_quant::{SINK_LEN, WINDOW_LEN}`) — validated once by the
+    /// caller (`crate::kv_quant::validate_sink_window`) before this is ever
+    /// reached.
     pub fn new(
         n_kv_heads: u32,
         head_dim: u32,
         max_seq: u32,
         v_bits: u8,
+        sink_len: u32,
+        window_len: u32,
     ) -> Result<Self, RocmlError> {
-        let bulk_positions = max_seq.saturating_sub(SINK_LEN);
-        let num_blocks_total = bulk_positions.div_ceil(WINDOW_LEN).max(1);
-        let bulk_cap = num_blocks_total * WINDOW_LEN;
+        let bulk_positions = max_seq.saturating_sub(sink_len);
+        let num_blocks_total = bulk_positions.div_ceil(window_len).max(1);
+        let bulk_cap = num_blocks_total * window_len;
 
-        let sink_len = (n_kv_heads * SINK_LEN * head_dim) as usize;
-        let window_len = (n_kv_heads * WINDOW_LEN * head_dim) as usize;
+        let sink_buf_len = (n_kv_heads * sink_len * head_dim) as usize;
+        let window_buf_len = (n_kv_heads * window_len * head_dim) as usize;
         let bulk_k_len = (n_kv_heads * bulk_cap * head_dim) as usize;
         let bulk_k_scale_len = (n_kv_heads * num_blocks_total * head_dim) as usize;
         let bulk_v_len = if v_bits == 8 {
@@ -90,18 +98,20 @@ impl MixedAttnPlane {
         let bulk_v_scale_len = (n_kv_heads * bulk_cap) as usize;
 
         Ok(Self {
-            sink_k: DeviceBuffer::new(sink_len)?,
-            sink_v: DeviceBuffer::new(sink_len)?,
-            window_k: DeviceBuffer::new(window_len)?,
-            window_v: DeviceBuffer::new(window_len)?,
+            sink_k: DeviceBuffer::new(sink_buf_len)?,
+            sink_v: DeviceBuffer::new(sink_buf_len)?,
+            window_k: DeviceBuffer::new(window_buf_len)?,
+            window_v: DeviceBuffer::new(window_buf_len)?,
             bulk_k_codes: DeviceBuffer::new(bulk_k_len)?,
             bulk_k_scales: DeviceBuffer::new(bulk_k_scale_len)?,
             bulk_v_codes: DeviceBuffer::new(bulk_v_len)?,
             bulk_v_scales: DeviceBuffer::new(bulk_v_scale_len)?,
-            layout: MixedLayout::new(),
+            layout: MixedLayout::with_lens(sink_len, window_len),
             v_bits,
             n_kv_heads,
             head_dim,
+            sink_len,
+            window_len,
             bulk_cap,
             num_blocks_total,
         })
@@ -120,7 +130,7 @@ impl MixedAttnPlane {
     /// bulk region reads as having zero evicted blocks regardless of
     /// whatever bytes are still physically sitting in it.
     pub fn reset(&mut self) {
-        self.layout = MixedLayout::new();
+        self.layout = MixedLayout::with_lens(self.sink_len, self.window_len);
     }
 
     /// Appends this decode step's `[n_kv_heads, head_dim]` k/v vectors at
@@ -137,10 +147,10 @@ impl MixedAttnPlane {
         v_src: &DeviceBuffer<f32>,
     ) -> Result<(), RocmlError> {
         let (head_dim, n_kv_heads) = (self.head_dim, self.n_kv_heads);
-        if pos < SINK_LEN {
+        if pos < self.sink_len {
             for h in 0..n_kv_heads as usize {
-                let dst =
-                    h * SINK_LEN as usize * head_dim as usize + pos as usize * head_dim as usize;
+                let dst = h * self.sink_len as usize * head_dim as usize
+                    + pos as usize * head_dim as usize;
                 let src = h * head_dim as usize;
                 kernels.cast_f32_f16(offset(k_src, src), offset(&self.sink_k, dst), head_dim)?;
                 kernels.cast_f32_f16(offset(v_src, src), offset(&self.sink_v, dst), head_dim)?;
@@ -155,7 +165,7 @@ impl MixedAttnPlane {
                 offset(&self.bulk_k_codes, 0),
                 offset(&self.bulk_k_scales, 0),
                 n_kv_heads,
-                WINDOW_LEN,
+                self.window_len,
                 head_dim,
                 self.bulk_cap,
                 self.num_blocks_total,
@@ -167,7 +177,7 @@ impl MixedAttnPlane {
                 offset(&self.bulk_v_codes, 0),
                 offset(&self.bulk_v_scales, 0),
                 n_kv_heads,
-                WINDOW_LEN,
+                self.window_len,
                 head_dim,
                 self.bulk_cap,
                 block,
@@ -175,8 +185,8 @@ impl MixedAttnPlane {
         }
 
         for h in 0..n_kv_heads as usize {
-            let dst =
-                h * WINDOW_LEN as usize * head_dim as usize + slot as usize * head_dim as usize;
+            let dst = h * self.window_len as usize * head_dim as usize
+                + slot as usize * head_dim as usize;
             let src = h * head_dim as usize;
             kernels.cast_f32_f16(offset(k_src, src), offset(&self.window_k, dst), head_dim)?;
             kernels.cast_f32_f16(offset(v_src, src), offset(&self.window_v, dst), head_dim)?;
@@ -290,7 +300,8 @@ impl MixedAttnPlane {
         self.bulk_k_scales.copy_from_host(bulk_k_scales)?;
         self.bulk_v_codes.copy_from_host(bulk_v_codes)?;
         self.bulk_v_scales.copy_from_host(bulk_v_scales)?;
-        self.layout = MixedLayout::from_window_base(*window_base);
+        self.layout =
+            MixedLayout::from_window_base_with_lens(*window_base, self.sink_len, self.window_len);
         Ok(())
     }
 
@@ -304,8 +315,8 @@ impl MixedAttnPlane {
             bulk_k_scales: offset(&self.bulk_k_scales, 0),
             bulk_v_codes: offset(&self.bulk_v_codes, 0),
             bulk_v_scales: offset(&self.bulk_v_scales, 0),
-            sink_len: SINK_LEN,
-            window_len: WINDOW_LEN,
+            sink_len: self.sink_len,
+            window_len: self.window_len,
             window_base: self.layout.window_base(),
             bulk_cap: self.bulk_cap,
             num_blocks_total: self.num_blocks_total,

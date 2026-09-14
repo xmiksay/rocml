@@ -25,10 +25,17 @@ mod chunk_plan;
 
 pub use chunk_plan::ChunkWindowSegment;
 
-/// First `SINK_LEN` positions of every mixed layer stay fp16 forever —
-/// attention sinks are exempt from eviction/quantization (issue #2).
+/// Default: first `SINK_LEN` positions of every mixed layer stay fp16
+/// forever — attention sinks are exempt from eviction/quantization (issue
+/// #2). Configurable per load via `LoadOptions::kv_sink` (issue #2
+/// leftovers) — `MixedLayout::with_lens`/`MixedAttnPlane::new` take an
+/// explicit `sink_len` instead of always reading this constant; it remains
+/// the value every default-config call site (`MixedLayout::new`,
+/// `MixedLayout::from_window_base`) and every pre-existing test pins.
 pub const SINK_LEN: u32 = 32;
-/// Recent-window capacity, and the quantize-on-evict batch size.
+/// Default: recent-window capacity, and the quantize-on-evict batch size.
+/// Configurable per load via `LoadOptions::kv_window` — see `SINK_LEN`'s doc
+/// comment for the same caveat.
 pub const WINDOW_LEN: u32 = 128;
 
 /// Where position `pos` currently lives.
@@ -48,12 +55,16 @@ pub enum Region {
     },
 }
 
-/// One mixed layer's eviction state: only the absolute position the
-/// window's slot 0 currently maps to (everything else — sink boundary,
-/// bulk block count — is derivable from it and the two constants above).
+/// One mixed layer's eviction state: the absolute position the window's
+/// slot 0 currently maps to, plus this layer's own `sink_len`/`window_len`
+/// (issue #2 leftovers — configurable per load via `LoadOptions::kv_sink`/
+/// `kv_window`; everything else, bulk block count included, is derivable
+/// from these three fields).
 #[derive(Debug, Clone, Copy)]
 pub struct MixedLayout {
     window_base: u32,
+    sink_len: u32,
+    window_len: u32,
 }
 
 impl Default for MixedLayout {
@@ -63,18 +74,42 @@ impl Default for MixedLayout {
 }
 
 impl MixedLayout {
+    /// Default sink/window lengths (`SINK_LEN`/`WINDOW_LEN`) — every
+    /// pre-existing call site and test uses this.
     pub fn new() -> Self {
+        Self::with_lens(SINK_LEN, WINDOW_LEN)
+    }
+
+    /// Like [`Self::new`], with an explicit `sink_len`/`window_len` —
+    /// `sink_len >= 1` and `window_len >= 1` are the caller's
+    /// responsibility (validated once, at load time, by
+    /// `crate::kv_quant::validate_sink_window`; not re-checked per call
+    /// here since this type has no way to surface an error).
+    pub fn with_lens(sink_len: u32, window_len: u32) -> Self {
         Self {
-            window_base: SINK_LEN,
+            window_base: sink_len,
+            sink_len,
+            window_len,
         }
     }
 
-    /// Reconstructs a layout from a previously-observed `window_base` — used
-    /// by the snapshot layer (issue #1) to restore a mixed layer's eviction
-    /// state exactly, since `window_base` alone determines every other
+    /// Reconstructs a layout from a previously-observed `window_base` at the
+    /// default sink/window lengths — used by the snapshot layer (issue #1)
+    /// to restore a mixed layer's eviction state exactly, since
+    /// `window_base` (plus `sink_len`/`window_len`) determines every other
     /// derived quantity (`bulk_len`/`evicted_blocks`/`region`).
     pub fn from_window_base(window_base: u32) -> Self {
-        Self { window_base }
+        Self::from_window_base_with_lens(window_base, SINK_LEN, WINDOW_LEN)
+    }
+
+    /// Like [`Self::from_window_base`], with an explicit `sink_len`/
+    /// `window_len`.
+    pub fn from_window_base_with_lens(window_base: u32, sink_len: u32, window_len: u32) -> Self {
+        Self {
+            window_base,
+            sink_len,
+            window_len,
+        }
     }
 
     /// Absolute position the window's physical slot 0 currently maps to.
@@ -82,26 +117,34 @@ impl MixedLayout {
         self.window_base
     }
 
+    pub fn sink_len(&self) -> u32 {
+        self.sink_len
+    }
+
+    pub fn window_len(&self) -> u32 {
+        self.window_len
+    }
+
     /// Number of positions currently evicted into the bulk region.
     pub fn bulk_len(&self) -> u32 {
-        self.window_base - SINK_LEN
+        self.window_base - self.sink_len
     }
 
     /// Number of whole blocks evicted so far.
     pub fn evicted_blocks(&self) -> u32 {
-        self.bulk_len() / WINDOW_LEN
+        self.bulk_len() / self.window_len
     }
 
     /// Which region `pos` lives in, given the *current* eviction state
     /// (call after any `prepare_append` that `pos` needed).
     pub fn region(&self, pos: u32) -> Region {
-        if pos < SINK_LEN {
+        if pos < self.sink_len {
             Region::Sink { index: pos }
         } else if pos < self.window_base {
-            let rel = pos - SINK_LEN;
+            let rel = pos - self.sink_len;
             Region::Bulk {
-                block: rel / WINDOW_LEN,
-                offset: rel % WINDOW_LEN,
+                block: rel / self.window_len,
+                offset: rel % self.window_len,
             }
         } else {
             Region::Window {
@@ -110,9 +153,9 @@ impl MixedLayout {
         }
     }
 
-    /// Call before writing a *new* position `pos >= SINK_LEN` into the
+    /// Call before writing a *new* position `pos >= sink_len` into the
     /// window. If the window is already full (`pos` would be the
-    /// `WINDOW_LEN`-th slot past `window_base`), evicts the whole window in
+    /// `window_len`-th slot past `window_base`), evicts the whole window in
     /// one batch (advancing `window_base`) and returns the evicted block
     /// index; the caller must launch the quantize-evict kernel for that
     /// block over the window's *current* (pre-advance) contents before
@@ -120,22 +163,25 @@ impl MixedLayout {
     /// which absolute positions were evicted. Returns the physical window
     /// slot `pos` should be written to either way.
     ///
-    /// Positions `< SINK_LEN` (sink writes) never call this — the sink has
+    /// Positions `< sink_len` (sink writes) never call this — the sink has
     /// its own fixed-index write, no eviction concept.
     pub fn prepare_append(&mut self, pos: u32) -> (u32, Option<u32>) {
-        debug_assert!(pos >= SINK_LEN, "sink positions don't use prepare_append");
+        debug_assert!(
+            pos >= self.sink_len,
+            "sink positions don't use prepare_append"
+        );
         debug_assert!(
             pos >= self.window_base,
             "prepare_append called for an already-evicted position"
         );
         let mut evicted_block = None;
-        if pos - self.window_base >= WINDOW_LEN {
+        if pos - self.window_base >= self.window_len {
             // Exactly one eviction can be pending at a time: `pos` only
             // ever advances by 1 between calls (one decode step at a
-            // time), so it can be at most WINDOW_LEN past window_base.
-            debug_assert_eq!(pos - self.window_base, WINDOW_LEN);
+            // time), so it can be at most window_len past window_base.
+            debug_assert_eq!(pos - self.window_base, self.window_len);
             evicted_block = Some(self.evicted_blocks());
-            self.window_base += WINDOW_LEN;
+            self.window_base += self.window_len;
         }
         (pos - self.window_base, evicted_block)
     }
@@ -262,5 +308,51 @@ mod tests {
                 index: WINDOW_LEN - 1
             }
         );
+    }
+
+    /// Non-default sink/window lengths (issue #2 leftovers, `--kv-sink`/
+    /// `--kv-window`): the same eviction/region invariants as the
+    /// default-config tests above, just parameterized — proves
+    /// `MixedLayout` itself has no hidden dependency on the specific
+    /// default values.
+    #[test]
+    fn with_lens_reproduces_the_same_invariants_at_a_non_default_config() {
+        let (sink, window) = (16u32, 256u32);
+        let mut layout = MixedLayout::with_lens(sink, window);
+        assert_eq!(layout.sink_len(), sink);
+        assert_eq!(layout.window_len(), window);
+        assert_eq!(layout.window_base(), sink);
+
+        for pos in 0..sink {
+            assert_eq!(layout.region(pos), Region::Sink { index: pos });
+        }
+        for pos in sink..sink + window {
+            let (slot, evicted) = layout.prepare_append(pos);
+            assert_eq!(slot, pos - sink);
+            assert!(evicted.is_none(), "no eviction expected at pos {pos}");
+        }
+        assert_eq!(layout.bulk_len(), 0);
+
+        let (slot, evicted) = layout.prepare_append(sink + window);
+        assert_eq!(evicted, Some(0));
+        assert_eq!(slot, 0);
+        assert_eq!(layout.window_base(), sink + window);
+        assert_eq!(layout.evicted_blocks(), 1);
+        assert_eq!(
+            layout.region(sink),
+            Region::Bulk {
+                block: 0,
+                offset: 0
+            }
+        );
+        assert_eq!(layout.region(sink + window), Region::Window { index: 0 });
+    }
+
+    #[test]
+    fn from_window_base_with_lens_round_trips() {
+        let layout = MixedLayout::from_window_base_with_lens(16 + 256 * 3, 16, 256);
+        assert_eq!(layout.sink_len(), 16);
+        assert_eq!(layout.window_len(), 256);
+        assert_eq!(layout.evicted_blocks(), 3);
     }
 }

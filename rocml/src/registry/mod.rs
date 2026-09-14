@@ -94,12 +94,19 @@ pub fn resolve(name_or_path: &str, download: bool) -> Result<ResolvedModel, Rocm
 /// comment on why it's necessarily approximate) — `Model::load` still
 /// performs the authoritative post-weights-load check and can still error
 /// if reality doesn't match this estimate closely enough.
+///
+/// `sink_len`/`window_len` are issue #2 leftovers' `LoadOptions::kv_sink`/
+/// `kv_window` (defaulting to `crate::kv_quant::{SINK_LEN, WINDOW_LEN}`) —
+/// only affect this estimate for a quantized `kv_cache` mode.
 pub fn clamp_ctx(
     requested: usize,
     gguf_path: &Path,
     kv_cache: crate::load_opts::KvCacheMode,
+    sink_len: u32,
+    window_len: u32,
 ) -> Result<usize, RocmlError> {
-    let (budget, model_ctx_cap) = crate::budget::estimate_from_gguf(gguf_path, kv_cache)?;
+    let (budget, model_ctx_cap) =
+        crate::budget::estimate_from_gguf(gguf_path, kv_cache, sink_len, window_len)?;
     let cap = budget.max_ctx().min(model_ctx_cap).max(1);
     if requested > cap {
         eprintln!(
@@ -282,7 +289,14 @@ mod tests {
             return;
         };
         assert_eq!(
-            clamp_ctx(64, &path, crate::load_opts::KvCacheMode::Fp16).expect("clamp_ctx"),
+            clamp_ctx(
+                64,
+                &path,
+                crate::load_opts::KvCacheMode::Fp16,
+                crate::kv_quant::SINK_LEN,
+                crate::kv_quant::WINDOW_LEN,
+            )
+            .expect("clamp_ctx"),
             64
         );
     }
@@ -295,8 +309,14 @@ mod tests {
         // A request far beyond any plausible VRAM budget or the model's own
         // declared context_length must come back clamped, not passed
         // through untouched.
-        let clamped =
-            clamp_ctx(10_000_000, &path, crate::load_opts::KvCacheMode::Fp16).expect("clamp_ctx");
+        let clamped = clamp_ctx(
+            10_000_000,
+            &path,
+            crate::load_opts::KvCacheMode::Fp16,
+            crate::kv_quant::SINK_LEN,
+            crate::kv_quant::WINDOW_LEN,
+        )
+        .expect("clamp_ctx");
         assert!(clamped > 0);
         assert!(clamped < 10_000_000);
     }

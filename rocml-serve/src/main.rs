@@ -59,6 +59,21 @@ struct Args {
     /// `rocml::KvCacheMode`. Default `fp16`; quantized modes are opt-in.
     #[arg(long, value_enum, default_value = "fp16")]
     kv_cache: KvCacheArg,
+    /// Attention-sink length for a quantized (`q8`/`q4-mixed`) `--kv-cache`
+    /// mode (issue #2 leftovers) — the leading positions that stay fp16
+    /// forever, never evicted/quantized. No effect at the default
+    /// `--kv-cache fp16`. Must be at least 1 and satisfy
+    /// `--kv-sink + --kv-window < --ctx` (otherwise no history ever reaches
+    /// the quantized bulk region).
+    #[arg(long, default_value_t = rocml::kv_quant::SINK_LEN)]
+    kv_sink: u32,
+    /// Recent-window ring capacity (and quantize-on-evict batch size) for a
+    /// quantized `--kv-cache` mode (issue #2 leftovers). Must be at least 1
+    /// and at most 65535 (HIP's grid.y/z dimension limit — the mixed
+    /// cache's quantize-evict kernel launches one grid.y row per window
+    /// position); no relationship to any prefill chunk size is required.
+    #[arg(long, default_value_t = rocml::kv_quant::WINDOW_LEN)]
+    kv_window: u32,
     /// Routes qwen35 hybrid chunked-prefill matmuls through the int8 MMQ
     /// GEMM instead of f16 WMMA where eligible — see
     /// `rocml::LoadOptions::use_mmq`'s doc comment. Off by default.
@@ -122,8 +137,14 @@ async fn run(args: Args) -> Result<(), String> {
     let requested_ctx = args
         .ctx
         .unwrap_or_else(|| spec.map_or(DEFAULT_CTX, |s| s.default_ctx));
-    let ctx = rocml::registry::clamp_ctx(requested_ctx, &resolved.path, kv_cache)
-        .map_err(|e| e.to_string())?;
+    let ctx = rocml::registry::clamp_ctx(
+        requested_ctx,
+        &resolved.path,
+        kv_cache,
+        args.kv_sink,
+        args.kv_window,
+    )
+    .map_err(|e| e.to_string())?;
     // `--no-think` can only force reasoning off, not force it on over a
     // preset that defaults it off — matching the CLI's existing one-way
     // switch (there's no `--think` counterpart today).
@@ -136,6 +157,8 @@ async fn run(args: Args) -> Result<(), String> {
         ctx,
         kv_cache,
         use_mmq: args.mmq,
+        kv_sink: args.kv_sink,
+        kv_window: args.kv_window,
         max_tokens_default: args.max_tokens_default,
         no_think,
         default_sampling,

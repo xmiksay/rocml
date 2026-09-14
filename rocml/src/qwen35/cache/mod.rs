@@ -188,7 +188,18 @@ impl HybridCache {
     /// the layers strictly between them get the mixed quantized layout. A
     /// model with only one full-attention layer has no mixed layers at all
     /// (that one layer is simultaneously first and last).
-    pub fn new(cfg: &Qwen35Config, ctx: usize, mode: KvCacheMode) -> Result<Self, RocmlError> {
+    ///
+    /// `sink_len`/`window_len` are issue #2 leftovers' `LoadOptions::kv_sink`/
+    /// `kv_window` (defaulting to `crate::kv_quant::{SINK_LEN, WINDOW_LEN}`)
+    /// — the caller (`qwen35::forward::Model::load`) must have already
+    /// validated them via `crate::kv_quant::validate_sink_window`.
+    pub fn new(
+        cfg: &Qwen35Config,
+        ctx: usize,
+        mode: KvCacheMode,
+        sink_len: u32,
+        window_len: u32,
+    ) -> Result<Self, RocmlError> {
         let max_seq = ctx.min(cfg.context_length as usize).max(1) as u32;
         let attn_indices: Vec<usize> = cfg
             .layer_kinds
@@ -223,6 +234,8 @@ impl HybridCache {
                             cfg.head_dim,
                             max_seq,
                             v_bits,
+                            sink_len,
+                            window_len,
                         )?)
                     } else {
                         AttnLayerCache::Dense(AttnPlane::new(

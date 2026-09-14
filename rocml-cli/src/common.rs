@@ -60,6 +60,24 @@ pub struct ModelArgs {
     /// the dense `qwen3` architecture or on decode.
     #[arg(long)]
     pub mmq: bool,
+    /// Attention-sink length for a quantized (`q8`/`q4-mixed`) `--kv-cache`
+    /// mode (issue #2 leftovers) — the leading positions that stay fp16
+    /// forever, never evicted/quantized. No effect at the default
+    /// `--kv-cache fp16`. Must be at least 1 and satisfy
+    /// `--kv-sink + --kv-window < --ctx` (otherwise no history ever reaches
+    /// the quantized bulk region).
+    #[arg(long, default_value_t = rocml::kv_quant::SINK_LEN)]
+    pub kv_sink: u32,
+    /// Recent-window ring capacity (and quantize-on-evict batch size) for a
+    /// quantized `--kv-cache` mode (issue #2 leftovers). Must be at least 1
+    /// and at most 65535 (the mixed cache's quantize-evict kernel launches
+    /// one HIP grid.y row per window position, and HIP's grid.y/z dimension
+    /// is capped at 65535); no relationship to any prefill chunk size is
+    /// required — the chunked-prefill eviction planner handles any window
+    /// size, including one that spans multiple evictions within a single
+    /// chunk.
+    #[arg(long, default_value_t = rocml::kv_quant::WINDOW_LEN)]
+    pub kv_window: u32,
 }
 
 impl ModelArgs {
@@ -78,9 +96,11 @@ pub fn resolve_ctx(
     default_ctx: usize,
     gguf_path: &Path,
     kv_cache: KvCacheMode,
+    kv_sink: u32,
+    kv_window: u32,
 ) -> Result<usize, RocmlError> {
     let requested = explicit.unwrap_or_else(|| spec.map_or(default_ctx, |s| s.default_ctx));
-    rocml::registry::clamp_ctx(requested, gguf_path, kv_cache)
+    rocml::registry::clamp_ctx(requested, gguf_path, kv_cache, kv_sink, kv_window)
 }
 
 /// Sampling flags shared by `chat` and `generate`. `bench` doesn't take

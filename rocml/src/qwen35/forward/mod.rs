@@ -111,6 +111,10 @@ impl Model {
             crate::load_opts::KvCacheMode::Q4Mixed => 4,
             _ => 8,
         };
+        let ctx = opts.ctx.min(config.context_length as usize).max(1);
+        if opts.kv_cache.is_quantized() {
+            crate::kv_quant::validate_sink_window(opts.kv_sink, opts.kv_window, ctx)?;
+        }
         let (per_token, fixed_overhead) = mixed_kv_bytes_per_token(
             opts.kv_cache,
             n_boundary_layers,
@@ -118,8 +122,9 @@ impl Model {
             config.head_count_kv,
             config.head_dim,
             v_bits,
+            opts.kv_sink,
+            opts.kv_window,
         );
-        let ctx = opts.ctx.min(config.context_length as usize).max(1);
         let mem = device.memory_info()?;
         let budget = Budget::for_loaded_weights_with_overhead(
             mem.total as u64,
@@ -142,7 +147,7 @@ impl Model {
             );
         }
 
-        let cache = HybridCache::new(&config, ctx, opts.kv_cache)?;
+        let cache = HybridCache::new(&config, ctx, opts.kv_cache, opts.kv_sink, opts.kv_window)?;
         let kernels = Kernels::load_all(opts.use_mmq)?;
         let hybrid = HybridKernels::load_all()?;
         let mixed_kernels = MixedKernels::load_all()?;

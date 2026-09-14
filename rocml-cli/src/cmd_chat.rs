@@ -57,7 +57,15 @@ pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
     let resolved = args.model_args.resolve()?;
     let spec = resolved.spec;
     let kv_cache: rocml::KvCacheMode = args.model_args.kv_cache.into();
-    let ctx = common::resolve_ctx(args.ctx, spec, DEFAULT_CTX, &resolved.path, kv_cache)?;
+    let ctx = common::resolve_ctx(
+        args.ctx,
+        spec,
+        DEFAULT_CTX,
+        &resolved.path,
+        kv_cache,
+        args.model_args.kv_sink,
+        args.model_args.kv_window,
+    )?;
     eprintln!("loading {}... (ctx {ctx})", args.model_args.model);
     let mut loaded = common::load(
         &resolved.path,
@@ -65,6 +73,8 @@ pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
             ctx,
             kv_cache,
             use_mmq: args.model_args.mmq,
+            kv_sink: args.model_args.kv_sink,
+            kv_window: args.model_args.kv_window,
         },
     )?;
     eprintln!(

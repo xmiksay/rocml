@@ -26,7 +26,13 @@ pub fn run(args: &BenchArgs, turns: usize) -> Result<(), RocmlError> {
     let kv_cache: rocml::KvCacheMode = args.model_args.kv_cache.into();
     let needed = turns * (FIXED_USER_MESSAGE_TOKENS + args.turn_decode_tokens) + 512;
     let ctx_request = args.ctx.unwrap_or(needed).max(needed).max(1);
-    let ctx = rocml::registry::clamp_ctx(ctx_request, &resolved.path, kv_cache)?;
+    let ctx = rocml::registry::clamp_ctx(
+        ctx_request,
+        &resolved.path,
+        kv_cache,
+        args.model_args.kv_sink,
+        args.model_args.kv_window,
+    )?;
     eprintln!("loading {}... (ctx {ctx})", args.model_args.model);
     let mut loaded = common::load(
         &resolved.path,
@@ -34,6 +40,8 @@ pub fn run(args: &BenchArgs, turns: usize) -> Result<(), RocmlError> {
             ctx,
             kv_cache,
             use_mmq: args.model_args.mmq,
+            kv_sink: args.model_args.kv_sink,
+            kv_window: args.model_args.kv_window,
         },
     )?;
 

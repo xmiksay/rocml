@@ -27,7 +27,6 @@ use rocml_hip::DeviceBuffer;
 use super::MixedAttnPlane;
 use crate::error::RocmlError;
 use crate::forward::kernels::offset;
-use crate::kv_quant::{SINK_LEN, WINDOW_LEN};
 use crate::qwen35::forward::chunk_kernels::ChunkKernels;
 use crate::qwen35::forward::kernels_mixed::MixedKernels;
 
@@ -68,7 +67,7 @@ impl MixedAttnPlane {
                 offset(&self.sink_v, 0),
                 n_kv_heads,
                 head_dim,
-                SINK_LEN,
+                self.sink_len,
                 sink_rows,
                 pos_base,
             )?;
@@ -106,7 +105,7 @@ impl MixedAttnPlane {
                     offset(&self.window_v, 0),
                     n_kv_heads,
                     head_dim,
-                    WINDOW_LEN,
+                    self.window_len,
                     seg.len,
                     seg.window_slot_start,
                 )?;
@@ -117,7 +116,7 @@ impl MixedAttnPlane {
                     offset(&self.bulk_k_codes, 0),
                     offset(&self.bulk_k_scales, 0),
                     n_kv_heads,
-                    WINDOW_LEN,
+                    self.window_len,
                     head_dim,
                     self.bulk_cap,
                     self.num_blocks_total,
@@ -129,7 +128,7 @@ impl MixedAttnPlane {
                     offset(&self.bulk_v_codes, 0),
                     offset(&self.bulk_v_scales, 0),
                     n_kv_heads,
-                    WINDOW_LEN,
+                    self.window_len,
                     head_dim,
                     self.bulk_cap,
                     block,

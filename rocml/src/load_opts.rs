@@ -4,6 +4,7 @@
 //! storage policy (issue #3/#2).
 
 use crate::cache::KvDtype;
+use crate::kv_quant::{SINK_LEN, WINDOW_LEN};
 
 /// KV cache storage policy selected at load time.
 ///
@@ -78,6 +79,19 @@ pub struct LoadOptions {
     /// (it never chunks prefill, so this dispatch is never reached) or on
     /// decode (token-serial decode uses `matvec`, never `matmul`).
     pub use_mmq: bool,
+    /// Attention-sink length for a quantized (`Q8`/`Q4Mixed`) mixed KV
+    /// layer — issue #2 leftovers' `--kv-sink`. Defaults to
+    /// `crate::kv_quant::SINK_LEN` (32); no effect when `kv_cache` isn't
+    /// quantized. Validated at load time by
+    /// `crate::kv_quant::validate_sink_window` (positive, and
+    /// `kv_sink + kv_window < ctx`) — `Model::load` surfaces a
+    /// `RocmlError::Config` rather than panicking on an invalid value.
+    pub kv_sink: u32,
+    /// Recent-window capacity (and quantize-on-evict batch size) for a
+    /// quantized mixed KV layer — issue #2 leftovers' `--kv-window`.
+    /// Defaults to `crate::kv_quant::WINDOW_LEN` (128). See `kv_sink`'s doc
+    /// comment for validation.
+    pub kv_window: u32,
 }
 
 impl LoadOptions {
@@ -86,6 +100,8 @@ impl LoadOptions {
             ctx,
             kv_cache: KvCacheMode::default(),
             use_mmq: false,
+            kv_sink: SINK_LEN,
+            kv_window: WINDOW_LEN,
         }
     }
 
@@ -96,6 +112,16 @@ impl LoadOptions {
 
     pub fn with_mmq(mut self, use_mmq: bool) -> Self {
         self.use_mmq = use_mmq;
+        self
+    }
+
+    pub fn with_kv_sink(mut self, kv_sink: u32) -> Self {
+        self.kv_sink = kv_sink;
+        self
+    }
+
+    pub fn with_kv_window(mut self, kv_window: u32) -> Self {
+        self.kv_window = kv_window;
         self
     }
 }

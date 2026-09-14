@@ -4,7 +4,7 @@
 //! position. Split into its own file purely for the 400-line cap, mirroring
 //! `cache/snapshot.rs`'s split from `cache/mod.rs`.
 
-use super::{MixedLayout, SINK_LEN, WINDOW_LEN};
+use super::MixedLayout;
 
 /// One segment of a chunk's window-region append — see
 /// [`MixedLayout::plan_chunk_append`]'s doc comment for the exact contract.
@@ -61,13 +61,13 @@ impl MixedLayout {
         pos_base: u32,
         chunk_len: u32,
     ) -> (u32, Vec<ChunkWindowSegment>) {
-        let sink_rows = SINK_LEN.saturating_sub(pos_base).min(chunk_len);
+        let sink_rows = self.sink_len.saturating_sub(pos_base).min(chunk_len);
         let mut segments = Vec::new();
         let mut row = sink_rows;
         let mut pos = pos_base + sink_rows;
         while row < chunk_len {
             let filled = pos - self.window_base;
-            let room = WINDOW_LEN - filled;
+            let room = self.window_len - filled;
             let take = room.min(chunk_len - row);
             let mut evict_after = None;
             if take == room && row + take < chunk_len {
@@ -78,7 +78,7 @@ impl MixedLayout {
                 // stopped exactly here instead, the block stays full but
                 // un-evicted (matches `window_fills_without_eviction_until_exactly_full`).
                 evict_after = Some(self.evicted_blocks());
-                self.window_base += WINDOW_LEN;
+                self.window_base += self.window_len;
             }
             segments.push(ChunkWindowSegment {
                 chunk_row_start: row,
@@ -95,6 +95,7 @@ impl MixedLayout {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{SINK_LEN, WINDOW_LEN};
     use super::*;
 
     /// Replays `prepare_append` one position at a time and records every
@@ -317,6 +318,81 @@ mod tests {
                 &chunked,
                 &serial,
                 &format!("random chunking trial {trial}: {chunk_lens:?}"),
+            );
+        }
+    }
+
+    /// Non-default sink/window lengths (issue #2 leftovers): the same
+    /// random-chunking equivalence proof as
+    /// `chunk_append_matches_token_serial_across_many_random_chunkings`
+    /// above, just at `sink=16/window=256` instead of the defaults —
+    /// confirms `plan_chunk_append` has no hidden dependency on the
+    /// specific default constants (chunk sizes here deliberately span both
+    /// sides of the non-default `window_len`).
+    #[test]
+    fn plan_chunk_append_matches_token_serial_at_non_default_lens() {
+        let (sink, window) = (16u32, 256u32);
+        let total_len = sink + window * 6 + 17;
+
+        let mut serial_layout = MixedLayout::with_lens(sink, window);
+        let mut serial_slots = Vec::new();
+        let mut serial_evictions = Vec::new();
+        for pos in sink..total_len {
+            let (slot, evicted) = serial_layout.prepare_append(pos);
+            serial_slots.push((pos, slot));
+            if let Some(block) = evicted {
+                serial_evictions.push(block);
+            }
+        }
+
+        let mut state = 0xD1B54A32D192ED03u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for trial in 0..20 {
+            let mut chunk_lens = Vec::new();
+            let mut remaining = total_len;
+            while remaining > 0 {
+                let max_take = remaining.min(window);
+                let take = 1 + (next() % max_take as u64) as u32;
+                chunk_lens.push(take);
+                remaining -= take;
+            }
+
+            let mut layout = MixedLayout::with_lens(sink, window);
+            let mut slots = Vec::new();
+            let mut evictions = Vec::new();
+            let mut pos_base = 0;
+            for &chunk_len in &chunk_lens {
+                let (_sink_rows, segments) = layout.plan_chunk_append(pos_base, chunk_len);
+                for seg in &segments {
+                    for i in 0..seg.len {
+                        let pos = pos_base + seg.chunk_row_start + i;
+                        slots.push((pos, seg.window_slot_start + i));
+                    }
+                    if let Some(block) = seg.evict_after {
+                        evictions.push(block);
+                    }
+                }
+                pos_base += chunk_len;
+            }
+
+            assert_eq!(
+                layout.window_base(),
+                serial_layout.window_base(),
+                "trial {trial} ({chunk_lens:?}): window_base mismatch"
+            );
+            assert_eq!(
+                evictions, serial_evictions,
+                "trial {trial} ({chunk_lens:?}): eviction sequence mismatch"
+            );
+            assert_eq!(
+                slots, serial_slots,
+                "trial {trial} ({chunk_lens:?}): per-position physical slot mismatch"
             );
         }
     }

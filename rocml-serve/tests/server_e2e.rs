@@ -78,6 +78,8 @@ async fn spawn_test_server_with_options(
         ctx: 4096,
         kv_cache: rocml::KvCacheMode::Fp16,
         use_mmq: false,
+        kv_sink: rocml::kv_quant::SINK_LEN,
+        kv_window: rocml::kv_quant::WINDOW_LEN,
         max_tokens_default: 128,
         no_think: true,
         default_sampling: rocml::SamplingParams::default(),

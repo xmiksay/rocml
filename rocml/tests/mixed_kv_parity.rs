@@ -81,18 +81,39 @@ fn run_greedy(model: &mut Model, prompt_ids: &[u32], n: usize) -> (Vec<f32>, Vec
     (logits, tokens)
 }
 
-/// Runs the fp16-vs-`mode` comparison and returns
-/// `(max_relative_logit_diff, first_divergence_step, divergence_count)`.
+/// Runs the fp16-vs-`mode` comparison at the default sink/window geometry
+/// and returns `(max_relative_logit_diff, first_divergence_step,
+/// divergence_count)`.
 fn compare_against_fp16(mode: KvCacheMode, prompt_ids: &[u32]) -> (f32, Option<usize>, usize) {
+    compare_against_fp16_with_lens(mode, prompt_ids, GREEDY_TOKENS, None)
+}
+
+/// Like [`compare_against_fp16`], but `lens = Some((sink, window))`
+/// overrides the mixed model's sink/window geometry (issue #2 leftovers'
+/// `--kv-sink`/`--kv-window`, the fp16 reference model is unaffected since
+/// sink/window only exist for a quantized mode) and `n` is the number of
+/// greedy decode steps past the prompt (independently tunable from the
+/// default-config gates' fixed `GREEDY_TOKENS`, since a non-default window
+/// needs a different decode depth to actually cross it).
+fn compare_against_fp16_with_lens(
+    mode: KvCacheMode,
+    prompt_ids: &[u32],
+    n: usize,
+    lens: Option<(u32, u32)>,
+) -> (f32, Option<usize>, usize) {
     let path = checkpoint(GGUF_REL).expect("checkpoint present (caller already checked)");
 
     let mut model_fp16 = Model::load(&path, LoadOptions::new(CTX)).expect("load fp16-KV model");
-    let (fp16_last_logits, fp16_tokens) = run_greedy(&mut model_fp16, prompt_ids, GREEDY_TOKENS);
+    let (fp16_last_logits, fp16_tokens) = run_greedy(&mut model_fp16, prompt_ids, n);
     drop(model_fp16);
 
-    let mut model_mixed = Model::load(&path, LoadOptions::new(CTX).with_kv_cache(mode))
-        .unwrap_or_else(|e| panic!("load {mode:?}-KV model: {e}"));
-    let (mixed_last_logits, mixed_tokens) = run_greedy(&mut model_mixed, prompt_ids, GREEDY_TOKENS);
+    let mut mixed_opts = LoadOptions::new(CTX).with_kv_cache(mode);
+    if let Some((sink, window)) = lens {
+        mixed_opts = mixed_opts.with_kv_sink(sink).with_kv_window(window);
+    }
+    let mut model_mixed =
+        Model::load(&path, mixed_opts).unwrap_or_else(|e| panic!("load {mode:?}-KV model: {e}"));
+    let (mixed_last_logits, mixed_tokens) = run_greedy(&mut model_mixed, prompt_ids, n);
 
     let mut max_rel = 0.0f32;
     for (got, want) in mixed_last_logits.iter().zip(&fp16_last_logits) {
@@ -225,4 +246,51 @@ fn q4_mixed_kv_greedy_divergence_is_a_near_tie_when_it_happens() {
             .expect("forward_token failed");
     }
     eprintln!("no greedy divergence over {GREEDY_TOKENS} tokens");
+}
+
+/// Non-default sink/window geometry (issue #2 leftovers, `--kv-sink 16
+/// --kv-window 256`): the same q4-mixed-vs-fp16 gate as
+/// `q4_mixed_kv_vs_fp16_logits_and_greedy_stability` above, just at a
+/// different configuration, to prove `LoadOptions::kv_sink`/`kv_window`
+/// actually reach the mixed cache rather than only compiling. `PROMPT_LEN`
+/// equals the new `sink_len` (mirroring the default-config tests' own
+/// `PROMPT_LEN == SINK_LEN` convention) and `GREEDY_TOKENS` is large enough
+/// to cross `sink_len + window_len = 272`, so at least one quantize-on-evict
+/// batch fires under the new geometry too.
+const NONDEFAULT_SINK: u32 = 16;
+const NONDEFAULT_WINDOW: u32 = 256;
+const NONDEFAULT_GREEDY_TOKENS: usize = 300;
+
+#[test]
+fn q4_mixed_kv_vs_fp16_at_non_default_sink_window() {
+    let Some(path) = checkpoint(GGUF_REL) else {
+        return;
+    };
+    let probe = Model::load(&path, LoadOptions::new(CTX)).expect("probe load");
+    let vocab_size = probe.vocab_size();
+    drop(probe);
+    let prompt_ids = synthetic_prompt(NONDEFAULT_SINK as usize, vocab_size);
+
+    let (max_rel, first_divergence, divergence_count) = compare_against_fp16_with_lens(
+        KvCacheMode::Q4Mixed,
+        &prompt_ids,
+        NONDEFAULT_GREEDY_TOKENS,
+        Some((NONDEFAULT_SINK, NONDEFAULT_WINDOW)),
+    );
+    eprintln!(
+        "q4-mixed (sink={NONDEFAULT_SINK}, window={NONDEFAULT_WINDOW}) vs fp16: max relative \
+         logit diff {max_rel:.6}; greedy divergences {divergence_count}/{NONDEFAULT_GREEDY_TOKENS} \
+         (first at step {first_divergence:?})"
+    );
+    // Same quantization scheme (K per-channel Q8, V per-token Q4) and the
+    // same architecture/checkpoint as `q4_mixed_kv_vs_fp16_logits_and_greedy_stability`
+    // above — only the sink/window geometry differs, so this reuses that
+    // gate's measured bound (1.5) rather than inventing a new one; if this
+    // ever fails, re-measure and record the new number here rather than
+    // loosening it blindly.
+    assert!(
+        max_rel < 1.5,
+        "q4-mixed (non-default sink/window) vs fp16 max relative logit diff {max_rel} exceeds \
+         the measured/justified bound"
+    );
 }
