@@ -6,6 +6,7 @@
 
 pub mod layout;
 pub mod quant_math;
+pub mod rotational;
 
 pub use layout::{ChunkWindowSegment, MixedLayout, Region, SINK_LEN, WINDOW_LEN};
 
