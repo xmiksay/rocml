@@ -12,3 +12,6 @@ pub mod smoothquant;
 
 #[allow(dead_code)] // only `rotational_kv_calibrate.rs`/`rotational_kv_measure.rs` use this today.
 pub mod rotational_kv;
+
+#[allow(dead_code)] // only `llama_layer_diff.rs`/`llama_ref_convert.rs` use this today.
+pub mod llama_ref;
