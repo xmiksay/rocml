@@ -289,6 +289,25 @@ pub const GDN_CW_OUTPUT_WMMA_F32_KERNEL: &str = "gdn_chunkwise_output_wmma_f32";
 pub const GDN_CW_STATE_WMMA_F32_HSACO: &[u8] = GDN_CW_UT_BUILD_WMMA_F32_HSACO;
 pub const GDN_CW_STATE_WMMA_F32_KERNEL: &str = "gdn_chunkwise_state_wmma_f32";
 
+/// `kernels/gdn_chunkwise_output_wmma_lds.hip` /
+/// `kernels/gdn_chunkwise_ut_build_wmma_lds.hip` (gdn-wmma-lds round, issue
+/// #6): LDS-staged follow-up to `GDN_CW_OUTPUT_WMMA_F32`/
+/// `GDN_CW_UT_BUILD_WMMA_F32` above — one workgroup per head stages every
+/// shared operand into LDS once instead of re-reading it from global memory
+/// per 16x16 output tile. See those files' module docs for the design and
+/// `gdn_chunkwise.rs`'s dispatch gate for the eligibility bound
+/// (`head_k_dim`/`head_v_dim` both multiples of 16 *and* <=128).
+pub const GDN_CW_OUTPUT_WMMA_LDS_F32_HSACO: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/gdn_chunkwise_output_wmma_lds.hsaco"
+));
+pub const GDN_CW_OUTPUT_WMMA_LDS_F32_KERNEL: &str = "gdn_chunkwise_output_wmma_lds_f32";
+pub const GDN_CW_UT_BUILD_WMMA_LDS_F32_HSACO: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/gdn_chunkwise_ut_build_wmma_lds.hsaco"
+));
+pub const GDN_CW_UT_BUILD_WMMA_LDS_F32_KERNEL: &str = "gdn_chunkwise_ut_build_wmma_lds_f32";
+
 /// `kernels/quantize_act_q8.hip`: per-32-element-block absmax int8
 /// quantizer for the int8 MMQ-style GEMM prototype below (WMMA-pipeline
 /// round, issue #6 lever 2) — llama.cpp Q8_1-style `(code, scale,

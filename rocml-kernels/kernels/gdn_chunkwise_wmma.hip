@@ -24,8 +24,14 @@
 // minimal such sharing). B and F are kept here as correctness-proven,
 // perf-rejected prototypes — the same disposition this codebase already
 // gives the int8 MMQ GEMM (`.claude/CLAUDE.md`'s WMMA-pipeline round) —
-// rather than deleted, since a future LDS-staged rewrite could reuse the
-// algebra derivation below directly.
+// rather than deleted, since the algebra derivation below is reused
+// verbatim by the LDS-staged follow-up that *is* wired into production
+// (gdn-wmma-lds round: `kernels/gdn_chunkwise_{ut_build,output}_wmma_lds.hip`
+// stage the same shared operands into LDS once per head instead of
+// re-reading them from global per 16x16 tile — see those files' module docs
+// and `gdn_chunkwise_kernels_wmma.rs`'s doc for the measured 2.33x/2.97x
+// wins over scalar that fixed exactly the redundant-traffic problem noted
+// above).
 //
 // Every kernel below is an *exact* algebraic reformulation of its scalar
 // counterpart as a `[16-multiple, 16-multiple]`-friendly matmul — see each

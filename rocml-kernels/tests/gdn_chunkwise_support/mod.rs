@@ -16,6 +16,7 @@ pub const L2_EPS: f64 = 1e-6;
 pub(crate) const UT_BUILD_J_PER_BLOCK: u32 = 8;
 
 pub mod wmma;
+pub mod wmma_lds;
 
 pub fn load(hsaco: &[u8], name: &str) -> (Module, rocml_hip::Function) {
     let module = Module::load_from_bytes(hsaco).expect("module load failed");
