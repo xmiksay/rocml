@@ -12,10 +12,15 @@
 //! it must uphold. `rot_sim` (also split out for the 400-line cap) adds
 //! [`MixedAttnPlane::apply_rot_sim`], issue #14 phase 2's debug quality
 //! simulation hook that both `append` and `append_chunk` call right before
-//! a real window eviction.
+//! a real window eviction. `snapshot` (also split out for the 400-line cap)
+//! adds [`MixedAttnPlane::capture`]/[`MixedAttnPlane::restore`], issue #1's
+//! snapshot layer hooks — see that module's doc comment for why the bulk
+//! region's capture is sliced to its filled prefix rather than the whole
+//! `bulk_cap`-sized allocation (issue #12).
 
 mod chunk;
 mod rot_sim;
+mod snapshot;
 
 use half::f16;
 use rocml_hip::DeviceBuffer;
@@ -25,7 +30,6 @@ use crate::error::RocmlError;
 use crate::forward::kernels::{offset, DevPtr, Kernels};
 use crate::kv_quant::rotational::RotSimSpec;
 use crate::kv_quant::MixedLayout;
-use crate::snapshot::AttnLayerBytes;
 
 /// Raw device pointers plus the shape/state scalars
 /// `Kernels`/`MixedKernels`' fused-attention launch needs — bundled so the
@@ -203,117 +207,6 @@ impl MixedAttnPlane {
         Ok(())
     }
 
-    /// Captures this layer's whole state for the snapshot layer (issue #1).
-    ///
-    /// Sink/window are captured whole (they're fixed-size, `SINK_LEN`/
-    /// `WINDOW_LEN` positions regardless of `ctx`). The bulk region is
-    /// captured whole too — a deliberate v1 simplification, unlike
-    /// `AttnPlane::capture`'s filled-prefix-only slicing: `bulk_k_codes`/
-    /// `bulk_v_codes`'s per-head/per-block physical layout is an
-    /// implementation detail of `quantize_evict_k`/`_v`'s HIP kernels (see
-    /// `kv_quant::quant_math`'s module doc for the one evicted block's
-    /// layout, `[n_kv_heads, WINDOW_LEN, head_dim]` — but not how blocks are
-    /// placed relative to each other in the larger buffer), so slicing out
-    /// only `evicted_blocks()` worth would require duplicating that
-    /// assumption here at real risk of a silent mismatch. Capturing the
-    /// whole `bulk_cap`-sized buffer costs snapshot size proportional to
-    /// configured `ctx` rather than actual position for mixed layers only —
-    /// correct either way (unfilled blocks are simply never read on
-    /// restore), and fine at this project's context scales; a follow-up can
-    /// slice precisely once that layout is exposed as a documented contract.
-    pub fn capture(&self) -> Result<AttnLayerBytes, RocmlError> {
-        let mut sink_k = vec![f16::from_f32(0.0); self.sink_k.len()];
-        let mut sink_v = vec![f16::from_f32(0.0); self.sink_v.len()];
-        let mut window_k = vec![f16::from_f32(0.0); self.window_k.len()];
-        let mut window_v = vec![f16::from_f32(0.0); self.window_v.len()];
-        self.sink_k.copy_to_host(&mut sink_k)?;
-        self.sink_v.copy_to_host(&mut sink_v)?;
-        self.window_k.copy_to_host(&mut window_k)?;
-        self.window_v.copy_to_host(&mut window_v)?;
-
-        let mut bulk_k_codes = vec![0i8; self.bulk_k_codes.len()];
-        let mut bulk_k_scales = vec![0.0f32; self.bulk_k_scales.len()];
-        let mut bulk_v_codes = vec![0u8; self.bulk_v_codes.len()];
-        let mut bulk_v_scales = vec![0.0f32; self.bulk_v_scales.len()];
-        self.bulk_k_codes.copy_to_host(&mut bulk_k_codes)?;
-        self.bulk_k_scales.copy_to_host(&mut bulk_k_scales)?;
-        self.bulk_v_codes.copy_to_host(&mut bulk_v_codes)?;
-        self.bulk_v_scales.copy_to_host(&mut bulk_v_scales)?;
-
-        Ok(AttnLayerBytes::Mixed {
-            sink_k,
-            sink_v,
-            window_k,
-            window_v,
-            bulk_k_codes,
-            bulk_k_scales,
-            bulk_v_codes,
-            bulk_v_scales,
-            window_base: self.layout.window_base(),
-            v_bits: self.v_bits,
-        })
-    }
-
-    /// Writes a captured state back — every buffer must match this plane's
-    /// own allocated size exactly (guaranteed when `KvConfigStamp`,
-    /// including `ctx`, matched at lookup time, since that determines
-    /// `bulk_cap`/`num_blocks_total` deterministically).
-    pub fn restore(&mut self, bytes: &AttnLayerBytes) -> Result<(), RocmlError> {
-        let AttnLayerBytes::Mixed {
-            sink_k,
-            sink_v,
-            window_k,
-            window_v,
-            bulk_k_codes,
-            bulk_k_scales,
-            bulk_v_codes,
-            bulk_v_scales,
-            window_base,
-            v_bits,
-        } = bytes
-        else {
-            return Err(RocmlError::Config(
-                "mixed attn plane restore: snapshot isn't a Mixed layer (internal bug — \
-                 KvConfigStamp should have gated this)"
-                    .to_string(),
-            ));
-        };
-        if *v_bits != self.v_bits {
-            return Err(RocmlError::Config(format!(
-                "mixed attn plane restore: v_bits mismatch ({v_bits} vs {})",
-                self.v_bits
-            )));
-        }
-        check_exact_len(sink_k.len(), self.sink_k.len(), "sink_k")?;
-        check_exact_len(sink_v.len(), self.sink_v.len(), "sink_v")?;
-        check_exact_len(window_k.len(), self.window_k.len(), "window_k")?;
-        check_exact_len(window_v.len(), self.window_v.len(), "window_v")?;
-        check_exact_len(bulk_k_codes.len(), self.bulk_k_codes.len(), "bulk_k_codes")?;
-        check_exact_len(
-            bulk_k_scales.len(),
-            self.bulk_k_scales.len(),
-            "bulk_k_scales",
-        )?;
-        check_exact_len(bulk_v_codes.len(), self.bulk_v_codes.len(), "bulk_v_codes")?;
-        check_exact_len(
-            bulk_v_scales.len(),
-            self.bulk_v_scales.len(),
-            "bulk_v_scales",
-        )?;
-
-        self.sink_k.copy_from_host(sink_k)?;
-        self.sink_v.copy_from_host(sink_v)?;
-        self.window_k.copy_from_host(window_k)?;
-        self.window_v.copy_from_host(window_v)?;
-        self.bulk_k_codes.copy_from_host(bulk_k_codes)?;
-        self.bulk_k_scales.copy_from_host(bulk_k_scales)?;
-        self.bulk_v_codes.copy_from_host(bulk_v_codes)?;
-        self.bulk_v_scales.copy_from_host(bulk_v_scales)?;
-        self.layout =
-            MixedLayout::from_window_base_with_lens(*window_base, self.sink_len, self.window_len);
-        Ok(())
-    }
-
     pub fn ptrs(&self) -> MixedPtrs {
         MixedPtrs {
             sink_k: offset(&self.sink_k, 0),
@@ -332,13 +225,4 @@ impl MixedAttnPlane {
             v_bits: self.v_bits,
         }
     }
-}
-
-fn check_exact_len(actual: usize, expected: usize, field: &str) -> Result<(), RocmlError> {
-    if actual != expected {
-        return Err(RocmlError::Config(format!(
-            "mixed attn plane restore: {field} has {actual} elements, expected {expected}"
-        )));
-    }
-    Ok(())
 }
