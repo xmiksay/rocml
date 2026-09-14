@@ -6,3 +6,6 @@ pub mod qwen35_cpu;
 
 #[allow(dead_code)] // only `mixed_kv_chunked_prefill_parity.rs` uses this today.
 pub mod mixed_kv_chunked_prefill;
+
+#[allow(dead_code)] // only `mmq_smoothquant_measure.rs`/`mmq_calibrate.rs` use this today.
+pub mod smoothquant;
