@@ -87,15 +87,46 @@ pub async fn spawn_test_server_with_options(
     snapshot_ram_mb: usize,
     debug_endpoints: bool,
 ) -> TestServer {
+    spawn_test_server_full(
+        model_path,
+        snapshot_ram_mb,
+        debug_endpoints,
+        true,
+        rocml::KvCacheMode::Fp16,
+    )
+    .await
+}
+
+/// Like [`spawn_test_server_with_options`], with `--no-think` and
+/// `--kv-cache` also controllable — every other helper hardcodes
+/// `no_think: true` (see `chat_completions_end_to_end`'s doc comment on why:
+/// qwen3.5-2b's own template defaults reasoning off, and this codebase's
+/// renderer is hardcoded to Ornith's template, whose default is reasoning
+/// *on*) and `KvCacheMode::Fp16`. Issue #12's server-path snapshot-miss
+/// regression needs both non-default knobs turned on to reproduce: thinking
+/// on (every prior server-level test ran with `no_think: true`) *and* a
+/// quantized KV cache (`MixedAttnPlane::capture`'s bulk region — see its
+/// doc comment — used to size every snapshot to the server's whole `ctx`
+/// regardless of actual conversation length, which a bounded RAM budget
+/// evicts before the next turn can look it up; `Fp16`'s dense `AttnPlane`
+/// never had this problem since it always captured only the filled
+/// prefix).
+pub async fn spawn_test_server_full(
+    model_path: PathBuf,
+    snapshot_ram_mb: usize,
+    debug_endpoints: bool,
+    no_think: bool,
+    kv_cache: rocml::KvCacheMode,
+) -> TestServer {
     let (app, worker_thread) = build(ServerConfig {
         model_path,
         ctx: 4096,
-        kv_cache: rocml::KvCacheMode::Fp16,
+        kv_cache,
         use_mmq: false,
         kv_sink: rocml::kv_quant::SINK_LEN,
         kv_window: rocml::kv_quant::WINDOW_LEN,
         max_tokens_default: 128,
-        no_think: true,
+        no_think,
         default_sampling: rocml::SamplingParams::default(),
         model_id_override: None,
         snapshot_ram_mb,
