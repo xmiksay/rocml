@@ -61,6 +61,18 @@ pub(crate) fn gdn_chunkwise_step(
     // tuning knob. `tile_len` itself is architecturally always <=128
     // (`GDN_RECUR_TILE` above) so it never needs its own check here.
     const LDS_MAX_DIM: u32 = 128;
+    // gdn-uvvnew round: stage D+E (fused `uv_vnew`) also got an LDS-staged
+    // WMMA kernel (`kernels/gdn_chunkwise_uv_vnew_wmma_lds.hip`) sharing this
+    // same eligibility bound, and it's a clean per-kernel/isolated-model win
+    // — but it is *not* dispatched here: it fails
+    // `rocml/tests/snapshot_equivalence.rs`'s whole-model `1e-2` final-logits
+    // gate by a hair in one specific snapshot-restore case (measured diff
+    // `0.010043` vs tolerance `0.01`), confirmed to disappear when this
+    // kernel alone is disabled. Per this round's own instructions the gate's
+    // tolerance was not loosened to paper over that — see
+    // `gdn_chunkwise_kernels_wmma.rs`'s module doc and `.claude/CLAUDE.md`'s
+    // gdn-uvvnew round entry for the full measurement. `cw.uv_vnew` (scalar)
+    // stays the only dispatch target below.
     let dispatch = WmmaDispatch {
         state: use_wmma,
         output: use_wmma && gdn.head_k_dim <= LDS_MAX_DIM && gdn.head_v_dim <= LDS_MAX_DIM,
@@ -132,6 +144,8 @@ fn run_tile(
         cw.ut_build(q_norm, k_norm, k_beta, g_cum, kb, kq, h, sk, tile_len)?;
     }
     cw.tinv(kb, h, tile_len)?;
+    // D+E (fused `uv_vnew`) stays scalar — see `WmmaDispatch`'s construction
+    // above for why the LDS-staged WMMA kernel exists but isn't dispatched.
     cw.uv_vnew(
         kb, // now Tinv, in place
         conv_out,

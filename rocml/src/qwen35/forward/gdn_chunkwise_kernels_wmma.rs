@@ -34,18 +34,31 @@
 //! item (`tinv`'s serial forward-substitution and `uv_vnew`'s recurrent-
 //! state-feeding chained matmuls are both still scalar, see below).
 //!
-//! **D+E** (`uv_vnew`) was evaluated again this round but still not
-//! attempted: chains three dependent matmuls through a shared intermediate
-//! that would need materializing into LDS as a fresh WMMA operand between
-//! phases (this file's B/F design only ever re-stages *existing* global
-//! operands, never a just-computed accumulator) — real additional
-//! engineering risk on top of feeding the *recurrent* state carried across
-//! every tile of a prompt, judged out of scope given B/F's own budget was
-//! already spent proving out the harder-than-expected LDS-materialization
-//! step for a from-global operand. Flagged for a future round if `tinv`
-//! (this pipeline's now-largest single kernel, 372.99us/call, unchanged
-//! since the `gdn-recur-occupancy` round evaluated and rejected a
-//! block-recursive rewrite) or `uv_vnew` (294.55us/call) are ever revisited.
+//! **D+E** (`gdn_chunkwise_uv_vnew_wmma_lds_f32`, `kernels/
+//! gdn_chunkwise_uv_vnew_wmma_lds.hip`, gdn-uvvnew round): the deferred
+//! kernel from the two rounds above — chains three dependent matmuls through
+//! a shared intermediate (`Tinv@VB`, `Tinv@KB`, then `K_cd@state`),
+//! materializing the mid-kernel `K_cd` accumulator into LDS as f16 fragments
+//! (negated, so the third matmul's accumulation into the *same* registers as
+//! the first computes the subtraction via a plain MAC) before consuming it
+//! as a fresh WMMA operand — see the kernel source's module doc for the full
+//! derived algebra and LDS-budget accounting. Correctness-proven standalone
+//! (all `gdn_chunkwise_wmma_lds.rs` f64-reference cases, including the
+//! 64-tile long-chain compounding check, pass comfortably inside the
+//! kernel-level `3e-3` tolerance) and a clean per-kernel/isolated-model win
+//! (288.0us/call scalar -> 134.5us/call, 2.14x; interleaved end-to-end
+//! ornith-9b +2.0-2.6%, decode flat) — but **not wired into production
+//! dispatch**: it fails `rocml/tests/snapshot_equivalence.rs`'s whole-model
+//! `1e-2` final-logits gate by a hair (measured diff `0.010043` vs tolerance
+//! `0.01`, one specific restore-scenario case at `len=4200 split=127`,
+//! confirmed to disappear when this kernel alone is disabled). No Rust host
+//! launch method is added for it here (unlike `state`/`output_lds`/
+//! `ut_build_lds` above) — the same disposition `gdn_chunkwise_wmma.hip`'s
+//! perf-rejected naive `ut_build_wmma`/`output_wmma` kernels already have:
+//! kept in-tree and covered by its own test file, never given a production
+//! call site. Per this round's own instructions, the tolerance was not
+//! loosened to make it pass — see `.claude/CLAUDE.md`'s gdn-uvvnew round
+//! entry for the full measurement.
 
 use rocml_hip::{kernel_params, LaunchConfig, Module};
 
