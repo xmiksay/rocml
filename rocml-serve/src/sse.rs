@@ -15,10 +15,13 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::mapping::AssistantAccumulator;
-use crate::openai::{self, DeltaOut, FunctionCallOut, ToolCallDeltaOut};
+use crate::openai::{
+    self, DeltaOut, FunctionCallOut, PromptTokensDetailsOut, ToolCallDeltaOut, UsageOut,
+};
 use crate::routes::{completion_id, new_scanner, now_unix};
 use crate::worker::WorkerEvent;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_response(
     model_id: String,
     prompt_tokens: usize,
@@ -26,6 +29,7 @@ pub(crate) fn stream_response(
     rx: mpsc::UnboundedReceiver<WorkerEvent>,
     started: Instant,
     thinking_primed: bool,
+    include_usage: bool,
 ) -> Response {
     let (sse_tx, sse_rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
     tokio::spawn(pump_stream(
@@ -36,6 +40,7 @@ pub(crate) fn stream_response(
         sse_tx,
         started,
         thinking_primed,
+        include_usage,
     ));
     Sse::new(UnboundedReceiverStream::new(sse_rx))
         .keep_alive(KeepAlive::default())
@@ -46,6 +51,7 @@ pub(crate) fn stream_response(
 /// OpenAI delta chunk as it arrives, then closes with a final chunk carrying
 /// `finish_reason` and a literal `[DONE]` — never leaving the connection
 /// hanging even if generation errors out mid-stream.
+#[allow(clippy::too_many_arguments)]
 async fn pump_stream(
     model_id: String,
     prompt_tokens: usize,
@@ -54,6 +60,7 @@ async fn pump_stream(
     tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
     started: Instant,
     thinking_primed: bool,
+    include_usage: bool,
 ) {
     let id = completion_id();
     let created = now_unix();
@@ -68,6 +75,7 @@ async fn pump_stream(
                 ..Default::default()
             },
             None,
+            include_usage,
         ),
     );
 
@@ -78,29 +86,30 @@ async fn pump_stream(
             Some(WorkerEvent::Chunk(text)) => {
                 if let Ok(events) = scanner.feed(&text) {
                     for ev in events {
-                        emit_event(&tx, &id, created, &model_id, ev, &mut acc);
+                        emit_event(&tx, &id, created, &model_id, ev, &mut acc, include_usage);
                     }
                 }
             }
-            Some(WorkerEvent::Done(stats)) => break Ok(stats),
+            Some(WorkerEvent::Done(turn)) => break Ok(turn),
             Some(WorkerEvent::Error(e)) => break Err(e),
             None => break Err("model worker closed unexpectedly".to_string()),
         }
     };
 
-    let (finish_reason, completion_tokens) = match outcome {
-        Ok(stats) => {
+    let (finish_reason, completion_tokens, cached_tokens) = match outcome {
+        Ok(turn) => {
             for ev in scanner.finish() {
-                emit_event(&tx, &id, created, &model_id, ev, &mut acc);
+                emit_event(&tx, &id, created, &model_id, ev, &mut acc, include_usage);
             }
             (
-                acc.finish_reason(stats.generated_tokens, max_new_tokens),
-                stats.generated_tokens,
+                acc.finish_reason(turn.stats.generated_tokens, max_new_tokens),
+                turn.stats.generated_tokens,
+                turn.cached_tokens,
             )
         }
         Err(e) => {
             tracing::error!(error = %e, "generation failed mid-stream");
-            ("stop", 0)
+            ("stop", 0, 0)
         }
     };
     let _ = send_chunk(
@@ -111,8 +120,18 @@ async fn pump_stream(
             &model_id,
             DeltaOut::default(),
             Some(finish_reason),
+            include_usage,
         ),
     );
+    if include_usage {
+        let usage = UsageOut {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: PromptTokensDetailsOut { cached_tokens },
+        };
+        let _ = send_chunk(&tx, openai::usage_chunk(&id, created, &model_id, usage));
+    }
     let _ = tx.send(Ok(Event::default().data("[DONE]")));
     tracing::info!(
         route = "/v1/chat/completions",
@@ -123,6 +142,7 @@ async fn pump_stream(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_event(
     tx: &mpsc::UnboundedSender<Result<Event, Infallible>>,
     id: &str,
@@ -130,6 +150,7 @@ fn emit_event(
     model_id: &str,
     event: ScanEvent,
     acc: &mut AssistantAccumulator,
+    include_usage: bool,
 ) {
     match event {
         ScanEvent::TextDelta(s) => {
@@ -138,7 +159,10 @@ fn emit_event(
                 ..Default::default()
             };
             acc.apply(ScanEvent::TextDelta(s));
-            let _ = send_chunk(tx, openai::chunk(id, created, model_id, delta, None));
+            let _ = send_chunk(
+                tx,
+                openai::chunk(id, created, model_id, delta, None, include_usage),
+            );
         }
         ScanEvent::ThinkingDelta(s) => {
             let delta = DeltaOut {
@@ -146,7 +170,10 @@ fn emit_event(
                 ..Default::default()
             };
             acc.apply(ScanEvent::ThinkingDelta(s));
-            let _ = send_chunk(tx, openai::chunk(id, created, model_id, delta, None));
+            let _ = send_chunk(
+                tx,
+                openai::chunk(id, created, model_id, delta, None, include_usage),
+            );
         }
         ScanEvent::ToolCallStarted => {}
         ScanEvent::ToolCallComplete(call) => {
@@ -164,14 +191,17 @@ fn emit_event(
                 ..Default::default()
             };
             acc.apply(ScanEvent::ToolCallComplete(call));
-            let _ = send_chunk(tx, openai::chunk(id, created, model_id, delta, None));
+            let _ = send_chunk(
+                tx,
+                openai::chunk(id, created, model_id, delta, None, include_usage),
+            );
         }
     }
 }
 
-fn send_chunk(
+fn send_chunk<T: serde::Serialize>(
     tx: &mpsc::UnboundedSender<Result<Event, Infallible>>,
-    chunk: openai::ChatCompletionChunk,
+    chunk: T,
 ) -> Result<(), ()> {
     let data = serde_json::to_string(&chunk).map_err(|_| ())?;
     tx.send(Ok(Event::default().data(data))).map_err(|_| ())

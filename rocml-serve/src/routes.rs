@@ -23,7 +23,7 @@ use crate::error::ApiError;
 use crate::mapping::{self, AssistantAccumulator};
 use crate::openai::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessageOut, ChoiceOut, FunctionCallOut,
-    ToolCallOut, UsageOut,
+    PromptTokensDetailsOut, ToolCallOut, UsageOut,
 };
 use crate::sse::stream_response;
 use crate::state::AppState;
@@ -67,6 +67,10 @@ async fn handle_request(
         }
     }
     let stream = request.stream;
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .is_some_and(|o| o.include_usage);
     let messages = mapping::map_messages(&request.messages)?;
     let tools = mapping::map_tools(&request.tools);
     let render_opts = RenderOpts {
@@ -142,6 +146,7 @@ async fn handle_request(
             rx,
             started,
             thinking_primed,
+            include_usage,
         ))
     } else {
         let response = collect_response(
@@ -179,11 +184,11 @@ async fn collect_response(
                     }
                 }
             }
-            Some(WorkerEvent::Done(stats)) => {
+            Some(WorkerEvent::Done(turn)) => {
                 for ev in scanner.finish() {
                     acc.apply(ev);
                 }
-                let finish_reason = acc.finish_reason(stats.generated_tokens, max_new_tokens);
+                let finish_reason = acc.finish_reason(turn.stats.generated_tokens, max_new_tokens);
                 let response = ChatCompletionResponse {
                     id: completion_id(),
                     object: "chat.completion",
@@ -196,8 +201,11 @@ async fn collect_response(
                     }],
                     usage: UsageOut {
                         prompt_tokens,
-                        completion_tokens: stats.generated_tokens,
-                        total_tokens: prompt_tokens + stats.generated_tokens,
+                        completion_tokens: turn.stats.generated_tokens,
+                        total_tokens: prompt_tokens + turn.stats.generated_tokens,
+                        prompt_tokens_details: PromptTokensDetailsOut {
+                            cached_tokens: turn.cached_tokens,
+                        },
                     },
                 };
                 return Ok(Json(response).into_response());

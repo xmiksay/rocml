@@ -33,8 +33,18 @@ pub struct Job {
 
 pub enum WorkerEvent {
     Chunk(String),
-    Done(GenerateStats),
+    Done(TurnStats),
     Error(String),
+}
+
+/// A completed turn's stats plus the one extra number the OpenAI usage
+/// surface needs beyond what `GenerateStats` already tracks: how many
+/// prompt tokens this request restored from a snapshot instead of
+/// re-prefilling (`rocml::snapshot::turn::TurnOutcome::reused_prefix`,
+/// `0` on a miss or when snapshots don't apply).
+pub struct TurnStats {
+    pub stats: GenerateStats,
+    pub cached_tokens: usize,
 }
 
 /// `--snapshot-ram-mb`/`--snapshot-dir`/`--snapshot-disk-mb` — see
@@ -153,7 +163,7 @@ fn worker_loop(
             )
         }));
         let event = match outcome {
-            Ok(Ok(stats)) => WorkerEvent::Done(stats),
+            Ok(Ok(turn_stats)) => WorkerEvent::Done(turn_stats),
             Ok(Err(e)) => WorkerEvent::Error(e.to_string()),
             Err(_) => {
                 let _ = model.reset();
@@ -176,7 +186,7 @@ fn run_job(
     model_stamp: &ModelStamp,
     kv_config: &KvConfigStamp,
     job: &Job,
-) -> Result<GenerateStats, rocml::RocmlError> {
+) -> Result<TurnStats, rocml::RocmlError> {
     let outcome = run_turn(
         model,
         tokenizer,
@@ -207,7 +217,10 @@ fn run_job(
             "snapshot miss"
         );
     }
-    Ok(outcome.stats)
+    Ok(TurnStats {
+        stats: outcome.stats,
+        cached_tokens: outcome.reused_prefix as usize,
+    })
 }
 
 #[cfg(test)]
