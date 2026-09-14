@@ -9,3 +9,6 @@ pub mod mixed_kv_chunked_prefill;
 
 #[allow(dead_code)] // only `mmq_smoothquant_measure.rs`/`mmq_calibrate.rs` use this today.
 pub mod smoothquant;
+
+#[allow(dead_code)] // only `rotational_kv_calibrate.rs`/`rotational_kv_measure.rs` use this today.
+pub mod rotational_kv;
