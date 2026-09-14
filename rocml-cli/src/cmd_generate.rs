@@ -70,6 +70,8 @@ pub fn run(args: &GenerateArgs) -> Result<(), RocmlError> {
             use_mmq: args.model_args.mmq,
             kv_sink: args.model_args.kv_sink,
             kv_window: args.model_args.kv_window,
+            kv_rot_sim: args.model_args.kv_rot_sim,
+            kv_rot_sim_k: args.model_args.kv_rot_sim_k,
         },
     )?;
     let mem = loaded.model.memory_info()?;

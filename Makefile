@@ -7,7 +7,7 @@ ROCML_CHECKPOINT_DIR ?= $(HOME)/checkpoints
 # Dev/test model (fast); override to point at a different checkpoint.
 QWEN_MODEL ?= $(ROCML_CHECKPOINT_DIR)/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf
 
-.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench bench-profile bench-profile-json eval mmq-layer-diff mmq-endtoend-measure mmq-calibrate mmq-smoothquant-measure kv-head-error-measure gdn-wmma-lds-perf gdn-uvvnew-perf
+.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench bench-profile bench-profile-json eval mmq-layer-diff mmq-endtoend-measure mmq-calibrate mmq-smoothquant-measure kv-head-error-measure gdn-wmma-lds-perf gdn-uvvnew-perf rotational-kv-calibrate rotational-kv-measure rotational-kv-sim-parity eval-rotational-v3
 
 build:
 	cargo build --workspace
@@ -185,3 +185,45 @@ gdn-wmma-lds-perf:
 # correctness gate, including the 64-tile long-chain compounding check).
 gdn-uvvnew-perf:
 	cargo test --release -p rocml-kernels --test gdn_chunkwise_uv_vnew_wmma_lds_perf -- --ignored --nocapture
+
+# Issue #14 phase 2's calibration harness (`rocml/tests/rotational_kv_calibrate.rs`):
+# builds and overwrites the checked-in rotational-KV calibration sidecar
+# (`rocml/data/rotational_kv_calibration.json`) from real K/V vectors
+# captured off Ornith-1.0-9B-Q4_K_M's fp16-KV decode path — pairing scheme,
+# per-pair Givens angles, and 2/3/4 bpw Lloyd-Max codebooks, searched and
+# picked by measured held-out round-trip error. Only re-run intentionally.
+rotational-kv-calibrate:
+	cargo test --release -p rocml --test rotational_kv_calibrate -- --ignored --nocapture
+
+# Issue #14 phase 2 step 2 (`rocml/tests/rotational_kv_measure.rs`): the
+# tensor-level quality table — rotational (2/3/4 bpw) vs the current scalar
+# K(q8)/V(q8,q4) encoding's vector RMSE and attention-score/output
+# perturbation, on real held-out Ornith K/V. Requires the calibration
+# sidecar above to already exist (checked in; re-run `rotational-kv-calibrate`
+# to refresh it).
+rotational-kv-measure:
+	cargo test --release -p rocml --test rotational_kv_measure -- --ignored --nocapture
+
+# Issue #14 phase 2 step 3(a) (`rocml/tests/rotational_kv_sim_parity.rs`):
+# the mixed-KV parity gates' own greedy-check methodology, run under the
+# debug rotational simulation (`--kv-rot-sim`) instead of asserting a bound
+# — informational, records divergence at 2/3/4 bpw for the decision-gate
+# report.
+rotational-kv-sim-parity:
+	cargo test --release -p rocml --test rotational_kv_sim_parity -- --ignored --nocapture
+
+# Issue #14 phase 2 step 3(b) — THE DECISION GATE: the agentic eval
+# (issue #15's `make eval` harness) on Ornith-1.0-9B-Q4_K_M with K left at
+# the real production Q8 encoding and V round-tripped through rotational
+# quantization at 3 bpw before every window eviction (`--kv-rot-sim 3`).
+# Compare this run's overall pass rate + PPL against `make eval`'s own
+# fp16-KV/q4-mixed-KV baselines recorded in `.claude/CLAUDE.md` — near-zero
+# loss is issue #14's GO signal for phase 3 (fast kernels); visible
+# degradation is STOP.
+eval-rotational-v3:
+	cargo run --release -p rocml-cli -- eval \
+		--model ornith-9b --ctx 16384 \
+		--kv-cache q8 --kv-rot-sim 3 \
+		--label ornith-q4km-rotv3bpw \
+		--out bench/eval/results/ornith-q4km-rotv3bpw.json \
+		--resume

@@ -72,6 +72,7 @@ impl DenseAttnCache {
         mode: KvCacheMode,
         sink_len: u32,
         window_len: u32,
+        rot_sim: Option<crate::kv_quant::rotational::RotSimSpec>,
     ) -> Result<Self, RocmlError> {
         let max_seq = ctx.min(config.context_length as usize).max(1) as u32;
         let n_layers = config.block_count as usize;
@@ -97,6 +98,7 @@ impl DenseAttnCache {
                     v_bits,
                     sink_len,
                     window_len,
+                    rot_sim,
                 )?)
             } else {
                 AttnLayerCache::Dense(AttnPlane::new(

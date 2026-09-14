@@ -78,6 +78,21 @@ pub struct ModelArgs {
     /// chunk.
     #[arg(long, default_value_t = rocml::kv_quant::WINDOW_LEN)]
     pub kv_window: u32,
+    /// Issue #14 phase 2's debug model-level quality simulation: bits/coord
+    /// (2/3/4) to round-trip V through rotational quantization (block-
+    /// diagonal Givens + Lloyd-Max, `rocml::kv_quant::rotational`) at every
+    /// mixed-cache window eviction, instead of the production scalar
+    /// encoding — measures whether the technique's quality holds up on real
+    /// tasks before investing in fast HIP kernels (phase 3). No effect
+    /// unless `--kv-cache` is `q8`/`q4-mixed`. Performance is irrelevant on
+    /// this path (a CPU round trip per evicted block) — research-only, not
+    /// meant for `rocml-serve`.
+    #[arg(long)]
+    pub kv_rot_sim: Option<u8>,
+    /// Also round-trips K (not just V) through the same simulation. No
+    /// effect unless `--kv-rot-sim` is set.
+    #[arg(long)]
+    pub kv_rot_sim_k: bool,
 }
 
 impl ModelArgs {

@@ -111,6 +111,7 @@ impl MixedAttnPlane {
                 )?;
             }
             if let Some(block) = seg.evict_after {
+                self.apply_rot_sim()?;
                 mixed.quantize_evict_k(
                     offset(&self.window_k, 0),
                     offset(&self.bulk_k_codes, 0),

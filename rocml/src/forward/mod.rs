@@ -167,7 +167,20 @@ impl Model {
             );
         }
 
-        let cache = DenseAttnCache::new(&config, ctx, opts.kv_cache, opts.kv_sink, opts.kv_window)?;
+        let rot_sim = opts
+            .kv_rot_sim
+            .map(|bpw| crate::kv_quant::rotational::RotSimSpec {
+                bpw,
+                apply_to_k: opts.kv_rot_sim_k,
+            });
+        let cache = DenseAttnCache::new(
+            &config,
+            ctx,
+            opts.kv_cache,
+            opts.kv_sink,
+            opts.kv_window,
+            rot_sim,
+        )?;
         let kernels = Kernels::load_all(opts.use_mmq)?;
         let mixed_kernels = MixedKernels::load_all()?;
         let flash_mixed_kernels = FlashPrefillMixedKernels::load_all()?;

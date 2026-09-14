@@ -98,6 +98,27 @@ pub struct LoadOptions {
     /// Defaults to `crate::kv_quant::WINDOW_LEN` (128). See `kv_sink`'s doc
     /// comment for validation.
     pub kv_window: u32,
+    /// Issue #14 phase 2's debug model-level quality simulation: when
+    /// `Some(bpw)` and `kv_cache.is_quantized()`, every mixed-KV-cache
+    /// window eviction (`MixedAttnPlane::append`/`append_chunk`) first
+    /// round-trips V (rotate -> normalize -> Lloyd-Max quantize at `bpw` ->
+    /// dequantize -> inverse-rotate, via `kv_quant::rotational`) on the
+    /// host before the block is quantize-evicted through the normal
+    /// production kernel — simulating rotational KV quantization's quality
+    /// impact without any new fast kernels. Performance is irrelevant on
+    /// this path (a full D2H/H2D round trip per evicted block); it exists
+    /// purely to decide whether phase 3 (fast HIP kernels) is worth
+    /// building. `None` (default): no effect, byte-identical to before this
+    /// issue. Not exposed by `rocml-serve` — research-only, driven through
+    /// `rocml-cli`.
+    pub kv_rot_sim: Option<u8>,
+    /// Also round-trips K (not just V) through the same simulation when
+    /// `kv_rot_sim` is `Some`. No effect otherwise. See issue #14's own
+    /// acceptance criteria: the primary decision gate is V-only at 3 bpw
+    /// (K stays the real, already-shipped Q8 production encoding); this
+    /// flag is the issue's own documented "if V passes, optionally 3 bpw
+    /// both" follow-up run.
+    pub kv_rot_sim_k: bool,
 }
 
 impl LoadOptions {
@@ -108,6 +129,8 @@ impl LoadOptions {
             use_mmq: false,
             kv_sink: SINK_LEN,
             kv_window: WINDOW_LEN,
+            kv_rot_sim: None,
+            kv_rot_sim_k: false,
         }
     }
 
@@ -128,6 +151,12 @@ impl LoadOptions {
 
     pub fn with_kv_window(mut self, kv_window: u32) -> Self {
         self.kv_window = kv_window;
+        self
+    }
+
+    pub fn with_kv_rot_sim(mut self, bpw: Option<u8>, apply_to_k: bool) -> Self {
+        self.kv_rot_sim = bpw;
+        self.kv_rot_sim_k = apply_to_k;
         self
     }
 }

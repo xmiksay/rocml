@@ -82,6 +82,11 @@ pub fn build(config: ServerConfig) -> Result<(axum::Router, std::thread::JoinHan
         use_mmq: config.use_mmq,
         kv_sink: config.kv_sink,
         kv_window: config.kv_window,
+        // Issue #14 phase 2's debug quality-simulation flag is
+        // research-only (driven through `rocml-cli`'s `eval`/`bench`), not
+        // exposed by the server.
+        kv_rot_sim: None,
+        kv_rot_sim_k: false,
     };
     let snapshot_config = worker::SnapshotConfig {
         ram_mb: config.snapshot_ram_mb,

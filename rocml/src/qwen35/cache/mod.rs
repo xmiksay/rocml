@@ -203,6 +203,7 @@ impl HybridCache {
         mode: KvCacheMode,
         sink_len: u32,
         window_len: u32,
+        rot_sim: Option<crate::kv_quant::rotational::RotSimSpec>,
     ) -> Result<Self, RocmlError> {
         let max_seq = ctx.min(cfg.context_length as usize).max(1) as u32;
         let attn_indices: Vec<usize> = cfg
@@ -240,6 +241,7 @@ impl HybridCache {
                             v_bits,
                             sink_len,
                             window_len,
+                            rot_sim,
                         )?)
                     } else {
                         AttnLayerCache::Dense(AttnPlane::new(

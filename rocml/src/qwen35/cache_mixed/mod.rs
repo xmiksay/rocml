@@ -9,9 +9,13 @@
 //! [`MixedAttnPlane::append_chunk`], the chunked-prefill sibling of
 //! [`MixedAttnPlane::append`] below — see that module's doc comment for the
 //! batched-append design and the bit-identity-with-token-serial invariant
-//! it must uphold.
+//! it must uphold. `rot_sim` (also split out for the 400-line cap) adds
+//! [`MixedAttnPlane::apply_rot_sim`], issue #14 phase 2's debug quality
+//! simulation hook that both `append` and `append_chunk` call right before
+//! a real window eviction.
 
 mod chunk;
+mod rot_sim;
 
 use half::f16;
 use rocml_hip::DeviceBuffer;
@@ -19,6 +23,7 @@ use rocml_hip::DeviceBuffer;
 use super::forward::kernels_mixed::MixedKernels;
 use crate::error::RocmlError;
 use crate::forward::kernels::{offset, DevPtr, Kernels};
+use crate::kv_quant::rotational::RotSimSpec;
 use crate::kv_quant::MixedLayout;
 use crate::snapshot::AttnLayerBytes;
 
@@ -63,6 +68,7 @@ pub struct MixedAttnPlane {
     window_len: u32,
     bulk_cap: u32,
     num_blocks_total: u32,
+    rot_sim: Option<RotSimSpec>,
 }
 
 impl MixedAttnPlane {
@@ -81,6 +87,7 @@ impl MixedAttnPlane {
         v_bits: u8,
         sink_len: u32,
         window_len: u32,
+        rot_sim: Option<RotSimSpec>,
     ) -> Result<Self, RocmlError> {
         let bulk_positions = max_seq.saturating_sub(sink_len);
         let num_blocks_total = bulk_positions.div_ceil(window_len).max(1);
@@ -114,6 +121,7 @@ impl MixedAttnPlane {
             window_len,
             bulk_cap,
             num_blocks_total,
+            rot_sim,
         })
     }
 
@@ -160,6 +168,7 @@ impl MixedAttnPlane {
 
         let (slot, evicted) = self.layout.prepare_append(pos);
         if let Some(block) = evicted {
+            self.apply_rot_sim()?;
             mixed.quantize_evict_k(
                 offset(&self.window_k, 0),
                 offset(&self.bulk_k_codes, 0),
