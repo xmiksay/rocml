@@ -47,6 +47,19 @@ pub struct TurnOutcome {
 /// `store: None` (or a `SnapshotStore` with both tiers disabled) makes this
 /// behave exactly like calling `generate_sampled_with_stop` directly — every
 /// lookup/capture becomes a no-op.
+///
+/// `stable_boundary` (issue #12, the thinking-enabled multi-turn snapshot
+/// miss): an absolute token index into `full_prompt_ids` where the caller's
+/// renderer knows the prompt is render-stable — see
+/// `crate::chat::render_with_boundary` and [`stable_boundary_tokens`] for
+/// how to derive it. When `Some`, an *extra* mid-prefill capture happens
+/// there (on top of the existing prefill-boundary and end-of-turn captures),
+/// so the next turn's re-rendered prompt has a prefix it can always hit even
+/// when the prompt's own volatile tail (generation prompt, `<think>` block,
+/// reply) isn't reproduced byte-for-byte by that next render. `None` is a
+/// no-op — only the two pre-existing capture points fire, matching the
+/// pre-issue-#12 behavior (still useful for thinking-off models and plain
+/// regeneration, which don't need this).
 #[allow(clippy::too_many_arguments)]
 pub fn run_turn(
     model: &mut Model,
@@ -59,6 +72,7 @@ pub fn run_turn(
     stop_on_eos: bool,
     params: &SamplingParams,
     stop_strings: &[String],
+    stable_boundary: Option<u32>,
     mut on_text: impl FnMut(&str),
 ) -> Result<TurnOutcome, RocmlError> {
     model.reset()?;
@@ -105,6 +119,7 @@ pub fn run_turn(
         max_new_tokens,
         stop_on_eos,
         params,
+        stable_boundary.map(|b| b as usize),
         prefill_boundary,
         |chunk| {
             on_text(chunk);
@@ -132,6 +147,28 @@ pub fn run_turn(
         restore_seconds,
         capture_seconds,
     })
+}
+
+/// Converts a `crate::chat::render_with_boundary` byte offset into the
+/// token-index `run_turn`'s `stable_boundary` expects, verifying the
+/// invariant the whole scheme rests on: `prompt[..boundary_byte]` must
+/// tokenize to a genuine prefix of `prompt_ids` (the render's history
+/// portion always ends on the `<|im_end|>` special-token boundary, which
+/// can't BPE-merge with anything — see `render_with_boundary`'s doc comment
+/// — so this holds for any well-formed render). Returns `None` rather than a
+/// wrong boundary if it doesn't (a future template change breaking the
+/// invariant, say): that only costs this turn's stable-boundary capture, not
+/// correctness.
+pub fn stable_boundary_tokens(
+    tokenizer: &BpeTokenizer,
+    prompt_text: &str,
+    boundary_byte: usize,
+    prompt_ids: &[u32],
+) -> Option<u32> {
+    let prefix_ids = tokenizer.encode(&prompt_text[..boundary_byte]);
+    prompt_ids
+        .starts_with(prefix_ids.as_slice())
+        .then_some(prefix_ids.len() as u32)
 }
 
 /// An empty stop string never matches (it would trivially match any text and

@@ -14,6 +14,6 @@ mod types;
 
 pub use error::ChatError;
 pub use parser::{parse_assistant_output, AssistantOutput};
-pub use render::render;
+pub use render::{render, render_with_boundary};
 pub use scanner::{ScanEvent, StreamScanner};
 pub use types::{Message, RenderOpts, Role, Tool, ToolCall};

@@ -86,6 +86,7 @@ pub fn run(args: &BenchArgs, turns: usize) -> Result<(), RocmlError> {
             false,
             &sampling,
             &[],
+            None,
             |_| {},
         )?;
         conversation.extend_from_slice(&outcome.stats.generated_ids);

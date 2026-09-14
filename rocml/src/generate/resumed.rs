@@ -47,6 +47,7 @@ pub fn generate_sampled_resumed(
         stop_on_eos,
         params,
         None,
+        None,
         prefill_boundary,
         |s| {
             on_text(s);
@@ -59,6 +60,18 @@ pub fn generate_sampled_resumed(
 /// resumed-from-a-snapshot semantics as [`generate_sampled_resumed`] — this
 /// is the variant `rocml-serve`'s worker uses (it needs OpenAI `stop` string
 /// support).
+///
+/// `stable_boundary` (issue #12): an absolute index into `prompt_ids` where
+/// the caller's renderer knows the prompt is render-stable (see
+/// `crate::chat::render_with_boundary`) — forces an extra chunked-prefill
+/// split there (in addition to the regular 4096-token grid) so
+/// `prefill_boundary` fires at that exact position too, letting
+/// `crate::snapshot::turn::run_turn` capture a snapshot the *next* turn's
+/// re-rendered prompt can always hit, even when thinking is on and the
+/// prompt's own tail (generation prompt, `<think>` block, reply) isn't
+/// reproduced by the next render. `None` (or an index outside
+/// `already_processed..prompt_ids.len()`, which needs no extra split)
+/// reduces to the plain 4096-grid-only behavior.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_sampled_with_stop_resumed(
     model: &mut Model,
@@ -68,6 +81,7 @@ pub fn generate_sampled_with_stop_resumed(
     max_new_tokens: usize,
     stop_on_eos: bool,
     params: &SamplingParams,
+    stable_boundary: Option<usize>,
     prefill_boundary: impl FnMut(&mut Model, usize),
     on_text: impl FnMut(&str) -> bool,
 ) -> Result<GenerateStats, RocmlError> {
@@ -80,6 +94,7 @@ pub fn generate_sampled_with_stop_resumed(
         stop_on_eos,
         params,
         None,
+        stable_boundary,
         prefill_boundary,
         on_text,
     )
@@ -110,6 +125,7 @@ pub fn generate_sampled_profiled_resumed(
         stop_on_eos,
         params,
         prof,
+        None,
         prefill_boundary,
         |s| {
             on_text(s);
@@ -147,6 +163,7 @@ pub(super) fn generate_core(
     stop_on_eos: bool,
     params: &SamplingParams,
     prof: Option<&Profiler>,
+    stable_boundary: Option<usize>,
     mut prefill_boundary: impl FnMut(&mut Model, usize),
     mut on_text: impl FnMut(&str) -> bool,
 ) -> Result<GenerateStats, RocmlError> {
@@ -160,6 +177,11 @@ pub(super) fn generate_core(
 
     let already = already_processed.min(prompt_ids.len());
     let suffix = &prompt_ids[already..];
+    // Only a boundary strictly ahead of what's already processed and
+    // strictly before the prompt's end needs forcing — anything else either
+    // coincides with a restore that already covers it or with the natural
+    // final chunk (see `generate_sampled_with_stop_resumed`'s doc comment).
+    let stable_boundary = stable_boundary.filter(|&b| b > already && b < prompt_ids.len());
 
     if let Some(p) = prof {
         p.set_phase(Phase::Prefill);
@@ -170,7 +192,12 @@ pub(super) fn generate_core(
     let mut i = 0usize;
     loop {
         let to_next_boundary = PREFILL_CAPTURE_INTERVAL - (processed % PREFILL_CAPTURE_INTERVAL);
-        let end = (i + to_next_boundary).min(suffix.len());
+        let mut end = (i + to_next_boundary).min(suffix.len());
+        if let Some(b) = stable_boundary {
+            if b > processed && b < processed + (end - i) {
+                end = i + (b - processed);
+            }
+        }
         logits = model.forward_prompt(&suffix[i..end], prof)?;
         processed += end - i;
         i = end;

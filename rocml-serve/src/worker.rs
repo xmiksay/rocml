@@ -28,6 +28,12 @@ pub struct Job {
     pub max_new_tokens: usize,
     pub sampling: SamplingParams,
     pub stop_strings: Vec<String>,
+    /// Issue #12's render-stable mid-prefill snapshot boundary (a token
+    /// index into `prompt_ids`), computed by the route handler from
+    /// `rocml::chat::render_with_boundary` — see `run_turn`'s
+    /// `stable_boundary` doc comment. `None` for a request whose renderer
+    /// couldn't establish one (or didn't try).
+    pub stable_boundary: Option<u32>,
     pub respond_to: UnboundedSender<WorkerEvent>,
 }
 
@@ -198,6 +204,7 @@ fn run_job(
         true,
         &job.sampling,
         &job.stop_strings,
+        job.stable_boundary,
         |chunk| {
             let _ = job.respond_to.send(WorkerEvent::Chunk(chunk.to_string()));
         },

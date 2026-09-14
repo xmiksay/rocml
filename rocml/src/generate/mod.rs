@@ -112,6 +112,7 @@ pub fn generate_sampled(
         stop_on_eos,
         params,
         None,
+        None,
         |_, _| {},
         |s| {
             on_text(s);
@@ -142,6 +143,7 @@ pub fn generate_sampled_with_stop(
         max_new_tokens,
         stop_on_eos,
         params,
+        None,
         None,
         |_, _| {},
         on_text,
@@ -174,6 +176,7 @@ pub fn generate_sampled_profiled(
         stop_on_eos,
         params,
         prof,
+        None,
         |_, _| {},
         |s| {
             on_text(s);

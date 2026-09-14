@@ -293,6 +293,7 @@ fn check_run_turn_reuses_a_prior_end_of_turn_snapshot(path: &std::path::Path) {
         false,
         &sampling,
         &[],
+        None,
         |_| {},
     )
     .expect("turn 1 failed");
@@ -317,6 +318,7 @@ fn check_run_turn_reuses_a_prior_end_of_turn_snapshot(path: &std::path::Path) {
         false,
         &sampling,
         &[],
+        None,
         |_| {},
     )
     .expect("turn 2 failed");

@@ -275,6 +275,7 @@ fn run_single_turn(
         true,
         &SamplingParams::greedy(),
         &[],
+        None,
         |chunk| raw_text.push_str(chunk),
     )?;
 

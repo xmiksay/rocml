@@ -25,6 +25,31 @@ const TOOLS_FOOTER: &str = "</tools>\n\nIf you choose to call a function ONLY re
 /// `AutoTokenizer::apply_chat_template_with_options` produces for this
 /// template (see fixtures for byte-identical ground truth).
 pub fn render(messages: &[Message], tools: &[Tool], opts: RenderOpts) -> Result<String, ChatError> {
+    render_with_boundary(messages, tools, opts).map(|(text, _)| text)
+}
+
+/// Like [`render`], but also returns the byte offset marking the end of the
+/// rendered *history* — right after the last message's closing `<|im_end|>`,
+/// before the plain-text `\n` that follows it. Always well-defined: a valid
+/// render ends its message loop with a complete `<|im_end|>\n`
+/// (`validate_user_query` guarantees at least one real user turn).
+///
+/// This is the render-stable snapshot boundary issue #12 needs
+/// (`rocml::snapshot::turn::run_turn`'s `stable_boundary` param): landing
+/// exactly on the `<|im_end|>` special token, which the tokenizer's own
+/// specials list always splits off as one atomic token before BPE
+/// (`rocml_core::tokenizer`, from the GGUF's CONTROL/USER_DEFINED token
+/// types — not a hardcoded id), so it can never merge with adjacent text and
+/// the next call's history re-render reproduces `prompt[..offset]`
+/// token-for-token no matter what a later turn's volatile generation
+/// contains. See `rocml/tests/snapshot_stable_boundary.rs` for the
+/// byte-vs-token proof and why the *old* prefill-boundary cut (mid-`<think>`
+/// block) isn't stable the same way.
+pub fn render_with_boundary(
+    messages: &[Message],
+    tools: &[Tool],
+    opts: RenderOpts,
+) -> Result<(String, usize), ChatError> {
     if messages.is_empty() {
         return Err(ChatError::NoMessages);
     }
@@ -53,6 +78,9 @@ pub fn render(messages: &[Message], tools: &[Tool], opts: RenderOpts) -> Result<
         }
     }
 
+    // `'\n'` is one byte, so trimming it off never lands mid-codepoint.
+    let boundary = out.len().saturating_sub(1);
+
     if opts.add_generation_prompt {
         out.push_str("<|im_start|>assistant\n");
         if opts.enable_thinking == Some(false) {
@@ -61,7 +89,7 @@ pub fn render(messages: &[Message], tools: &[Tool], opts: RenderOpts) -> Result<
             out.push_str("<think>\n");
         }
     }
-    Ok(out)
+    Ok((out, boundary))
 }
 
 fn render_tools_header(out: &mut String, messages: &[Message], tools: &[Tool]) {
@@ -365,8 +393,7 @@ mod tests {
         );
     }
 
-    // Issue #9's tool-result-hygiene tests (empty body, multiple consecutive
-    // results) live in `rocml/tests/chat_fixtures.rs` instead of here — this
-    // module is already at the 400-line cap, and both tests only exercise
-    // the public `render` API, no private internals.
+    // Issue #9's tool-result-hygiene tests and issue #12's boundary-offset
+    // tests live in `rocml/tests/` instead of here — this module is at the
+    // 400-line cap, and all of them only exercise public APIs.
 }

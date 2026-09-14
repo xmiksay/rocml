@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rocml::chat::{self, RenderOpts, StreamScanner};
+use rocml::snapshot::turn::stable_boundary_tokens;
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -87,9 +88,13 @@ async fn handle_request(
     // explicitly off, so the response-side scanner must start already in
     // thinking mode to match — see `StreamScanner::new_primed_for_thinking`.
     let thinking_primed = render_opts.enable_thinking != Some(false);
-    let prompt_text = chat::render(&messages, &tools, render_opts)
+    let (prompt_text, boundary_byte) = chat::render_with_boundary(&messages, &tools, render_opts)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let prompt_ids = state.tokenizer.encode(&prompt_text);
+    // Issue #12: the render-stable mid-prefill snapshot boundary — see
+    // `rocml::snapshot::turn::run_turn`'s `stable_boundary` doc comment.
+    let stable_boundary =
+        stable_boundary_tokens(&state.tokenizer, &prompt_text, boundary_byte, &prompt_ids);
     if prompt_ids.len() > state.ctx {
         return Err(ApiError::bad_request(format!(
             "prompt has {} tokens, exceeding this server's context budget of {} tokens",
@@ -122,6 +127,7 @@ async fn handle_request(
         max_new_tokens,
         sampling,
         stop_strings,
+        stable_boundary,
         respond_to: tx,
     };
     state

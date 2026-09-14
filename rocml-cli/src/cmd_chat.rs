@@ -15,7 +15,7 @@ use std::io::{self, BufRead, Write};
 
 use clap::Args;
 use rocml::chat::{Message, RenderOpts, ScanEvent, StreamScanner, ToolCall};
-use rocml::snapshot::turn::run_turn;
+use rocml::snapshot::turn::{run_turn, stable_boundary_tokens};
 use rocml::snapshot::KvConfigStamp;
 use rocml::{LoadOptions, RocmlError};
 
@@ -129,15 +129,22 @@ pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
         }
 
         messages.push(Message::user(text));
-        let prompt = match rocml::chat::render(&messages, &[], render_opts) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("error rendering chat template: {e}");
-                messages.pop();
-                continue;
-            }
-        };
+        let (prompt, boundary_byte) =
+            match rocml::chat::render_with_boundary(&messages, &[], render_opts) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error rendering chat template: {e}");
+                    messages.pop();
+                    continue;
+                }
+            };
         let prompt_ids = loaded.tokenizer.encode(&prompt);
+        // Issue #12: lets a thinking-enabled turn's mid-prefill snapshot
+        // survive into the next turn even though the reply/think block this
+        // turn produces won't be reproduced verbatim by that next render —
+        // see `run_turn`'s `stable_boundary` doc comment.
+        let stable_boundary =
+            stable_boundary_tokens(&loaded.tokenizer, &prompt, boundary_byte, &prompt_ids);
         if prompt_ids.len() + args.max_tokens > ctx {
             eprintln!(
                 "error: this turn needs ~{} tokens of context, over the --ctx budget of {}",
@@ -171,6 +178,7 @@ pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
             true,
             &sampling,
             &[], // no OpenAI stop strings in the REPL
+            stable_boundary,
             |chunk| {
                 feed_scanner(
                     &mut scanner,
