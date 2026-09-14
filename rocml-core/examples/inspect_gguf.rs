@@ -1,9 +1,14 @@
 //! Throwaway GGUF tensor inspector for issue #8 Phase-1 investigation
 //! (MTP-head tensor presence check). Not part of the shipped CLI surface.
+//! `--full` (issue #4's quant-policy audit) additionally dumps every
+//! tensor's name/shape/dtype, sorted by name, for a full per-tensor dtype
+//! inventory.
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .expect("usage: inspect_gguf <path.gguf>");
+    let mut args = std::env::args().skip(1);
+    let path = args
+        .next()
+        .expect("usage: inspect_gguf <path.gguf> [--full]");
+    let full = args.next().as_deref() == Some("--full");
     let f = rocml_core::gguf::GgufFile::open(&path).expect("open gguf");
     println!("version: {}", f.version());
     if let Ok(bc) = f.get_u32("qwen35.block_count") {
@@ -48,6 +53,14 @@ fn main() {
         if n.starts_with(&format!("blk.{max_blk}."))
             || n.starts_with(&format!("blk.{}.", max_blk + 1))
         {
+            let t = f.tensor(n).unwrap();
+            println!("{n} shape={:?} dtype={:?}", t.shape(), t.dtype());
+        }
+    }
+
+    if full {
+        println!("--- full tensor dump ---");
+        for n in &names {
             let t = f.tensor(n).unwrap();
             println!("{n} shape={:?} dtype={:?}", t.shape(), t.dtype());
         }
