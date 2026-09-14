@@ -6,9 +6,117 @@
 //! `Content-Length` body or a chunked (SSE) one, both well-formed because
 //! we control the server on the other end — so a ~60-line client is enough,
 //! and it exercises the real TCP/HTTP path `axum::serve` runs in production.
+//!
+//! Also carries the shared `TestServer`/`spawn_test_server*` router-spawning
+//! harness both `server_e2e.rs` and `server_e2e_usage.rs` use. `mod
+//! support;` compiles this whole module into each test *binary*
+//! independently (unlike a real lib crate, a `tests/` integration binary has
+//! no external callers to prove `pub` items reachable), so whichever helper
+//! one binary doesn't call would otherwise be flagged dead code by the
+//! other — hence the blanket allow.
+#![allow(dead_code)]
 
+use std::path::PathBuf;
+
+use rocml_serve::{build, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+/// Dev/test checkpoints shared by every `server_e2e*` test binary.
+pub const GGUF_REL: &str = "Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
+pub const ORNITH_GGUF_REL: &str = "Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf";
+
+pub const WEATHER_TOOL: &str = r#"{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a location",
+        "parameters": {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["location"]
+        }
+    }
+}"#;
+
+pub struct TestServer {
+    pub addr: std::net::SocketAddr,
+    serve_task: tokio::task::JoinHandle<()>,
+    worker_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TestServer {
+    /// Aborts the serve task (dropping its `Router`/`Arc<AppState>`, and
+    /// with it the job sender) and waits for the worker thread to notice
+    /// and exit. Must run before the test function returns — see
+    /// `worker::spawn`'s doc comment for why a still-live worker thread
+    /// racing this process's own exit crashes with "pure virtual method
+    /// called" instead of a clean exit.
+    pub async fn shutdown(mut self) {
+        self.serve_task.abort();
+        if let Some(handle) = self.worker_thread.take() {
+            let _ = tokio::task::spawn_blocking(move || handle.join()).await;
+        }
+    }
+}
+
+pub async fn spawn_test_server(model_path: PathBuf) -> TestServer {
+    spawn_test_server_with_snapshots(model_path, 0).await
+}
+
+/// Like [`spawn_test_server`], with the conversation-state snapshot RAM
+/// budget (issue #1) as an explicit parameter — `0` (what every test that
+/// doesn't care about snapshots uses) disables the snapshot layer entirely,
+/// keeping them exactly as they behaved before that feature existed.
+pub async fn spawn_test_server_with_snapshots(
+    model_path: PathBuf,
+    snapshot_ram_mb: usize,
+) -> TestServer {
+    spawn_test_server_with_options(model_path, snapshot_ram_mb, false).await
+}
+
+/// Like [`spawn_test_server`], with issue #9's `--debug-endpoints` flag on
+/// (mounting `GET /debug/last_prompt`) — every other caller leaves it off,
+/// matching the flag's off-by-default posture.
+pub async fn spawn_test_server_with_debug_endpoints(model_path: PathBuf) -> TestServer {
+    spawn_test_server_with_options(model_path, 0, true).await
+}
+
+pub async fn spawn_test_server_with_options(
+    model_path: PathBuf,
+    snapshot_ram_mb: usize,
+    debug_endpoints: bool,
+) -> TestServer {
+    let (app, worker_thread) = build(ServerConfig {
+        model_path,
+        ctx: 4096,
+        kv_cache: rocml::KvCacheMode::Fp16,
+        use_mmq: false,
+        kv_sink: rocml::kv_quant::SINK_LEN,
+        kv_window: rocml::kv_quant::WINDOW_LEN,
+        max_tokens_default: 128,
+        no_think: true,
+        default_sampling: rocml::SamplingParams::default(),
+        model_id_override: None,
+        snapshot_ram_mb,
+        snapshot_dir: None,
+        snapshot_disk_mb: 0,
+        debug_endpoints,
+    })
+    .expect("server failed to build (model load / tokenizer)");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local_addr");
+    let serve_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    TestServer {
+        addr,
+        serve_task,
+        worker_thread: Some(worker_thread),
+    }
+}
 
 pub struct HttpResponse {
     pub status: u16,

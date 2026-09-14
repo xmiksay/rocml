@@ -5,6 +5,10 @@
 //! server_e2e`); debug mode makes even a handful of decode tokens
 //! uncomfortably slow. Skips itself if the checkpoint isn't present.
 //!
+//! The usage-reporting (`cached_tokens`/`stream_options`) scenarios live in
+//! the sibling `server_e2e_usage.rs` binary instead of here — purely the
+//! 400-line file cap, both share `tests/support`'s spawn helpers.
+//!
 //! `--no-think` is used for the test server: this codebase's chat renderer
 //! is hardcoded to Ornith-1.0-9B's template, whose *default* (`enable_thinking`
 //! left unset) opens reasoning, while Qwen3.5-2B's own real template
@@ -13,109 +17,17 @@
 //! streaming assertions independent of how many tokens the 2B model would
 //! otherwise spend thinking before any visible content appears.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use rocml_core::testpaths::checkpoint;
-use rocml_serve::{build, ServerConfig};
 use serde_json::{json, Value};
 
 mod support;
 
-const GGUF_REL: &str = "Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
-const ORNITH_GGUF_REL: &str = "Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf";
-
-struct TestServer {
-    addr: std::net::SocketAddr,
-    serve_task: tokio::task::JoinHandle<()>,
-    worker_thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl TestServer {
-    /// Aborts the serve task (dropping its `Router`/`Arc<AppState>`, and
-    /// with it the job sender) and waits for the worker thread to notice
-    /// and exit. Must run before the test function returns — see
-    /// `worker::spawn`'s doc comment for why a still-live worker thread
-    /// racing this process's own exit crashes with "pure virtual method
-    /// called" instead of a clean exit.
-    async fn shutdown(mut self) {
-        self.serve_task.abort();
-        if let Some(handle) = self.worker_thread.take() {
-            let _ = tokio::task::spawn_blocking(move || handle.join()).await;
-        }
-    }
-}
-
-async fn spawn_test_server(model_path: PathBuf) -> TestServer {
-    spawn_test_server_with_snapshots(model_path, 0).await
-}
-
-/// Like [`spawn_test_server`], with the conversation-state snapshot RAM
-/// budget (issue #1) as an explicit parameter — `0` (what every pre-existing
-/// test in this file uses) disables the snapshot layer entirely, keeping
-/// them exactly as they behaved before this feature existed.
-async fn spawn_test_server_with_snapshots(
-    model_path: PathBuf,
-    snapshot_ram_mb: usize,
-) -> TestServer {
-    spawn_test_server_with_options(model_path, snapshot_ram_mb, false).await
-}
-
-/// Like [`spawn_test_server`], with issue #9's `--debug-endpoints` flag on
-/// (mounting `GET /debug/last_prompt`) — every other test in this file
-/// leaves it off, matching the flag's off-by-default posture.
-async fn spawn_test_server_with_debug_endpoints(model_path: PathBuf) -> TestServer {
-    spawn_test_server_with_options(model_path, 0, true).await
-}
-
-async fn spawn_test_server_with_options(
-    model_path: PathBuf,
-    snapshot_ram_mb: usize,
-    debug_endpoints: bool,
-) -> TestServer {
-    let (app, worker_thread) = build(ServerConfig {
-        model_path,
-        ctx: 4096,
-        kv_cache: rocml::KvCacheMode::Fp16,
-        use_mmq: false,
-        kv_sink: rocml::kv_quant::SINK_LEN,
-        kv_window: rocml::kv_quant::WINDOW_LEN,
-        max_tokens_default: 128,
-        no_think: true,
-        default_sampling: rocml::SamplingParams::default(),
-        model_id_override: None,
-        snapshot_ram_mb,
-        snapshot_dir: None,
-        snapshot_disk_mb: 0,
-        debug_endpoints,
-    })
-    .expect("server failed to build (model load / tokenizer)");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local_addr");
-    let serve_task = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    TestServer {
-        addr,
-        serve_task,
-        worker_thread: Some(worker_thread),
-    }
-}
-
-const WEATHER_TOOL: &str = r#"{
-    "type": "function",
-    "function": {
-        "name": "get_weather",
-        "description": "Get the current weather for a location",
-        "parameters": {
-            "type": "object",
-            "properties": {"location": {"type": "string"}},
-            "required": ["location"]
-        }
-    }
-}"#;
+use support::{
+    spawn_test_server, spawn_test_server_with_debug_endpoints, spawn_test_server_with_snapshots,
+    GGUF_REL, ORNITH_GGUF_REL, WEATHER_TOOL,
+};
 
 #[tokio::test]
 async fn chat_completions_end_to_end() {

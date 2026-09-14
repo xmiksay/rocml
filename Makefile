@@ -72,6 +72,7 @@ test-model:
 	cargo test --release -p rocml --test ornith_e2e -- --test-threads=1
 	cargo test --release -p rocml-serve --test server_e2e
 	cargo test --release -p rocml-serve --test server_e2e -- --ignored ornith_tool_call_is_emitted
+	cargo test --release -p rocml-serve --test server_e2e_usage
 	cargo test --release -p rocml-cli --test profile_json_smoke
 
 lint:
