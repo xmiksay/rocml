@@ -1,7 +1,12 @@
 //! Single-token decode-style forward pass: embedding lookup, N transformer
 //! layers (attention.rs + ffn.rs), final norm, logits. Prompt processing
 //! reuses this exact path one token at a time — batched prefill (a fused
-//! multi-token gemm path) is a later performance milestone, not this one.
+//! multi-token gemm path) is a later performance milestone, not this one
+//! (see `crate::model::Model::forward_prompt`'s doc comment for why this
+//! also means there's no separate "chunked-prefill" cache dispatch path to
+//! port for issue #2/#16's dense mixed-KV work below: prefill and decode
+//! already share this one token-serial path, so the Dense/Mixed per-layer
+//! dispatch `attention::attention_step` performs covers both for free).
 
 mod attention;
 mod ffn;
@@ -21,12 +26,16 @@ use rocml_core::gguf::GgufFile;
 use rocml_hip::{Device, MemoryInfo};
 use scratch::Scratch;
 
-use crate::budget::{kv_bytes_per_token, Budget, HIGH_USAGE_WARN_FRACTION};
-use crate::cache::KvCache;
+use crate::budget::{
+    kv_bytes_per_token, mixed_kv_bytes_per_token, Budget, HIGH_USAGE_WARN_FRACTION,
+};
+use crate::cache::DenseAttnCache;
 use crate::config::ModelConfig;
 use crate::error::RocmlError;
+use crate::kv_quant::validate_sink_window;
 use crate::load_opts::LoadOptions;
 use crate::profile::{self, OpKind, Phase, Profiler};
+use crate::qwen35::forward::kernels_mixed::MixedKernels;
 use crate::weights::ModelWeights;
 
 pub struct Model {
@@ -36,8 +45,14 @@ pub struct Model {
     _device: Device,
     config: ModelConfig,
     weights: ModelWeights,
-    cache: KvCache,
+    cache: DenseAttnCache,
     kernels: Kernels,
+    /// KIVI-style mixed KV cache kernels (issue #2/#16) — loaded
+    /// unconditionally like every other kernel set, even when `opts.kv_cache`
+    /// is dense-only, mirroring `qwen35::forward::Model`'s own
+    /// `mixed_kernels` field for the same reason (cheap, keeps `Model`
+    /// shape independent of the chosen mode).
+    mixed_kernels: MixedKernels,
     scratch: Scratch,
     pos: u32,
 }
@@ -48,32 +63,68 @@ impl Model {
     /// post-weights-load VRAM budget check (issue #3 — see `crate::budget`),
     /// then allocates the KV cache and scratch buffers and loads every
     /// kernel this forward pass needs.
+    ///
+    /// `opts.kv_cache`'s quantized modes (issue #2, ported to this dense
+    /// architecture per issue #16) are supported here the same way
+    /// `qwen35::forward::Model::load` supports them: `DenseAttnCache::new`
+    /// applies the generalized boundary-layer-skip rule (first + last layer
+    /// stay dense fp16; see its own doc comment) and `mixed_kv_bytes_per_token`
+    /// accounts for the mixed layers' VRAM cost the same way.
     pub fn load(gguf_path: impl AsRef<Path>, opts: LoadOptions) -> Result<Self, RocmlError> {
-        if opts.kv_cache.is_quantized() {
-            return Err(RocmlError::Config(format!(
-                "kv-cache mode {:?} is not yet implemented for the dense qwen3 architecture \
-                 (issue #2 targets the qwen3.5 hybrid architecture's full-attention layers)",
-                opts.kv_cache
-            )));
-        }
         let device = Device::new(0)?;
         let gguf = GgufFile::open(gguf_path)?;
         let config = ModelConfig::from_gguf(&gguf)?;
         let weights = ModelWeights::load(&gguf, &config)?;
 
+        let ctx = opts.ctx.min(config.context_length as usize).max(1);
+        if opts.kv_cache.is_quantized() {
+            validate_sink_window(opts.kv_sink, opts.kv_window, ctx)?;
+        }
+
+        let dtype = opts.kv_cache.dense_dtype();
+        let v_bits: u8 = match opts.kv_cache {
+            crate::load_opts::KvCacheMode::Q4Mixed => 4,
+            _ => 8,
+        };
+        // Boundary layers (first + last layer) always stay dense fp16
+        // regardless of mode — see `DenseAttnCache::new`. A single-layer
+        // model has zero mixed layers (that layer is both boundary
+        // positions at once).
+        let n_boundary_layers = config.block_count.min(2);
+        let n_mixed_layers = config.block_count.saturating_sub(n_boundary_layers);
+        let (per_token, fixed_overhead) = if opts.kv_cache.is_quantized() {
+            mixed_kv_bytes_per_token(
+                opts.kv_cache,
+                n_boundary_layers,
+                n_mixed_layers,
+                config.head_count_kv,
+                config.head_dim,
+                v_bits,
+                opts.kv_sink,
+                opts.kv_window,
+            )
+        } else {
+            (
+                kv_bytes_per_token(
+                    config.block_count,
+                    config.head_count_kv,
+                    config.head_dim,
+                    dtype,
+                ),
+                0,
+            )
+        };
+
         // Authoritative check: real hipMemGetInfo numbers now that weights
         // are actually resident, unlike registry::clamp_ctx's necessarily
         // approximate pre-load (file-size-proxied) estimate.
-        let dtype = opts.kv_cache.dense_dtype();
-        let per_token = kv_bytes_per_token(
-            config.block_count,
-            config.head_count_kv,
-            config.head_dim,
-            dtype,
-        );
-        let ctx = opts.ctx.min(config.context_length as usize).max(1);
         let mem = device.memory_info()?;
-        let budget = Budget::for_loaded_weights(mem.total as u64, mem.free as u64, per_token);
+        let budget = Budget::for_loaded_weights_with_overhead(
+            mem.total as u64,
+            mem.free as u64,
+            per_token,
+            fixed_overhead,
+        );
         if !budget.fits(ctx) {
             return Err(RocmlError::VramBudget {
                 requested_ctx: ctx,
@@ -89,13 +140,14 @@ impl Model {
             );
         }
 
-        let cache = KvCache::new(&config, ctx, dtype)?;
+        let cache = DenseAttnCache::new(&config, ctx, opts.kv_cache, opts.kv_sink, opts.kv_window)?;
         // `opts.use_mmq` is threaded through for consistency with the
         // qwen35 hybrid loader, but is inert here: the dense architecture
         // never chunks prefill (see `Model::forward_prompt`'s doc comment),
         // so `LinearWeight::matmul`/the MMQ dispatch it can reach are never
         // called on this path.
         let kernels = Kernels::load_all(opts.use_mmq)?;
+        let mixed_kernels = MixedKernels::load_all()?;
         let scratch = Scratch::new(&config)?;
 
         Ok(Self {
@@ -104,6 +156,7 @@ impl Model {
             weights,
             cache,
             kernels,
+            mixed_kernels,
             scratch,
             pos: 0,
         })
@@ -126,11 +179,13 @@ impl Model {
     }
 
     /// Clears the cache position so the next `forward_token` starts a fresh
-    /// sequence. Cheap: cache buffers are only ever read up to the current
-    /// position, so stale bytes beyond it are never observed — no need to
-    /// re-zero them.
+    /// sequence. Cheap for a dense plane (stale bytes past the current
+    /// position are never read, see `crate::qwen35::cache`'s module doc);
+    /// a mixed layer's eviction bookkeeping does need an explicit rewind
+    /// (`DenseAttnCache::reset`'s doc comment), same as the hybrid cache.
     pub fn reset(&mut self) {
         self.pos = 0;
+        self.cache.reset();
     }
 
     /// Runs one decode step for `token_id` at the current cache position and
@@ -181,6 +236,7 @@ impl Model {
         )?;
 
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+            let plane = self.cache.attn_mut(layer_idx)?;
             if coarse_prefill {
                 let (attn_bytes, attn_flops) =
                     attention::attention_step_cost(&self.config, layer, cur_len);
@@ -194,9 +250,11 @@ impl Model {
                     || {
                         attention::attention_step(
                             &self.kernels,
+                            &self.mixed_kernels,
                             &self.config,
                             layer,
-                            &mut self.cache,
+                            plane,
+                            max_seq,
                             &mut self.scratch,
                             layer_idx,
                             pos,
@@ -215,9 +273,11 @@ impl Model {
             } else {
                 attention::attention_step(
                     &self.kernels,
+                    &self.mixed_kernels,
                     &self.config,
                     layer,
-                    &mut self.cache,
+                    plane,
+                    max_seq,
                     &mut self.scratch,
                     layer_idx,
                     pos,

@@ -5,12 +5,23 @@
 //! Batched (multi-token) prefill is a separate, later perf milestone —
 //! today's token-serial prefill reuses this same decode-shaped step, so it
 //! gets this kernel's win for free.
+//!
+//! Dense/Mixed per-layer dispatch (issue #2/#16's dense-architecture mixed-KV
+//! port): `plane` is a `qwen35::cache::AttnLayerCache`, reused unchanged from
+//! the hybrid path — this function's `AttnLayerCache::Mixed` arm mirrors
+//! `qwen35::forward::attention::attention_step`'s own Mixed arm exactly
+//! (same kernels, same call shape), since the mixed cache and its kernels
+//! were already architecture-generic (`n_kv_heads`/`head_dim`/etc. are all
+//! runtime arguments, never hybrid-specific config) — nothing here forks
+//! kernel code, it only reuses it from a second call site.
 
 use super::kernels::{attn_decode_splits, offset, Kernels};
-use crate::cache::{KvCache, KvDtype};
+use crate::cache::KvDtype;
 use crate::config::ModelConfig;
 use crate::error::RocmlError;
 use crate::profile::{self, OpKind, Profiler};
+use crate::qwen35::cache::AttnLayerCache;
+use crate::qwen35::forward::kernels_mixed::MixedKernels;
 use crate::weights::LayerWeights;
 
 use super::scratch::Scratch;
@@ -18,9 +29,11 @@ use super::scratch::Scratch;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attention_step(
     kernels: &Kernels,
+    mixed: &MixedKernels,
     config: &ModelConfig,
     layer: &LayerWeights,
-    cache: &mut KvCache,
+    plane: &mut AttnLayerCache,
+    max_seq: u32,
     scratch: &mut Scratch,
     layer_idx: usize,
     pos: u32,
@@ -138,35 +151,77 @@ pub(crate) fn attention_step(
         OpKind::AttnDecode,
         attn_bytes,
         attn_flops,
-        || {
-            cache.append(kernels, layer_idx as usize, pos, &scratch.k, &scratch.v)?;
+        || match plane {
+            AttnLayerCache::Dense(plane) => {
+                plane.append(
+                    kernels, pos, max_seq, n_kv_heads, head_dim, &scratch.k, &scratch.v,
+                )?;
 
-            let max_seq = cache.max_seq();
-            let scale = 1.0f32 / (head_dim as f32).sqrt();
-            let (k_ptr, v_ptr) = (
-                cache.k_ptr(layer_idx as usize)?,
-                cache.v_ptr(layer_idx as usize)?,
-            );
-            let decode = match cache.dtype() {
-                KvDtype::F16 => Kernels::attn_decode_f16,
-                KvDtype::F32 => Kernels::attn_decode,
-            };
-            decode(
-                kernels,
-                offset(&scratch.q, 0),
-                k_ptr,
-                v_ptr,
-                offset(&scratch.attn_concat, 0),
-                offset(&scratch.attn_partial_out, 0),
-                offset(&scratch.attn_partial_m, 0),
-                offset(&scratch.attn_partial_l, 0),
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                max_seq,
-                cur_len,
-                scale,
-            )
+                let scale = 1.0f32 / (head_dim as f32).sqrt();
+                let decode = match plane.dtype() {
+                    KvDtype::F16 => Kernels::attn_decode_f16,
+                    KvDtype::F32 => Kernels::attn_decode,
+                };
+                decode(
+                    kernels,
+                    offset(&scratch.q, 0),
+                    plane.k_ptr(),
+                    plane.v_ptr(),
+                    offset(&scratch.attn_concat, 0),
+                    offset(&scratch.attn_partial_out, 0),
+                    offset(&scratch.attn_partial_m, 0),
+                    offset(&scratch.attn_partial_l, 0),
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_seq,
+                    cur_len,
+                    scale,
+                )
+            }
+            AttnLayerCache::Mixed(plane) => {
+                plane.append(kernels, mixed, pos, &scratch.k, &scratch.v)?;
+
+                let scale = 1.0f32 / (head_dim as f32).sqrt();
+                let ptrs = plane.ptrs();
+                let (n_splits, split_len) = attn_decode_splits(n_kv_heads, cur_len);
+                mixed.attn_decode_partial_mixed(
+                    ptrs.v_bits,
+                    offset(&scratch.q, 0),
+                    ptrs.sink_k,
+                    ptrs.sink_v,
+                    ptrs.window_k,
+                    ptrs.window_v,
+                    ptrs.bulk_k_codes,
+                    ptrs.bulk_k_scales,
+                    ptrs.bulk_v_codes,
+                    ptrs.bulk_v_scales,
+                    offset(&scratch.attn_partial_out, 0),
+                    offset(&scratch.attn_partial_m, 0),
+                    offset(&scratch.attn_partial_l, 0),
+                    n_kv_heads,
+                    n_heads / n_kv_heads,
+                    head_dim,
+                    ptrs.sink_len,
+                    ptrs.window_len,
+                    ptrs.window_base,
+                    ptrs.bulk_cap,
+                    ptrs.num_blocks_total,
+                    cur_len,
+                    split_len,
+                    n_splits,
+                    scale,
+                )?;
+                kernels.attn_decode_reduce(
+                    offset(&scratch.attn_partial_out, 0),
+                    offset(&scratch.attn_partial_m, 0),
+                    offset(&scratch.attn_partial_l, 0),
+                    offset(&scratch.attn_concat, 0),
+                    n_heads,
+                    head_dim,
+                    n_splits,
+                )
+            }
         },
     )?;
 
@@ -196,7 +251,10 @@ pub(crate) fn attention_step(
 /// Analytical bytes/flops for one full attention_step, used by the prefill
 /// coarse (per-layer) instrumentation path in `forward::Model::forward_token_profiled`
 /// — the same formulas the fine-grained decode path above uses, just summed
-/// up-front instead of measured per sub-op.
+/// up-front instead of measured per sub-op. Unaffected by the Dense/Mixed
+/// cache dispatch above (the analytical cost model doesn't distinguish
+/// them — see `qwen35::forward::attention::attention_step_cost`'s identical
+/// choice).
 pub(crate) fn attention_step_cost(
     config: &ModelConfig,
     layer: &LayerWeights,

@@ -87,13 +87,12 @@ pub fn mixed_kv_bytes_per_token(
 /// Returns the estimated budget plus the model's own declared
 /// `context_length` (a second, independent cap `clamp_ctx` also applies).
 ///
-/// `mode`'s quantized variants (issue #2) only affect the estimate for the
-/// `qwen35` hybrid architecture (the only one that implements them —
-/// `forward::Model::load` rejects a quantized mode for the dense `qwen3`
-/// architecture with a clear error at actual load time); this pre-load
-/// estimate simply treats a dense `qwen3` GGUF as `mode.dense_dtype()`
-/// regardless, since the real error surfaces there anyway. `sink_len`/
-/// `window_len` are ignored for a dense `qwen3` GGUF for the same reason.
+/// `mode`'s quantized variants (issue #2, ported to the dense `qwen3`
+/// architecture per issue #16 — see `crate::cache::DenseAttnCache`) apply
+/// the same boundary-layer-skip accounting for both architectures now: the
+/// dense arm below treats every layer as full-attention (there's no
+/// `layer_kinds` split to filter, unlike `qwen35`) with `n_boundary =
+/// block_count.min(2)`, mirroring `DenseAttnCache::new`'s own rule exactly.
 pub fn estimate_from_gguf(
     gguf_path: &Path,
     mode: KvCacheMode,
@@ -106,13 +105,32 @@ pub fn estimate_from_gguf(
     let (per_token, fixed_overhead, model_ctx_cap) = match arch {
         "qwen3" => {
             let c = ModelConfig::from_gguf(&gguf)?;
-            let per_token = kv_bytes_per_token(
-                c.block_count,
-                c.head_count_kv,
-                c.head_dim,
-                mode.dense_dtype(),
-            );
-            (per_token, 0, c.context_length)
+            let (per_token, fixed_overhead) = if mode.is_quantized() {
+                let n_boundary = c.block_count.min(2);
+                let n_mixed = c.block_count.saturating_sub(n_boundary);
+                let v_bits: u8 = if mode == KvCacheMode::Q4Mixed { 4 } else { 8 };
+                mixed_kv_bytes_per_token(
+                    mode,
+                    n_boundary,
+                    n_mixed,
+                    c.head_count_kv,
+                    c.head_dim,
+                    v_bits,
+                    sink_len,
+                    window_len,
+                )
+            } else {
+                (
+                    kv_bytes_per_token(
+                        c.block_count,
+                        c.head_count_kv,
+                        c.head_dim,
+                        mode.dense_dtype(),
+                    ),
+                    0,
+                )
+            };
+            (per_token, fixed_overhead, c.context_length)
         }
         "qwen35" => {
             let c = Qwen35Config::from_gguf(&gguf)?;

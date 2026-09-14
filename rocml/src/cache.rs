@@ -1,28 +1,40 @@
-//! Per-layer KV cache, one contiguous buffer per layer laid out as
-//! `[kv_head][max_seq][head_dim]` — a per-(layer, kv head) plane is exactly
-//! the `[cur_len, head_dim]` row-major slice the attention kernels expect,
-//! so decode attention needs no gather step, just a head-plane offset.
+//! KV cache storage for the dense (all full-attention) Qwen3 architecture.
 //!
-//! Storage dtype is chosen at load time (`KvDtype`, issue #3): `F16`
+//! `KvDtype` (issue #3) is shared with `qwen35::cache`'s hybrid cache: `F16`
 //! (default) halves the cache vs `F32` with negligible quality impact at
 //! these scales (see the module doc on `attn_decode.hip`'s templated
 //! `load_kv` seam for how the fused kernels read either dtype without ever
 //! materializing a dequantized copy); `F32` exists purely so the parity
 //! test suites can pin the pre-issue-#3 reference numerics exactly (see
-//! `crate::model::LoadOptions`).
+//! `crate::load_opts::LoadOptions`).
+//!
+//! `DenseAttnCache` (issue #2/#16 — the dense-architecture mixed-KV port)
+//! generalizes `qwen35::cache::HybridCache`'s boundary-layer-skip rule to a
+//! model with no GDN layers at all: every layer here is a full-attention
+//! layer, so a quantized `KvCacheMode` gives every layer *except* the first
+//! and last the KIVI-style mixed cache
+//! (`qwen35::cache_mixed::MixedAttnPlane`) — reused as-is, not forked: the
+//! mixed cache and its kernels only ever take `n_kv_heads`/`head_dim`/
+//! `max_seq`/`v_bits`/`sink_len`/`window_len`, no qwen35-specific config, so
+//! nothing about them is hybrid-architecture-specific in the first place
+//! (issue #16's "keep the kernels architecture-generic" constraint holds
+//! for free here). `qwen35::cache::AttnPlane`/`AttnLayerCache` are reused
+//! the same way for the dense-fp16/f32 and Dense/Mixed dispatch enum
+//! respectively — see that module's doc comment for the per-layer storage
+//! shape, unchanged by this reuse.
 //!
 //! No hardcoded cap on `max_seq` any more: issue #3 removed the old
 //! `MAX_SEQ_CAP` constant in favor of an up-front VRAM budget check (see
 //! `crate::budget` and `crate::registry::clamp_ctx`) — the caller supplies
-//! whatever context length the budgeter approved, and `KvCache::new` just
-//! allocates it.
-
-use half::f16;
-use rocml_hip::DeviceBuffer;
+//! whatever context length the budgeter approved, and `DenseAttnCache::new`
+//! just allocates it.
 
 use crate::config::ModelConfig;
 use crate::error::RocmlError;
-use crate::forward::kernels::{offset, DevPtr, Kernels};
+use crate::kv_quant::validate_sink_window;
+use crate::load_opts::KvCacheMode;
+use crate::qwen35::cache::{AttnLayerCache, AttnPlane};
+use crate::qwen35::cache_mixed::MixedAttnPlane;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvDtype {
@@ -30,182 +42,95 @@ pub enum KvDtype {
     F32,
 }
 
-enum LayerCache {
-    F16 {
-        k: DeviceBuffer<f16>,
-        v: DeviceBuffer<f16>,
-    },
-    F32 {
-        k: DeviceBuffer<f32>,
-        v: DeviceBuffer<f32>,
-    },
-}
-
-impl LayerCache {
-    fn new(dtype: KvDtype, plane_len: usize) -> Result<Self, RocmlError> {
-        Ok(match dtype {
-            KvDtype::F16 => Self::F16 {
-                k: DeviceBuffer::new(plane_len)?,
-                v: DeviceBuffer::new(plane_len)?,
-            },
-            KvDtype::F32 => Self::F32 {
-                k: DeviceBuffer::new(plane_len)?,
-                v: DeviceBuffer::new(plane_len)?,
-            },
-        })
-    }
-
-    fn k_ptr(&self) -> DevPtr {
-        match self {
-            Self::F16 { k, .. } => offset(k, 0),
-            Self::F32 { k, .. } => offset(k, 0),
-        }
-    }
-
-    fn v_ptr(&self) -> DevPtr {
-        match self {
-            Self::F16 { v, .. } => offset(v, 0),
-            Self::F32 { v, .. } => offset(v, 0),
-        }
-    }
-
-    fn dtype(&self) -> KvDtype {
-        match self {
-            Self::F16 { .. } => KvDtype::F16,
-            Self::F32 { .. } => KvDtype::F32,
-        }
-    }
-
-    /// Appends one time step's `[n_kv_heads, head_dim]` k/v vectors (always
-    /// f32 — the scratch buffers' native dtype) at `pos`. `F32` storage does
-    /// the previous raw device-to-device copy per head; `F16` storage casts
-    /// through `Kernels::cast_f32_f16` per head instead (n_kv_heads tiny
-    /// launches per layer per step — 8 on Ornith — amortized against every
-    /// future decode/prefill read of that position via the fused kernels'
-    /// dequant-on-load seam, never materialized back to f32 in memory).
-    #[allow(clippy::too_many_arguments)]
-    fn append(
-        &mut self,
-        kernels: &Kernels,
-        pos: u32,
-        max_seq: u32,
-        n_kv_heads: u32,
-        head_dim: u32,
-        k_src: &DeviceBuffer<f32>,
-        v_src: &DeviceBuffer<f32>,
-    ) -> Result<(), RocmlError> {
-        let head_dim_u = head_dim as usize;
-        let max_seq_u = max_seq as usize;
-        match self {
-            Self::F32 { k, v } => {
-                for h in 0..n_kv_heads as usize {
-                    let dst = h * max_seq_u * head_dim_u + pos as usize * head_dim_u;
-                    let src = h * head_dim_u;
-                    k.copy_from_device(dst, k_src, src, head_dim_u)?;
-                    v.copy_from_device(dst, v_src, src, head_dim_u)?;
-                }
-                Ok(())
-            }
-            Self::F16 { k, v } => {
-                for h in 0..n_kv_heads as usize {
-                    let dst = h * max_seq_u * head_dim_u + pos as usize * head_dim_u;
-                    let src = h * head_dim_u;
-                    kernels.cast_f32_f16(offset(k_src, src), offset(k, dst), head_dim)?;
-                    kernels.cast_f32_f16(offset(v_src, src), offset(v, dst), head_dim)?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-pub struct KvCache {
+pub struct DenseAttnCache {
     max_seq: u32,
-    head_dim: u32,
-    n_kv_heads: u32,
-    layers: Vec<LayerCache>,
+    layers: Vec<AttnLayerCache>,
 }
 
-impl KvCache {
+impl DenseAttnCache {
     /// `ctx` is the caller's already-budgeted context length (see
     /// `crate::registry::clamp_ctx`) — clamped once more here against the
-    /// model's own declared `context_length` as a final sanity bound.
-    pub fn new(config: &ModelConfig, ctx: usize, dtype: KvDtype) -> Result<Self, RocmlError> {
+    /// model's own declared `context_length` as a final sanity bound,
+    /// mirroring `qwen35::cache::HybridCache::new`.
+    ///
+    /// Boundary-layer skip (issue #2, generalized per issue #16): when
+    /// `mode` is quantized, layer `0` and layer `block_count - 1` always get
+    /// a dense fp16 plane regardless of `mode` — only the layers strictly
+    /// between them get the mixed quantized layout. A single-layer model
+    /// has no mixed layers at all (that one layer is both boundary
+    /// positions at once), matching `HybridCache::new`'s same degenerate
+    /// case.
+    ///
+    /// `sink_len`/`window_len` are issue #2 leftovers' `LoadOptions::kv_sink`/
+    /// `kv_window` — validated here via `crate::kv_quant::validate_sink_window`
+    /// (only when `mode.is_quantized()`; a non-quantized mode never
+    /// allocates a mixed layer, so an out-of-range sink/window is inert and
+    /// not worth rejecting).
+    pub fn new(
+        config: &ModelConfig,
+        ctx: usize,
+        mode: KvCacheMode,
+        sink_len: u32,
+        window_len: u32,
+    ) -> Result<Self, RocmlError> {
         let max_seq = ctx.min(config.context_length as usize).max(1) as u32;
-        let n_kv_heads = config.head_count_kv;
-        let head_dim = config.head_dim;
-        let plane_len = (n_kv_heads as usize) * (max_seq as usize) * (head_dim as usize);
+        let n_layers = config.block_count as usize;
+        let dense_dtype = mode.dense_dtype();
+        let v_bits: u8 = match mode {
+            KvCacheMode::Q4Mixed => 4,
+            _ => 8,
+        };
 
-        let mut layers = Vec::with_capacity(config.block_count as usize);
-        for _ in 0..config.block_count {
-            layers.push(LayerCache::new(dtype, plane_len)?);
+        if mode.is_quantized() {
+            validate_sink_window(sink_len, window_len, max_seq as usize)?;
         }
 
-        Ok(Self {
-            max_seq,
-            head_dim,
-            n_kv_heads,
-            layers,
-        })
+        let last = n_layers.saturating_sub(1);
+        let mut layers = Vec::with_capacity(n_layers);
+        for idx in 0..n_layers {
+            let is_boundary = idx == 0 || idx == last;
+            let layer = if mode.is_quantized() && !is_boundary {
+                AttnLayerCache::Mixed(MixedAttnPlane::new(
+                    config.head_count_kv,
+                    config.head_dim,
+                    max_seq,
+                    v_bits,
+                    sink_len,
+                    window_len,
+                )?)
+            } else {
+                AttnLayerCache::Dense(AttnPlane::new(
+                    config.head_count_kv,
+                    max_seq,
+                    config.head_dim,
+                    dense_dtype,
+                )?)
+            };
+            layers.push(layer);
+        }
+        Ok(Self { max_seq, layers })
     }
 
     pub fn max_seq(&self) -> u32 {
         self.max_seq
     }
 
-    /// Storage dtype every layer shares (`KvCache::new` allocates all
-    /// layers with the same `dtype`) — `None` if there are no layers
-    /// (never true for a real model config, `block_count >= 1`).
-    pub fn dtype(&self) -> KvDtype {
-        self.layers
-            .first()
-            .map(LayerCache::dtype)
-            .unwrap_or(KvDtype::F16)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn append(
-        &mut self,
-        kernels: &Kernels,
-        layer_idx: usize,
-        pos: u32,
-        k: &DeviceBuffer<f32>,
-        v: &DeviceBuffer<f32>,
-    ) -> Result<(), RocmlError> {
-        if pos >= self.max_seq {
-            return Err(RocmlError::ContextOverflow {
-                requested: pos + 1,
-                max_seq: self.max_seq,
-            });
+    /// Rewinds every mixed-layer's eviction bookkeeping for a fresh
+    /// sequence — see `HybridCache::reset`'s doc comment for why this is
+    /// necessary (unlike a dense plane's stale-bytes-never-read argument).
+    /// No GDN state exists on this path to reset (the dense architecture
+    /// has none).
+    pub fn reset(&mut self) {
+        for layer in &mut self.layers {
+            if let AttnLayerCache::Mixed(plane) = layer {
+                plane.reset();
+            }
         }
-        let (max_seq, n_kv_heads, head_dim) = (self.max_seq, self.n_kv_heads, self.head_dim);
-        let layer = self.layers.get_mut(layer_idx).ok_or_else(|| {
+    }
+
+    pub fn attn_mut(&mut self, layer_idx: usize) -> Result<&mut AttnLayerCache, RocmlError> {
+        self.layers.get_mut(layer_idx).ok_or_else(|| {
             RocmlError::Config(format!("cache: layer index {layer_idx} out of range"))
-        })?;
-        layer.append(kernels, pos, max_seq, n_kv_heads, head_dim, k, v)
-    }
-
-    /// Element offset where kv head `kvh`'s `[max_seq, head_dim]` plane
-    /// starts within a layer's K/V buffer.
-    pub fn head_plane_offset(&self, kvh: u32) -> usize {
-        kvh as usize * self.max_seq as usize * self.head_dim as usize
-    }
-
-    pub fn k_ptr(&self, layer_idx: usize) -> Result<DevPtr, RocmlError> {
-        self.layers
-            .get(layer_idx)
-            .map(LayerCache::k_ptr)
-            .ok_or_else(|| {
-                RocmlError::Config(format!("cache: layer index {layer_idx} out of range"))
-            })
-    }
-
-    pub fn v_ptr(&self, layer_idx: usize) -> Result<DevPtr, RocmlError> {
-        self.layers
-            .get(layer_idx)
-            .map(LayerCache::v_ptr)
-            .ok_or_else(|| {
-                RocmlError::Config(format!("cache: layer index {layer_idx} out of range"))
-            })
+        })
     }
 }

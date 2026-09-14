@@ -76,7 +76,11 @@ pub struct AttnPlane {
 }
 
 impl AttnPlane {
-    fn new(
+    /// `pub(crate)` (not just module-private) so `crate::cache::DenseAttnCache`
+    /// (issue #16 prep: the dense qwen3 architecture's mixed-KV port) can
+    /// reuse this exact plane type instead of forking a second copy of the
+    /// dense f16/f32 KV storage.
+    pub(crate) fn new(
         n_kv_heads: u32,
         max_seq: u32,
         head_dim: u32,
