@@ -7,7 +7,7 @@ ROCML_CHECKPOINT_DIR ?= $(HOME)/checkpoints
 # Dev/test model (fast); override to point at a different checkpoint.
 QWEN_MODEL ?= $(ROCML_CHECKPOINT_DIR)/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf
 
-.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench bench-profile bench-profile-json eval mmq-layer-diff mmq-endtoend-measure mmq-calibrate mmq-smoothquant-measure kv-head-error-measure gdn-wmma-lds-perf gdn-uvvnew-perf rotational-kv-calibrate rotational-kv-measure rotational-kv-sim-parity eval-rotational-v3
+.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench bench-profile bench-profile-json eval mmq-layer-diff mmq-endtoend-measure mmq-calibrate mmq-smoothquant-measure kv-head-error-measure gdn-wmma-lds-perf gdn-uvvnew-perf rotational-kv-calibrate rotational-kv-measure rotational-kv-sim-parity eval-rotational-v3 llama-layer-diff
 
 build:
 	cargo build --workspace
@@ -227,3 +227,17 @@ eval-rotational-v3:
 		--label ornith-q4km-rotv3bpw \
 		--out bench/eval/results/ornith-q4km-rotv3bpw.json \
 		--resume
+
+# Issue #10's llama.cpp-reference per-layer diff (`rocml/tests/llama_layer_diff.rs`):
+# runs Ornith-1.0-9B's chunked-prefill path with LayerCapture over the
+# pinned 64-token corpus prompt, ingests a pre-generated llama.cpp CPU
+# reference dump (see docs/llama-diff.md for how to build `rocml-dump` in a
+# scratch llama.cpp checkout and produce LLAMA_DUMP — this target does not
+# build or run llama.cpp itself, since it is never vendored into this
+# repo), and reports per-layer/per-tensor max/mean relative error against
+# the recorded healthy-build baseline in docs/llama-diff.md. Diagnostic
+# tool, not a correctness gate, hence `--ignored`. Skips itself if either
+# the checkpoint or LLAMA_DUMP is missing.
+LLAMA_DUMP ?= bench/eval/llama_ref/ornith-9b-ref.txt
+llama-layer-diff:
+	LLAMA_DUMP=$(LLAMA_DUMP) cargo test --release -p rocml --test llama_layer_diff -- --ignored --nocapture

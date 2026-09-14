@@ -3,3 +3,8 @@
 # rocprofv3's own scratch directory (counter-collection cache files),
 # created wherever it's invoked from (docs/profiling.md's workflow).
 /.rocprofv3/
+# Issue #10's llama.cpp reference dumps (docs/llama-diff.md, `make
+# llama-layer-diff`'s LLAMA_DUMP) — full-precision per-tensor text, easily
+# hundreds of MB; only the diffed summary numbers get committed, in
+# docs/llama-diff.md itself.
+/bench/eval/llama_ref/
