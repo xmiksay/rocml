@@ -11,6 +11,7 @@ use super::chunk_kernels::ChunkKernels;
 use super::chunk_scratch::ChunkScratch;
 use super::gdn_chunkwise::gdn_chunkwise_step;
 use super::gdn_chunkwise_kernels::GdnChunkwiseKernels;
+use super::gdn_chunkwise_kernels_wmma::GdnChunkwiseWmmaKernels;
 use super::layer_capture::LayerCapture;
 use crate::error::RocmlError;
 use crate::forward::kernels::{offset, Kernels};
@@ -24,6 +25,7 @@ pub(crate) fn gdn_chunk_step(
     kernels: &Kernels,
     chunk: &ChunkKernels,
     cw: &GdnChunkwiseKernels,
+    cw_wmma: &GdnChunkwiseWmmaKernels,
     config: &Qwen35Config,
     layer: &GdnLayerWeights,
     state: &mut GdnLayerState,
@@ -161,7 +163,7 @@ pub(crate) fn gdn_chunk_step(
         OpKind::GdnRecur,
         recur_bytes,
         recur_flops,
-        || gdn_chunkwise_step(cw, gdn, state, scratch, chunk_len),
+        || gdn_chunkwise_step(cw, cw_wmma, gdn, state, scratch, chunk_len),
     )?;
 
     let out_bytes = profile::norm_bytes(chunk_len * gdn.num_v_heads, gdn.head_v_dim)

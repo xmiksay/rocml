@@ -17,6 +17,7 @@
 
 use super::chunk_scratch::{ChunkScratch, GDN_RECUR_TILE};
 use super::gdn_chunkwise_kernels::GdnChunkwiseKernels;
+use super::gdn_chunkwise_kernels_wmma::GdnChunkwiseWmmaKernels;
 use crate::error::RocmlError;
 use crate::forward::kernels::offset;
 use crate::qwen35::cache::GdnLayerState;
@@ -27,15 +28,27 @@ const L2_NORM_EPS: f32 = 1e-6;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gdn_chunkwise_step(
     cw: &GdnChunkwiseKernels,
+    cw_wmma: &GdnChunkwiseWmmaKernels,
     gdn: &GdnConfig,
     state: &mut GdnLayerState,
     scratch: &mut ChunkScratch,
     chunk_len: u32,
 ) -> Result<(), RocmlError> {
+    // gdn-wmma round: only stage G (state update) routes through the
+    // matrix-core kernel, and only when this model's head dims are both
+    // multiples of 16 (a per-model load-time constant, checked once per
+    // call rather than per tile). Stages B (`ut_build`)/F (`output`) also
+    // have WMMA kernels (`kernels/gdn_chunkwise_wmma.hip`), correctness-
+    // proven against the f64 reference, but measured *slower* than scalar
+    // on ornith-9b's real shape — see `gdn_chunkwise_kernels_wmma.rs`'s
+    // module doc for the numbers and root cause. Kept scalar here.
+    let use_wmma = gdn.head_k_dim.is_multiple_of(16) && gdn.head_v_dim.is_multiple_of(16);
     let mut tile_start = 0u32;
     while tile_start < chunk_len {
         let tile_len = (chunk_len - tile_start).min(GDN_RECUR_TILE);
-        run_tile(cw, gdn, state, scratch, tile_start, tile_len)?;
+        run_tile(
+            cw, cw_wmma, use_wmma, gdn, state, scratch, tile_start, tile_len,
+        )?;
         tile_start += tile_len;
     }
     Ok(())
@@ -44,6 +57,8 @@ pub(crate) fn gdn_chunkwise_step(
 #[allow(clippy::too_many_arguments)]
 fn run_tile(
     cw: &GdnChunkwiseKernels,
+    cw_wmma: &GdnChunkwiseWmmaKernels,
+    use_wmma: bool,
     gdn: &GdnConfig,
     state: &mut GdnLayerState,
     scratch: &mut ChunkScratch,
@@ -118,15 +133,29 @@ fn run_tile(
         sv,
         tile_len,
     )?;
-    cw.state_update(
-        k_norm,
-        cum_decay_exp,
-        state_decay,
-        v_new,
-        state_ptr,
-        h,
-        sk,
-        sv,
-        tile_len,
-    )
+    if use_wmma {
+        cw_wmma.state_update(
+            k_norm,
+            cum_decay_exp,
+            state_decay,
+            v_new,
+            state_ptr,
+            h,
+            sk,
+            sv,
+            tile_len,
+        )
+    } else {
+        cw.state_update(
+            k_norm,
+            cum_decay_exp,
+            state_decay,
+            v_new,
+            state_ptr,
+            h,
+            sk,
+            sv,
+            tile_len,
+        )
+    }
 }

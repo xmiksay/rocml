@@ -13,7 +13,9 @@ use rocml_hip::{kernel_params, DeviceBuffer, LaunchConfig, Module};
 pub const TOL: f32 = 3e-3;
 pub const L2_EPS: f64 = 1e-6;
 /// Must match `kernels/gdn_chunkwise.hip`'s `#define UT_BUILD_J_PER_BLOCK`.
-const UT_BUILD_J_PER_BLOCK: u32 = 8;
+pub(crate) const UT_BUILD_J_PER_BLOCK: u32 = 8;
+
+pub mod wmma;
 
 pub fn load(hsaco: &[u8], name: &str) -> (Module, rocml_hip::Function) {
     let module = Module::load_from_bytes(hsaco).expect("module load failed");

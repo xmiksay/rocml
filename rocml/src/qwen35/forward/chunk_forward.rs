@@ -165,6 +165,7 @@ impl Model {
                         &self.kernels,
                         &self.chunk_kernels,
                         &self.gdn_cw_kernels,
+                        &self.gdn_cw_wmma_kernels,
                         &self.config,
                         gdn_weights,
                         state,

@@ -16,6 +16,7 @@ mod gdn;
 mod gdn_chunk;
 mod gdn_chunkwise;
 mod gdn_chunkwise_kernels;
+mod gdn_chunkwise_kernels_wmma;
 mod kernels;
 pub(crate) mod kernels_flash_mixed;
 pub(crate) mod kernels_mixed;
@@ -28,6 +29,7 @@ use std::path::Path;
 use chunk_kernels::ChunkKernels;
 use chunk_scratch::ChunkScratch;
 use gdn_chunkwise_kernels::GdnChunkwiseKernels;
+use gdn_chunkwise_kernels_wmma::GdnChunkwiseWmmaKernels;
 use kernels::HybridKernels;
 use kernels_flash_mixed::FlashPrefillMixedKernels;
 use kernels_mixed::MixedKernels;
@@ -69,6 +71,12 @@ pub struct Model {
     /// Chunkwise (blocked delta-rule) GDN recurrence kernels — see
     /// `gdn_chunkwise.rs`. Loaded unconditionally alongside `chunk_kernels`.
     gdn_cw_kernels: GdnChunkwiseKernels,
+    /// WMMA variants of stages B/F/G (gdn-wmma round) — see
+    /// `gdn_chunkwise_kernels_wmma.rs`'s module doc for why this is a
+    /// separate struct/field rather than folded into `gdn_cw_kernels`.
+    /// Loaded unconditionally; `gdn_chunkwise::run_tile` picks per call
+    /// based on whether `head_k_dim`/`head_v_dim` are multiples of 16.
+    gdn_cw_wmma_kernels: GdnChunkwiseWmmaKernels,
     chunk_scratch: ChunkScratch,
     pos: u32,
 }
@@ -142,6 +150,7 @@ impl Model {
         let scratch = Scratch::new(&config)?;
         let chunk_kernels = ChunkKernels::load_all()?;
         let gdn_cw_kernels = GdnChunkwiseKernels::load_all()?;
+        let gdn_cw_wmma_kernels = GdnChunkwiseWmmaKernels::load_all()?;
         let chunk_scratch = ChunkScratch::new(&config)?;
 
         Ok(Self {
@@ -156,6 +165,7 @@ impl Model {
             scratch,
             chunk_kernels,
             gdn_cw_kernels,
+            gdn_cw_wmma_kernels,
             chunk_scratch,
             pos: 0,
         })

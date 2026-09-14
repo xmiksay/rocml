@@ -277,6 +277,18 @@ pub const GDN_CW_OUTPUT_F32_KERNEL: &str = "gdn_chunkwise_output_f32";
 pub const GDN_CW_STATE_F32_HSACO: &[u8] = GDN_CW_UT_BUILD_F32_HSACO;
 pub const GDN_CW_STATE_F32_KERNEL: &str = "gdn_chunkwise_state_f32";
 
+/// `kernels/gdn_chunkwise_wmma.hip` (gdn-wmma round, issue #6): matrix-core
+/// replacements for stages B/F/G above, dispatched only when `head_k_dim`/
+/// `head_v_dim` are both multiples of 16 — see that file's module doc for
+/// why D+E stays scalar and the fragment-loader algebra for B/F/G.
+pub const GDN_CW_UT_BUILD_WMMA_F32_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gdn_chunkwise_wmma.hsaco"));
+pub const GDN_CW_UT_BUILD_WMMA_F32_KERNEL: &str = "gdn_chunkwise_ut_build_wmma_f32";
+pub const GDN_CW_OUTPUT_WMMA_F32_HSACO: &[u8] = GDN_CW_UT_BUILD_WMMA_F32_HSACO;
+pub const GDN_CW_OUTPUT_WMMA_F32_KERNEL: &str = "gdn_chunkwise_output_wmma_f32";
+pub const GDN_CW_STATE_WMMA_F32_HSACO: &[u8] = GDN_CW_UT_BUILD_WMMA_F32_HSACO;
+pub const GDN_CW_STATE_WMMA_F32_KERNEL: &str = "gdn_chunkwise_state_wmma_f32";
+
 /// `kernels/quantize_act_q8.hip`: per-32-element-block absmax int8
 /// quantizer for the int8 MMQ-style GEMM prototype below (WMMA-pipeline
 /// round, issue #6 lever 2) — llama.cpp Q8_1-style `(code, scale,
