@@ -11,6 +11,10 @@
 //! Run via `make test-model` (release: a real ~7.4GB GGUF and a 32-layer x
 //! 24-token decode loop, twice, is unbearably slow unoptimized). Skips
 //! itself if the checkpoint isn't present on this machine.
+//!
+//! Ornith-1.5-9B (Q4_K_M) runs the same gates. Its GGUF also carries an MTP
+//! draft block (`blk.32`) that the forward pass must skip, asserted through
+//! `Model::block_count`.
 
 use rocml::{LoadOptions, Model};
 use rocml_core::gguf::GgufFile;
@@ -18,6 +22,10 @@ use rocml_core::testpaths::checkpoint;
 use rocml_core::tokenizer::BpeTokenizer;
 
 const GGUF_REL: &str = "Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf";
+const ORNITH_1_5_GGUF_REL: &str = "Ornith-1.5-9B-GGUF/Ornith-1.5-9B-Q4_K_M.gguf";
+/// Forward-pass layers in both Ornith-9B generations (1.5's GGUF declares 33,
+/// counting its MTP block).
+const MAIN_LAYERS: u32 = 32;
 /// A raw continuation prompt (no chat template) — this test cares about
 /// forward-pass well-formedness, not chat behavior.
 const PROMPT: &str = "The capital of France is";
@@ -59,7 +67,16 @@ fn greedy_generate(model: &mut Model, prompt_ids: &[u32], n: usize) -> Vec<u32> 
 
 #[test]
 fn ornith_9b_greedy_decode_is_well_formed_and_deterministic() {
-    let Some(gguf_path) = checkpoint(GGUF_REL) else {
+    assert_greedy_decode_well_formed_and_deterministic(GGUF_REL);
+}
+
+#[test]
+fn ornith_1_5_9b_greedy_decode_is_well_formed_and_deterministic() {
+    assert_greedy_decode_well_formed_and_deterministic(ORNITH_1_5_GGUF_REL);
+}
+
+fn assert_greedy_decode_well_formed_and_deterministic(gguf_rel: &str) {
+    let Some(gguf_path) = checkpoint(gguf_rel) else {
         return;
     };
 
@@ -73,6 +90,11 @@ fn ornith_9b_greedy_decode_is_well_formed_and_deterministic() {
     // reference to pin against, only internal well-formedness/determinism.
     let opts = LoadOptions::new(4096);
     let mut model_a = Model::load(&gguf_path, opts).expect("load model (first run)");
+    assert_eq!(
+        model_a.block_count(),
+        MAIN_LAYERS,
+        "{gguf_rel}: forward pass must exclude MTP blocks"
+    );
     let ids_a = greedy_generate(&mut model_a, &prompt_ids, NUM_TOKENS);
     drop(model_a); // free VRAM before the second load
 
@@ -96,9 +118,59 @@ fn ornith_9b_greedy_decode_is_well_formed_and_deterministic() {
 /// the bug present this prompt degenerates into protocol babble instead.
 #[test]
 fn ornith_9b_tooled_prompt_greedy_matches_external_references() {
-    let Some(gguf_path) = checkpoint(GGUF_REL) else {
+    let Some(text) = tooled_prompt_greedy_text(GGUF_REL) else {
         return;
     };
+
+    // llama.cpp (`llama-completion --temp 0`, chunked AND -ub 1 sequential)
+    // and HF transformers (same GGUF via `gguf_file=`) both open with
+    // exactly this thinking sentence. The sentence tail is deliberately not
+    // pinned: greedy near-ties can flip a word mid-sentence (same policy as
+    // the parity suites' near-tie escape hatch) without invalidating the
+    // gate this test exists for.
+    assert!(
+        text.trim_start()
+            .starts_with("The user is asking about the current weather in Prague."),
+        "greedy continuation diverges from llama.cpp/HF reference: {text:?}"
+    );
+    // ...and emit exactly this tool call.
+    let expected_call = "<tool_call>\n<function=get_weather>\n<parameter=location>\nPrague\n\
+                         </parameter>\n</function>\n</tool_call>";
+    assert!(
+        text.contains("</think>"),
+        "thinking block never closed: {text:?}"
+    );
+    assert!(
+        text.contains(expected_call),
+        "expected exact tool-call block missing: {text:?}"
+    );
+}
+
+/// No external token-level reference is pinned for Ornith-1.5-9B, so this
+/// asserts the behavior the 1.0 gate protects rather than exact text: the
+/// thinking block closes and the model calls `get_weather` for Prague.
+#[test]
+fn ornith_1_5_9b_tooled_prompt_emits_weather_tool_call() {
+    let Some(text) = tooled_prompt_greedy_text(ORNITH_1_5_GGUF_REL) else {
+        return;
+    };
+    assert!(
+        text.contains("</think>"),
+        "thinking block never closed: {text:?}"
+    );
+    for expected in [
+        "<tool_call>",
+        "<function=get_weather>",
+        "<parameter=location>\nPrague\n</parameter>",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?}: {text:?}");
+    }
+}
+
+/// Greedy-decodes 96 tokens after a rendered tool-bearing chat prompt, or
+/// `None` if the checkpoint isn't present.
+fn tooled_prompt_greedy_text(gguf_rel: &str) -> Option<String> {
+    let gguf_path = checkpoint(gguf_rel)?;
 
     let gguf = GgufFile::open(&gguf_path).expect("open GGUF");
     let tokenizer = BpeTokenizer::from_gguf(&gguf).expect("build tokenizer");
@@ -147,28 +219,5 @@ fn ornith_9b_tooled_prompt_greedy_matches_external_references() {
         out_ids.push(best);
         logits = model.forward_token(best).expect("forward_token failed");
     }
-    let text = tokenizer.decode(&out_ids);
-
-    // llama.cpp (`llama-completion --temp 0`, chunked AND -ub 1 sequential)
-    // and HF transformers (same GGUF via `gguf_file=`) both open with
-    // exactly this thinking sentence. The sentence tail is deliberately not
-    // pinned: greedy near-ties can flip a word mid-sentence (same policy as
-    // the parity suites' near-tie escape hatch) without invalidating the
-    // gate this test exists for.
-    assert!(
-        text.trim_start()
-            .starts_with("The user is asking about the current weather in Prague."),
-        "greedy continuation diverges from llama.cpp/HF reference: {text:?}"
-    );
-    // ...and emit exactly this tool call.
-    let expected_call = "<tool_call>\n<function=get_weather>\n<parameter=location>\nPrague\n\
-                         </parameter>\n</function>\n</tool_call>";
-    assert!(
-        text.contains("</think>"),
-        "thinking block never closed: {text:?}"
-    );
-    assert!(
-        text.contains(expected_call),
-        "expected exact tool-call block missing: {text:?}"
-    );
+    Some(tokenizer.decode(&out_ids))
 }

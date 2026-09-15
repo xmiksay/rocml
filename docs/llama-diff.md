@@ -431,12 +431,12 @@ data (that function had no prior unit tests).
   architecture, same mapping table, same harness. To redo against the
   flagship once VRAM is free:
   ```sh
-  ROCML_DUMP_OUT=bench/eval/llama_ref/ornith-9b-ref.txt \
+  ROCML_DUMP_OUT=bench/eval/llama_ref/ornith-1.0-9b-ref.txt \
   ROCML_DUMP_FILTER="attn_residual,attn_post_norm,ffn_swiglu,ffn_out,l_out,attn_norm,linear_attn_qkv_mixed,final_output,linear_attn_out" \
   ./build/bin/rocml-dump -m <checkpoint dir>/Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf \
     -f <64-token prompt text, decoded via rocml's tokenizer per Section 2> -ngl 0 -t $(nproc)
 
-  make llama-layer-diff LLAMA_DUMP=bench/eval/llama_ref/ornith-9b-ref.txt
+  make llama-layer-diff LLAMA_DUMP=bench/eval/llama_ref/ornith-1.0-9b-ref.txt
   ```
 - **An unfiltered `rocml-dump` run is impractical**: every non-quantized
   node in the graph (RoPE caches, per-op views/reshapes, the KV cache

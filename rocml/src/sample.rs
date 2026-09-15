@@ -13,7 +13,7 @@
 
 use std::cmp::Ordering;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplingParams {
     /// `<= 0.0` selects greedy argmax, ignoring every other field below.
     pub temperature: f32,

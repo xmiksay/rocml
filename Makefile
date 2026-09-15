@@ -21,6 +21,7 @@ test:
 		--skip qwen35_cpu_reference_matches_crane_for_a_handful_of_tokens \
 		--skip qwen35_2b_hybrid_greedy_matches_crane_gpu_reference \
 		--skip ornith_9b_greedy_decode_is_well_formed_and_deterministic \
+		--skip ornith_1_5_9b \
 		--skip qwen35_2b_chunked_prefill_matches_token_serial \
 		--skip qwen3_0_6b_chunked_prefill_matches_token_serial \
 		--skip qwen3_0_6b_chunked_prefill_matches_token_serial_mixed_kv \
@@ -119,21 +120,32 @@ bench-profile-json:
 	cargo run --release -p rocml-cli -- bench --model $(MODEL) --depth $(DEPTH) --profile-json $(OUT)
 
 # Issue #15's agentic quality-eval harness: establishes the Q6_K fp16-KV
-# baseline and the Q4_K_M candidate, both at ctx 16384 (long-context
-# scenarios need ~8K tokens of filler plus thinking/answer headroom).
+# baseline and the Q4_K_M candidate for both Ornith-1.0-9B and Ornith-1.5-9B,
+# all at ctx 16384 (long-context scenarios need ~8K tokens of filler plus
+# thinking/answer headroom).
 # `--resume` is always passed so a run interrupted partway through (a long
 # eval, possibly split across several invocations) picks back up instead of
 # re-scoring already-graded scenarios.
 eval:
 	cargo run --release -p rocml-cli -- eval \
-		--model ornith-9b-q6 --ctx 16384 \
+		--model ornith-1.0-9b-q6 --ctx 16384 \
 		--label ornith-q6k-fp16kv \
 		--out bench/eval/results/ornith-q6k-fp16kv.json \
 		--resume
 	cargo run --release -p rocml-cli -- eval \
-		--model ornith-9b --ctx 16384 \
+		--model ornith-1.0-9b --ctx 16384 \
 		--label ornith-q4km-fp16kv \
 		--out bench/eval/results/ornith-q4km-fp16kv.json \
+		--resume
+	cargo run --release -p rocml-cli -- eval \
+		--model ornith-1.5-9b-q6 --ctx 16384 \
+		--label ornith15-q6k-fp16kv \
+		--out bench/eval/results/ornith15-q6k-fp16kv.json \
+		--resume
+	cargo run --release -p rocml-cli -- eval \
+		--model ornith-1.5-9b --ctx 16384 \
+		--label ornith15-q4km-fp16kv \
+		--out bench/eval/results/ornith15-q4km-fp16kv.json \
 		--resume
 
 # Issue #10's per-layer diff harness (`rocml/tests/mmq_layer_diff.rs`):
@@ -231,7 +243,7 @@ rotational-kv-sim-parity:
 # degradation is STOP.
 eval-rotational-v3:
 	cargo run --release -p rocml-cli -- eval \
-		--model ornith-9b --ctx 16384 \
+		--model ornith-1.0-9b --ctx 16384 \
 		--kv-cache q8 --kv-rot-sim 3 \
 		--label ornith-q4km-rotv3bpw \
 		--out bench/eval/results/ornith-q4km-rotv3bpw.json \
@@ -247,6 +259,6 @@ eval-rotational-v3:
 # the recorded healthy-build baseline in docs/llama-diff.md. Diagnostic
 # tool, not a correctness gate, hence `--ignored`. Skips itself if either
 # the checkpoint or LLAMA_DUMP is missing.
-LLAMA_DUMP ?= bench/eval/llama_ref/ornith-9b-ref.txt
+LLAMA_DUMP ?= bench/eval/llama_ref/ornith-1.0-9b-ref.txt
 llama-layer-diff:
 	LLAMA_DUMP=$(LLAMA_DUMP) cargo test --release -p rocml --test llama_layer_diff -- --ignored --nocapture

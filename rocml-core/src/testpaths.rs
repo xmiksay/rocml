@@ -10,6 +10,7 @@
 //! - `Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf`
 //! - `Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf`
 //! - `Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf`
+//! - `Ornith-1.5-9B-GGUF/Ornith-1.5-9B-Q4_K_M.gguf` (and `-Q6_K.gguf`)
 //! - `Qwen3.5-2B-tokenizer/tokenizer.json`
 //! - `Ornith-1.0-9B/chat_template.jinja`
 //!

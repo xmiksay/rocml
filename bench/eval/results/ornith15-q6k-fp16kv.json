@@ -1,0 +1,208 @@
+{
+  "label": "ornith15-q6k-fp16kv",
+  "timestamp_unix": 1789496667,
+  "git_rev": "3c90526-dirty",
+  "model_path": "/home/miksa/checkpoints/Ornith-1.5-9B-GGUF/Ornith-1.5-9B-Q6_K.gguf",
+  "engine_config": {
+    "ctx": 16384,
+    "kv_cache": "fp16",
+    "max_gen_tokens": 2048,
+    "sampling": {
+      "temperature": 0.0,
+      "top_k": null,
+      "top_p": null,
+      "seed": 0
+    }
+  },
+  "per_scenario": [
+    {
+      "id": "weather_prague",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user wants to know the current weather in Prague. I have a get_weather tool available. Let me call it with the location \"Prague\". I'll use celsius as the unit since that's common for Prague (Czech Republic).\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=location>\nPrague\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 2.629050065
+    },
+    {
+      "id": "send_email_basic",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user wants me to send an email. This is a straightforward task that doesn't require any external information or web search. Let me just send the email with the specified details.\n</think>\n\n<tool_call>\n<function=send_email>\n<parameter=to>\nboss@example.com\n</parameter>\n<parameter=subject>\nStatus Update\n</parameter>\n<parameter=body>\nThe deployment finished successfully.\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 2.745187082
+    },
+    {
+      "id": "currency_convert",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user wants to convert 250 US dollars to Japanese yen. I have a convert_currency tool available. Let me use it.\n</think>\n\n<tool_call>\n<function=convert_currency>\n<parameter=amount>\n250\n</parameter>\n<parameter=from>\nUSD\n</parameter>\n<parameter=to>\nJPY\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 2.472576001
+    },
+    {
+      "id": "calendar_event",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user wants me to schedule a meeting called 'Q3 Planning' on 2026-09-20 at 14:00. I have a create_calendar_event tool that takes title, date, and time parameters. Let me use it.\n</think>\n\n<tool_call>\n<function=create_calendar_event>\n<parameter=title>\nQ3 Planning\n</parameter>\n<parameter=date>\n2026-09-20\n</parameter>\n<parameter=time>\n14:00\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 3.355533176
+    },
+    {
+      "id": "stock_price",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user wants the current stock price of NVIDIA (NVDA). I have a get_stock_price tool for this. Let me call it.\n</think>\n\n<tool_call>\n<function=get_stock_price>\n<parameter=ticker>\nNVDA\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 1.8524962870000001
+    },
+    {
+      "id": "translate_text",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user wants me to translate 'good morning' into French. I have a translate_text tool available. Let me use it.\n</think>\n\n<tool_call>\n<function=translate_text>\n<parameter=text>\ngood morning\n</parameter>\n<parameter=target_language>\nFrench\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 1.971534309
+    },
+    {
+      "id": "set_reminder_quoted",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user wants me to set a reminder in 15 minutes to \"call the dentist\". This is a straightforward request that maps directly to the set_reminder tool.\n\nLet me call the set_reminder function with:\n- text: \"call the dentist\"\n- minutes_before: 15\n</think>\n\n<tool_call>\n<function=set_reminder>\n<parameter=text>\ncall the dentist\n</parameter>\n<parameter=minutes_before>\n15\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 2.997539788
+    },
+    {
+      "id": "control_light",
+      "kind": "tool_choice",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user wants me to turn on the kitchen lights and set them to 80% brightness. This is a straightforward request that I can fulfill using the control_smart_light tool.\n\nLet me call the function with:\n- room: \"kitchen\"\n- state: \"on\"\n- brightness: 80\n</think>\n\n<tool_call>\n<function=control_smart_light>\n<parameter=room>\nkitchen\n</parameter>\n<parameter=state>\non\n</parameter>\n<parameter=brightness>\n80\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 3.377694075
+    },
+    {
+      "id": "capital_of_france",
+      "kind": "no_tool",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user is asking a simple factual question: \"What is the capital of France? Answer in one word.\"\n\nThis is a well-known fact that I already know - the capital of France is Paris. I don't need to use any tools for this. The instruction says to only use tools when the request genuinely requires current or external information, and this doesn't.\n\nThe answer in one word is \"Paris.\"\n</think>\n\nParis",
+      "wall_seconds": 2.47396208
+    },
+    {
+      "id": "http_meaning",
+      "kind": "no_tool",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user is asking a simple factual question about what HTTP stands for. This is basic knowledge that I already know - I don't need to search the web for this. HTTP stands for HyperText Transfer Protocol.\n\nThe user asked for one short sentence.\n</think>\n\nHTTP stands for HyperText Transfer Protocol.",
+      "wall_seconds": 1.860051927
+    },
+    {
+      "id": "count_continents",
+      "kind": "no_tool",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user is asking a simple factual question: \"How many continents are there on Earth?\" This doesn't require any tools—it's general knowledge. I should just answer directly.\n\nThere are different models for counting continents. The most common in English-speaking countries is 7 continents. However, some models (particularly in Europe and some other regions) count 6 continents (combining North and South America). I should mention this nuance.\n\nNo tools needed here.\n</think>\n\nThere are **7 continents** on Earth according to the most widely used model in English-speaking countries:\n\n1. **Africa**\n2. **Antarctica**\n3. **Asia**\n4. **Europe**\n5. **North America**\n6. **Oceania** (also called Australia)\n7. **South America**\n\nHowever, it's worth noting that the number can vary depending on the model used:\n\n- **6 continents**: Some models (common in Europe and parts of Asia) combine North and South America into a single \"America\" continent.\n- **5 continents**: The \"seven continents\" model sometimes omits Antarctica (since it has no permanent human population).\n\nSo the answer is most commonly **7**, but you may encounter **5 or 6** depending on the source.",
+      "wall_seconds": 6.855585186
+    },
+    {
+      "id": "weather_then_advice",
+      "kind": "multi_turn",
+      "pass": true,
+      "detail": "turn 1: ok; turn 2: ok",
+      "raw_output": "[turn 1]\nThe user is asking for the current weather in London. I have a get_weather tool available. Let me call it with the location \"London\".\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=location>\nLondon\n</parameter>\n</function>\n</tool_call>\n\n[turn 2]\nThe user asked about the weather in London right now. I got the result. Let me provide a helpful response.\n</think>\n\nThe current weather in London is:\n\n- **Condition:** Light rain\n- **Temperature:** 14°C\n\nLooks like a wet day there — might want to grab an umbrella! 🌧️",
+      "wall_seconds": 3.706065943
+    },
+    {
+      "id": "stock_lookup_then_report",
+      "kind": "multi_turn",
+      "pass": true,
+      "detail": "turn 1: ok; turn 2: ok",
+      "raw_output": "[turn 1]\nThe user is asking for the current price of AAPL stock. I have a tool to get the stock price. Let me call it.\n</think>\n\n<tool_call>\n<function=get_stock_price>\n<parameter=ticker>\nAAPL\n</parameter>\n</function>\n</tool_call>\n\n[turn 2]\nThe user asked for the current price of AAPL stock. I got the result: $227.35. Let me provide a clear answer.\n</think>\n\nThe current price of AAPL (Apple Inc.) stock is **$227.35**.",
+      "wall_seconds": 3.452528341
+    },
+    {
+      "id": "email_then_confirm",
+      "kind": "multi_turn",
+      "pass": true,
+      "detail": "turn 1: ok; turn 2: ok",
+      "raw_output": "[turn 1]\nThe user wants me to send an email. I have the send_email tool available. Let me use it with the provided parameters.\n</think>\n\n<tool_call>\n<function=send_email>\n<parameter=to>\nalice@example.com\n</parameter>\n<parameter=subject>\nLunch\n</parameter>\n<parameter=body>\nAre you free for lunch tomorrow?\n</parameter>\n</function>\n</tool_call>\n\n[turn 2]\nThe email was sent successfully. Let me confirm this to the user.\n</think>\n\nYour email has been sent to alice@example.com with the subject \"Lunch\". Message ID: m-8842.",
+      "wall_seconds": 3.977276472
+    },
+    {
+      "id": "two_city_weather",
+      "kind": "multi_turn",
+      "pass": false,
+      "detail": "turn 1: expected exactly 1 tool call, got 2",
+      "raw_output": "The user wants me to check the weather in both London and Paris. I have a get_weather tool that takes a location parameter. I can call it for both locations. Since these are independent calls, I can make them in the same block.\n</think>\n\nI'll check the weather in both London and Paris for you.\n\n<tool_call>\n<function=get_weather>\n<parameter=location>\nLondon\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n</parameter>\n</function>\n</tool_call>",
+      "wall_seconds": 3.139722641
+    },
+    {
+      "id": "currency_then_advice",
+      "kind": "multi_turn",
+      "pass": true,
+      "detail": "turn 1: ok; turn 2: ok",
+      "raw_output": "[turn 1]\nThe user wants to convert 500 EUR to GBP. I have a convert_currency tool available. Let me use it.\n</think>\n\n<tool_call>\n<function=convert_currency>\n<parameter=amount>\n500\n</parameter>\n<parameter=from>\nEUR\n</parameter>\n<parameter=to>\nGBP\n</parameter>\n</function>\n</tool_call>\n\n[turn 2]\nThe user asked to convert 500 EUR to GBP. The result is 430.15 GBP. Let me provide a clear answer.\n</think>\n\n500 EUR converts to **430.15 GBP**.",
+      "wall_seconds": 3.973081286
+    },
+    {
+      "id": "needle_4k_early",
+      "kind": "long_context",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user is asking me to find the secret laboratory access code mentioned in the text. Let me scan through the text for this information.\n\nLooking through the text, I can see this line: \"The secret laboratory. Access code is ZQ-7734.\"\n\nSo the access code is ZQ-7734.\n</think>\n\nZQ-7734",
+      "wall_seconds": 5.736430425
+    },
+    {
+      "id": "needle_4k_late",
+      "kind": "long_context",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user is asking me to find the password to the vault based on the passage. Let me scan through the text for any mention of a password.\n\nLooking through the text, I can see this line:\n\n\"Mountains gates birds seeking The password to the vault. Is Falcon-Nine-Echo.\"\n\nSo the password is \"Falcon-Nine-Echo\".\n</think>\n\nAccording to the passage, the password to the vault is **Falcon-Nine-Echo**.\n\nThis is found in the line: *\"Mountains gates birds seeking The password to the vault. Is Falcon-Nine-Echo.\"*",
+      "wall_seconds": 6.84929219
+    },
+    {
+      "id": "needle_8k_middle",
+      "kind": "long_context",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user is asking about Agent Whitmore's rendezvous point based on the text. Let me search for \"Whitmore\" in the text.\n\nI found: \"Goods Agent Whitmore's rendezvous point is Pier 19 at. Midnight.\"\n\nSo the rendezvous point is Pier 19, and the time is Midnight.\n</think>\n\nAccording to the text, Agent Whitmore's rendezvous point is **Pier 19**, and it is scheduled for **Midnight**.",
+      "wall_seconds": 11.184545625
+    },
+    {
+      "id": "needle_8k_early",
+      "kind": "long_context",
+      "pass": true,
+      "detail": "ok",
+      "raw_output": "The user is asking about a lottery number combination that was stated earlier in the text. Let me search through the text for this information.\n\nLooking through the text, I can find this line:\n\n\"Readers doors The winning lottery number combination is 14-27-33-49-52..\"\n\nSo the winning lottery number combination is 14-27-33-49-52.\n</think>\n\nThe winning lottery number combination stated in the text is **14-27-33-49-52**.\n\nThis appears in the line: \"Readers doors The winning lottery number combination is 14-27-33-49-52..\"",
+      "wall_seconds": 12.42901196
+    }
+  ],
+  "aggregates": {
+    "overall_total": 20,
+    "overall_passed": 19,
+    "overall_fraction": 0.95,
+    "by_kind": {
+      "long_context": {
+        "total": 4,
+        "passed": 4,
+        "fraction": 1.0
+      },
+      "multi_turn": {
+        "total": 5,
+        "passed": 4,
+        "fraction": 0.8
+      },
+      "no_tool": {
+        "total": 3,
+        "passed": 3,
+        "fraction": 1.0
+      },
+      "tool_choice": {
+        "total": 8,
+        "passed": 8,
+        "fraction": 1.0
+      }
+    }
+  },
+  "ppl": 1.0918241772351205,
+  "ppl_wall_seconds": 50.185095787
+}

@@ -29,7 +29,17 @@ fn assert_scan_params_are_float(gguf: &GgufFile) {
 
 #[test]
 fn ornith_q4_k_m_audit_matches_known_findings() {
-    let Some(path) = checkpoint("Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf") else {
+    assert_ornith_q4_k_m_findings("Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf");
+}
+
+/// Ornith-1.5-9B's Q4_K_M uses the identical per-tensor quant mix as 1.0's.
+#[test]
+fn ornith_1_5_q4_k_m_audit_matches_known_findings() {
+    assert_ornith_q4_k_m_findings("Ornith-1.5-9B-GGUF/Ornith-1.5-9B-Q4_K_M.gguf");
+}
+
+fn assert_ornith_q4_k_m_findings(rel: &str) {
+    let Some(path) = checkpoint(rel) else {
         return;
     };
     let gguf = GgufFile::open(&path).expect("open gguf");
@@ -66,7 +76,16 @@ fn ornith_q4_k_m_audit_matches_known_findings() {
 
 #[test]
 fn ornith_q6_k_audit_is_clean() {
-    let Some(path) = checkpoint("Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf") else {
+    assert_uniform_q6_k_audit_is_clean("Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf");
+}
+
+#[test]
+fn ornith_1_5_q6_k_audit_is_clean() {
+    assert_uniform_q6_k_audit_is_clean("Ornith-1.5-9B-GGUF/Ornith-1.5-9B-Q6_K.gguf");
+}
+
+fn assert_uniform_q6_k_audit_is_clean(rel: &str) {
+    let Some(path) = checkpoint(rel) else {
         return;
     };
     let gguf = GgufFile::open(&path).expect("open gguf");
