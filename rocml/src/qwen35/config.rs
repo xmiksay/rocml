@@ -4,7 +4,7 @@
 //! layout (verified against a real Qwen3.5-2B-Q8_0.gguf and against Crane's
 //! independent implementation of the same architecture).
 
-use rocml_core::gguf::GgufFile;
+use rocml_core::gguf::{GgufError, GgufFile};
 
 use crate::error::RocmlError;
 
@@ -18,6 +18,8 @@ pub enum LayerKind {
 
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {
+    /// Forward-pass layers only — excludes trailing MTP blocks, see
+    /// [`main_block_count`].
     pub block_count: u32,
     pub embedding_length: u32,
     pub feed_forward_length: u32,
@@ -63,7 +65,12 @@ impl Qwen35Config {
             });
         }
 
-        let block_count = gguf.get_u32("qwen35.block_count")?;
+        let nextn_layers = match gguf.get_u32("qwen35.nextn_predict_layers") {
+            Ok(n) => n,
+            Err(GgufError::MissingKey(_)) => 0,
+            Err(e) => return Err(e.into()),
+        };
+        let block_count = main_block_count(gguf.get_u32("qwen35.block_count")?, nextn_layers)?;
         let embedding_length = gguf.get_u32("qwen35.embedding_length")?;
         let feed_forward_length = gguf.get_u32("qwen35.feed_forward_length")?;
         let head_count = gguf.get_u32("qwen35.attention.head_count")?;
@@ -198,5 +205,44 @@ impl Qwen35Config {
 
     pub fn kv_dim(&self) -> u32 {
         self.head_count_kv * self.head_dim
+    }
+}
+
+/// `qwen35.block_count` counts every `blk.N` in the file, including trailing
+/// multi-token-prediction draft blocks (`nextn_predict_layers`, e.g.
+/// Ornith-1.5-9B's `blk.32`), which llama.cpp's `n_layer()` also excludes.
+/// An MTP block carries ordinary attention/FFN tensors and no `ssm_a`, so
+/// counting it would load cleanly and silently run the draft head as an
+/// extra full-attention layer.
+fn main_block_count(block_count: u32, nextn_layers: u32) -> Result<u32, RocmlError> {
+    block_count
+        .checked_sub(nextn_layers)
+        .filter(|&n| n > 0)
+        .ok_or_else(|| {
+            RocmlError::Config(format!(
+                "nextn_predict_layers {nextn_layers} leaves no forward-pass layers out of \
+                 block_count {block_count}"
+            ))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::main_block_count;
+
+    #[test]
+    fn no_mtp_blocks_keeps_every_layer() {
+        assert_eq!(main_block_count(32, 0).unwrap(), 32);
+    }
+
+    #[test]
+    fn trailing_mtp_block_is_excluded() {
+        assert_eq!(main_block_count(33, 1).unwrap(), 32);
+    }
+
+    #[test]
+    fn mtp_blocks_covering_every_layer_are_rejected() {
+        assert!(main_block_count(1, 1).is_err());
+        assert!(main_block_count(1, 2).is_err());
     }
 }
