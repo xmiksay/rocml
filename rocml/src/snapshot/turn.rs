@@ -16,23 +16,46 @@ use std::time::Instant;
 
 use rocml_core::tokenizer::BpeTokenizer;
 
-use super::{KvConfigStamp, ModelStamp, SnapshotStore};
+use super::{KvConfigStamp, ModelStamp, SnapshotStore, SnapshotTier};
 use crate::error::RocmlError;
 use crate::generate::{generate_sampled_with_stop_resumed, GenerateStats};
 use crate::model::Model;
+use crate::qwen35::forward::RewindSlot;
 use crate::sample::SamplingParams;
+
+/// Which tier a turn's prefix reuse came from — see `crate::snapshot`'s
+/// module doc for the three tiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HitSource {
+    Gpu,
+    Ram,
+    Disk,
+}
+
+impl HitSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gpu => "gpu",
+            Self::Ram => "ram",
+            Self::Disk => "disk",
+        }
+    }
+}
 
 pub struct TurnOutcome {
     pub stats: GenerateStats,
     /// Tokens reused from a restored snapshot (0 means no hit, or a
     /// dense/non-hybrid model where snapshots don't apply).
     pub reused_prefix: u32,
-    /// Wall time spent H2D-restoring a snapshot (0 on a miss).
+    /// Where `reused_prefix` came from; `None` on a miss.
+    pub hit_source: Option<HitSource>,
+    /// Wall time spent restoring (a GPU rewind, or an H2D snapshot copy);
+    /// 0 on a miss.
     pub restore_seconds: f64,
-    /// Wall time spent D2H-capturing snapshots this turn — usually one
-    /// (end-of-turn), more for a long prefill that crossed a 4096-token
-    /// boundary (`rocml-cli bench --turns` reports both separately so
-    /// per-turn overhead is visible).
+    /// Wall time spent saving state this turn: the GPU rewind points (cheap)
+    /// plus whatever host captures the policy in [`run_turn`] took
+    /// (`rocml-cli bench --turns` reports both separately so per-turn
+    /// overhead is visible).
     pub capture_seconds: f64,
 }
 
@@ -60,6 +83,22 @@ pub struct TurnOutcome {
 /// no-op — only the two pre-existing capture points fire, matching the
 /// pre-issue-#12 behavior (still useful for thinking-off models and plain
 /// regeneration, which don't need this).
+///
+/// **Tier policy.** With a `Some` store, the hybrid model's GPU rewind
+/// points (`qwen35::forward::rewind`) are consulted first — a growing
+/// single-session conversation hits there every turn with no host traffic —
+/// and the RAM/disk store only on a GPU miss (a second conversation, an
+/// edited history, a restarted server with `--snapshot-dir`). Saves per
+/// turn: the stable boundary goes to the GPU `StableBoundary` slot *and*
+/// the store as its pinned entry; the end of turn goes to the GPU
+/// `EndOfTurn` slot (and to the store, pinned, only when the caller passed
+/// no `stable_boundary`, so the store always holds exactly the one snapshot
+/// the next turn is expected to hit); the periodic 4096-token mid-prefill
+/// capture is taken only when the RAM budget can hold it beside the pinned
+/// entry (it is crash/abort insurance for a long prefill, not something
+/// worth a multi-GB D2H copy that would be evicted before it's ever used).
+/// The prompt-end capture the pre-GPU-tier design took is gone: it's
+/// covered by the end-of-turn point in every case a next turn can match.
 #[allow(clippy::too_many_arguments)]
 pub fn run_turn(
     model: &mut Model,
@@ -75,16 +114,31 @@ pub fn run_turn(
     stable_boundary: Option<u32>,
     mut on_text: impl FnMut(&str),
 ) -> Result<TurnOutcome, RocmlError> {
-    model.reset()?;
     let is_hybrid = model.as_hybrid().is_some();
+    let snapshots_on = is_hybrid && store.is_some();
 
     let mut reused_prefix = 0u32;
     let mut restore_seconds = 0.0;
-    if is_hybrid {
-        let hit = store
-            .as_deref_mut()
-            .and_then(|s| s.lookup(model_stamp, kv_config, full_prompt_ids));
-        if let Some(snap) = hit {
+    let mut hit_source = None;
+    if snapshots_on {
+        let start = Instant::now();
+        let hybrid = model.as_hybrid_mut().expect("is_hybrid checked above");
+        if let Some(pos) = hybrid.rewind_to_prefix(full_prompt_ids)? {
+            restore_seconds = start.elapsed().as_secs_f64();
+            reused_prefix = pos;
+            hit_source = Some(HitSource::Gpu);
+        }
+    }
+    if hit_source.is_none() {
+        model.reset()?;
+        let hit = if snapshots_on {
+            store
+                .as_deref_mut()
+                .and_then(|s| s.lookup_with_tier(model_stamp, kv_config, full_prompt_ids))
+        } else {
+            None
+        };
+        if let Some((snap, tier)) = hit {
             let start = Instant::now();
             model
                 .as_hybrid_mut()
@@ -92,22 +146,37 @@ pub fn run_turn(
                 .restore_snapshot(&snap)?;
             restore_seconds = start.elapsed().as_secs_f64();
             reused_prefix = snap.position;
+            hit_source = Some(match tier {
+                SnapshotTier::Ram => HitSource::Ram,
+                SnapshotTier::Disk => HitSource::Disk,
+            });
         }
     }
 
     let mut capture_seconds = 0.0;
     let prefill_boundary = |m: &mut Model, processed: usize| {
-        let (Some(s), Some(hybrid)) = (store.as_deref_mut(), m.as_hybrid()) else {
+        let (Some(s), Some(hybrid)) = (store.as_deref_mut(), m.as_hybrid_mut()) else {
             return;
         };
         let start = Instant::now();
-        match hybrid.capture_snapshot(full_prompt_ids[..processed].to_vec()) {
-            Ok(snap) => {
-                capture_seconds += start.elapsed().as_secs_f64();
-                s.insert(model_stamp.clone(), *kv_config, snap);
+        let prefix = &full_prompt_ids[..processed];
+        if stable_boundary.is_some_and(|b| b as usize == processed) {
+            if let Err(e) = hybrid.save_rewind_point(RewindSlot::StableBoundary, prefix.to_vec()) {
+                eprintln!("snapshot: stable-boundary GPU rewind save failed: {e}");
             }
-            Err(e) => eprintln!("snapshot: prefill-boundary capture failed: {e}"),
+            if s.would_keep_pinned(hybrid.snapshot_byte_size()) {
+                match hybrid.capture_snapshot(prefix.to_vec()) {
+                    Ok(snap) => s.insert_pinned(model_stamp.clone(), *kv_config, snap),
+                    Err(e) => eprintln!("snapshot: stable-boundary capture failed: {e}"),
+                }
+            }
+        } else if processed < full_prompt_ids.len() && s.would_keep(hybrid.snapshot_byte_size()) {
+            match hybrid.capture_snapshot(prefix.to_vec()) {
+                Ok(snap) => s.insert(model_stamp.clone(), *kv_config, snap),
+                Err(e) => eprintln!("snapshot: prefill-boundary capture failed: {e}"),
+            }
         }
+        capture_seconds += start.elapsed().as_secs_f64();
     };
 
     let mut decoded_so_far = String::new();
@@ -128,22 +197,30 @@ pub fn run_turn(
         },
     )?;
 
-    if let (Some(s), Some(hybrid)) = (store, model.as_hybrid()) {
+    if let (Some(s), Some(hybrid)) = (store, model.as_hybrid_mut()) {
         let mut full_tokens = full_prompt_ids.to_vec();
         full_tokens.extend_from_slice(&stats.generated_ids);
+        // A stop-string ending pushes its last token without running it
+        // through the model, so the cache is one token short of
+        // prompt + generated; save the prefix it actually holds.
+        full_tokens.truncate(hybrid.position() as usize);
         let start = Instant::now();
-        match hybrid.capture_snapshot(full_tokens) {
-            Ok(snap) => {
-                capture_seconds += start.elapsed().as_secs_f64();
-                s.insert(model_stamp.clone(), *kv_config, snap);
-            }
-            Err(e) => eprintln!("snapshot: end-of-turn capture failed: {e}"),
+        if let Err(e) = hybrid.save_rewind_point(RewindSlot::EndOfTurn, full_tokens.clone()) {
+            eprintln!("snapshot: end-of-turn GPU rewind save failed: {e}");
         }
+        if stable_boundary.is_none() && s.would_keep_pinned(hybrid.snapshot_byte_size()) {
+            match hybrid.capture_snapshot(full_tokens) {
+                Ok(snap) => s.insert_pinned(model_stamp.clone(), *kv_config, snap),
+                Err(e) => eprintln!("snapshot: end-of-turn capture failed: {e}"),
+            }
+        }
+        capture_seconds += start.elapsed().as_secs_f64();
     }
 
     Ok(TurnOutcome {
         stats,
         reused_prefix,
+        hit_source,
         restore_seconds,
         capture_seconds,
     })

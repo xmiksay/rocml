@@ -54,6 +54,19 @@ impl Model {
             &snap.attn,
         )?;
         self.pos = snap.position;
+        // Positions `[0, snap.position)` were just rewritten from host
+        // bytes, so no GPU rewind point's prefix can be trusted any more.
+        self.invalidate_rewind_points();
         Ok(())
+    }
+
+    /// Exactly what [`Self::capture_snapshot`]'s result would report as
+    /// `SnapshotData::byte_size()` at the current position, with no D2H
+    /// traffic — `run_turn` uses it to skip a periodic host capture the RAM
+    /// store couldn't keep anyway.
+    pub fn snapshot_byte_size(&self) -> usize {
+        self.cache
+            .snapshot_byte_size(self.config.head_count_kv, self.config.head_dim, self.pos)
+            + self.pos as usize * 4
     }
 }

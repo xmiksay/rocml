@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
-use rocml::snapshot::turn::run_turn;
+use rocml::snapshot::turn::{run_turn, HitSource};
 use rocml::snapshot::{KvConfigStamp, ModelStamp, SnapshotStore};
 use rocml::{GenerateStats, LoadOptions, Model, SamplingParams};
 use rocml_core::tokenizer::BpeTokenizer;
@@ -211,6 +211,7 @@ fn run_job(
     )?;
     if outcome.reused_prefix > 0 {
         tracing::info!(
+            source = outcome.hit_source.map_or("none", HitSource::as_str),
             reused_tokens = outcome.reused_prefix,
             prompt_tokens = job.prompt_ids.len(),
             restore_ms = outcome.restore_seconds * 1000.0,

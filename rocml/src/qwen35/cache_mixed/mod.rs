@@ -19,8 +19,11 @@
 //! `bulk_cap`-sized allocation (issue #12).
 
 mod chunk;
+mod rewind;
 mod rot_sim;
 mod snapshot;
+
+pub use rewind::MixedWindowRewind;
 
 use half::f16;
 use rocml_hip::DeviceBuffer;

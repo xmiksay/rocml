@@ -15,3 +15,6 @@ pub mod rotational_kv;
 
 #[allow(dead_code)] // only `llama_layer_diff.rs`/`llama_ref_convert.rs` use this today.
 pub mod llama_ref;
+
+#[allow(dead_code)] // only the `snapshot_equivalence`/`snapshot_rewind*` tests use this today.
+pub mod snapshot_check;

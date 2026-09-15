@@ -5,7 +5,7 @@
 //! `--no-snapshots` to see the snapshot layer's effect on later turns'
 //! prefill cost.
 
-use rocml::snapshot::turn::run_turn;
+use rocml::snapshot::turn::{run_turn, HitSource};
 use rocml::snapshot::KvConfigStamp;
 use rocml::{LoadOptions, RocmlError, SamplingParams};
 use serde_json::json;
@@ -24,7 +24,11 @@ pub fn run(args: &BenchArgs, turns: usize) -> Result<(), RocmlError> {
     }
     let resolved = args.model_args.resolve()?;
     let kv_cache: rocml::KvCacheMode = args.model_args.kv_cache.into();
-    let needed = turns * (FIXED_USER_MESSAGE_TOKENS + args.turn_decode_tokens) + 512;
+    // `--depth N` seeds the conversation with N synthetic tokens before turn
+    // 1, so later turns measure snapshot reuse at a realistic context depth
+    // rather than from a 64-token start.
+    let depth = args.depth.unwrap_or(0);
+    let needed = depth + turns * (FIXED_USER_MESSAGE_TOKENS + args.turn_decode_tokens) + 512;
     let ctx_request = args.ctx.unwrap_or(needed).max(needed).max(1);
     let ctx = rocml::registry::clamp_ctx(
         ctx_request,
@@ -60,11 +64,15 @@ pub fn run(args: &BenchArgs, turns: usize) -> Result<(), RocmlError> {
 
     let fixed_user_message = synthetic_tokens(&loaded, FIXED_USER_MESSAGE_TOKENS);
     let sampling = SamplingParams::greedy();
-    let mut conversation: Vec<u32> = Vec::new();
+    let mut conversation: Vec<u32> = if depth > 0 {
+        synthetic_tokens(&loaded, depth)
+    } else {
+        Vec::new()
+    };
     let mut rows = Vec::new();
 
     eprintln!(
-        "simulating {turns} turns ({} decode tokens/turn, snapshots {})",
+        "simulating {turns} turns ({} decode tokens/turn, starting at depth {depth}, snapshots {})",
         args.turn_decode_tokens,
         if args.no_snapshots { "off" } else { "on" },
     );
@@ -90,9 +98,10 @@ pub fn run(args: &BenchArgs, turns: usize) -> Result<(), RocmlError> {
             |_| {},
         )?;
         conversation.extend_from_slice(&outcome.stats.generated_ids);
+        let source = outcome.hit_source.map_or("none", HitSource::as_str);
         eprintln!(
-            "  turn {turn}/{turns}: conv_len {}, reused {} tok, prefill {} tok in {:.1}ms \
-             ({:.1} tok/s), decode {:.1} tok/s, restore {:.2}ms, capture {:.2}ms",
+            "  turn {turn}/{turns}: conv_len {}, reused {} tok ({source}), prefill {} tok in \
+             {:.1}ms ({:.1} tok/s), decode {:.1} tok/s, restore {:.2}ms, capture {:.2}ms",
             conversation.len(),
             outcome.reused_prefix,
             outcome.stats.prompt_tokens,
@@ -106,6 +115,7 @@ pub fn run(args: &BenchArgs, turns: usize) -> Result<(), RocmlError> {
             "turn": turn,
             "conversation_tokens": conversation.len(),
             "reused_prefix_tokens": outcome.reused_prefix,
+            "hit_source": source,
             "prefill_tokens": outcome.stats.prompt_tokens,
             "prefill_ms": outcome.stats.prompt_seconds * 1000.0,
             "prefill_tok_s": outcome.stats.prompt_tokens_per_sec(),
@@ -130,6 +140,7 @@ pub fn run(args: &BenchArgs, turns: usize) -> Result<(), RocmlError> {
         let out = json!({
             "model": common::model_id(&resolved),
             "turns": turns,
+            "depth": depth,
             "snapshots_enabled": !args.no_snapshots,
             "ram_used_mb": ram_used_mb,
             "disk_used_mb": disk_used_mb,
@@ -142,18 +153,11 @@ pub fn run(args: &BenchArgs, turns: usize) -> Result<(), RocmlError> {
 }
 
 /// A fixed, deterministic synthetic "user message" of exactly `target_len`
-/// tokens — same technique as `cmd_bench::synthetic_prompt`, duplicated
-/// rather than shared since that one is private to this crate's other
-/// module and the two have slightly different growth semantics (this one is
-/// appended repeatedly across turns, not generated once).
+/// tokens, appended repeatedly across turns (and used to seed `--depth`).
 fn synthetic_tokens(loaded: &common::Loaded, target_len: usize) -> Vec<u32> {
-    const FILLER: &str = "Please review the update above and suggest the next concrete step. ";
-    let mut text = String::with_capacity(FILLER.len() * (target_len / 4 + 4));
-    let mut ids = Vec::new();
-    while ids.len() < target_len {
-        text.push_str(FILLER);
-        ids = loaded.tokenizer.encode(&text);
-    }
-    ids.truncate(target_len.max(1));
-    ids
+    common::synthetic_tokens(
+        loaded,
+        "Please review the update above and suggest the next concrete step. ",
+        target_len,
+    )
 }

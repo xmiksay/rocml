@@ -101,6 +101,22 @@ impl MixedAttnPlane {
         })
     }
 
+    /// Exactly what [`Self::capture`]'s result would report as
+    /// `AttnLayerBytes::byte_size()`, without doing the D2H copy — lets
+    /// `run_turn` decide whether a host capture is worth taking before
+    /// paying for it.
+    pub fn snapshot_byte_size(&self) -> usize {
+        let heads = self.n_kv_heads as usize;
+        let head_dim = self.head_dim as usize;
+        let evicted_blocks = self.layout.evicted_blocks() as usize;
+        let evicted_len = evicted_blocks * self.window_len as usize;
+        (self.sink_k.len() + self.sink_v.len() + self.window_k.len() + self.window_v.len()) * 2
+            + heads * evicted_len * head_dim
+            + heads * evicted_blocks * head_dim * 4
+            + heads * evicted_len * self.v_row_width()
+            + heads * evicted_len * 4
+    }
+
     /// V codes' per-position row width: `head_dim` elements at 8-bit
     /// (`Vec<u8>` reinterpreting the kernel's `signed char` codes), or
     /// `head_dim / 2` packed-nibble bytes at 4-bit — see

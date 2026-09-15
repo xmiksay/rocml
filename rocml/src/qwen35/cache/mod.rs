@@ -14,7 +14,10 @@
 //! a child module purely for the 400-line file cap — see that module's own
 //! doc comment.
 
+mod rewind;
 mod snapshot;
+
+pub use rewind::RewindStorage;
 
 use half::f16;
 use rocml_hip::DeviceBuffer;

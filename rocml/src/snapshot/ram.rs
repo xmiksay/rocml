@@ -3,6 +3,16 @@
 //! entry (capture counts as a write+touch) once `budget_bytes` is exceeded.
 //! `budget_bytes == 0` disables the tier entirely (every insert is a no-op,
 //! every lookup misses) — see `--snapshot-ram-mb 0` in `rocml-serve`/`rocml-cli`.
+//!
+//! One entry at a time may be **pinned** ([`RamStore::insert_pinned`]): the
+//! snapshot the next turn is actually expected to hit (a turn's
+//! render-stable boundary — see `crate::snapshot::turn`). Plain LRU can't
+//! tell it apart from the same turn's later, equally large captures, and at
+//! long context (where only one or two snapshots fit the budget at all)
+//! would evict it first — exactly the failure seen in production at ~78K
+//! tokens under `q4-mixed`, where every turn thereafter missed. A pinned
+//! entry is never evicted; anything that can't fit *beside* it is simply not
+//! stored, and a new pin releases the old one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +31,8 @@ pub struct RamStore {
     used_bytes: usize,
     tick: u64,
     entries: HashMap<SnapshotKey, Entry>,
+    /// See the module doc. Always names a live entry (cleared by `remove`).
+    pinned: Option<SnapshotKey>,
 }
 
 impl RamStore {
@@ -30,6 +42,7 @@ impl RamStore {
             used_bytes: 0,
             tick: 0,
             entries: HashMap::new(),
+            pinned: None,
         }
     }
 
@@ -55,11 +68,31 @@ impl RamStore {
     }
 
     /// Inserts `data` under `(model, kv, position, token hash of the whole
-    /// prefix)`, evicting least-recently-used entries first until the new
-    /// entry fits the budget. A single entry larger than the whole budget is
-    /// simply not stored (never partially evicts everything else for
-    /// nothing) — the RAM tier is a cache, not a durability guarantee.
+    /// prefix)`, evicting least-recently-used *unpinned* entries first until
+    /// the new entry fits the budget. An entry that can't fit beside the
+    /// pinned one (or the whole budget, when nothing is pinned) is simply not
+    /// stored (never partially evicts everything else for nothing) — the RAM
+    /// tier is a cache, not a durability guarantee.
     pub fn insert(&mut self, model: ModelStamp, kv: KvConfigStamp, data: SnapshotData) {
+        self.insert_inner(model, kv, data, false);
+    }
+
+    /// Like [`Self::insert`], but the new entry becomes the store's one
+    /// pinned entry (releasing any previous pin): it is never evicted by a
+    /// later insert, only replaced by the next `insert_pinned`. See the
+    /// module doc for why the snapshot a turn expects the next turn to hit
+    /// needs this protection.
+    pub fn insert_pinned(&mut self, model: ModelStamp, kv: KvConfigStamp, data: SnapshotData) {
+        self.insert_inner(model, kv, data, true);
+    }
+
+    fn insert_inner(
+        &mut self,
+        model: ModelStamp,
+        kv: KvConfigStamp,
+        data: SnapshotData,
+        pin: bool,
+    ) {
         if self.budget_bytes == 0 {
             return;
         }
@@ -74,6 +107,11 @@ impl RamStore {
             chain_hash: ChainHash::of(&data.token_ids),
         };
         self.remove(&key);
+        if pin {
+            self.pinned = None;
+        } else if !self.fits_beside_pinned(bytes) {
+            return;
+        }
         while self.used_bytes + bytes > self.budget_bytes {
             if !self.evict_one() {
                 break;
@@ -82,25 +120,56 @@ impl RamStore {
         let last_used = self.next_tick();
         self.used_bytes += bytes;
         self.entries.insert(
-            key,
+            key.clone(),
             Entry {
                 data: Arc::new(data),
                 bytes,
                 last_used,
             },
         );
+        if pin {
+            self.pinned = Some(key);
+        }
+    }
+
+    /// Whether an entry of `bytes` could be stored without touching the
+    /// pinned entry (`false` when the tier is disabled) — lets a caller skip
+    /// the D2H capture of a snapshot this store would refuse anyway.
+    pub fn fits_beside_pinned(&self, bytes: usize) -> bool {
+        let pinned_bytes = self
+            .pinned
+            .as_ref()
+            .and_then(|k| self.entries.get(k))
+            .map_or(0, |e| e.bytes);
+        self.budget_bytes > 0 && bytes + pinned_bytes <= self.budget_bytes
+    }
+
+    /// Whether [`Self::insert_pinned`] would keep an entry of `bytes` (a pin
+    /// displaces everything else, so only the whole budget bounds it).
+    pub fn can_pin(&self, bytes: usize) -> bool {
+        self.budget_bytes > 0 && bytes <= self.budget_bytes
+    }
+
+    /// Position of the pinned entry, if any.
+    pub fn pinned_position(&self) -> Option<u32> {
+        self.pinned.as_ref().map(|k| k.position)
     }
 
     fn remove(&mut self, key: &SnapshotKey) {
         if let Some(entry) = self.entries.remove(key) {
             self.used_bytes -= entry.bytes;
         }
+        if self.pinned.as_ref() == Some(key) {
+            self.pinned = None;
+        }
     }
 
+    /// Evicts the least-recently-used *unpinned* entry; `false` if none.
     fn evict_one(&mut self) -> bool {
         let victim = self
             .entries
             .iter()
+            .filter(|(k, _)| self.pinned.as_ref() != Some(*k))
             .min_by_key(|(_, e)| e.last_used)
             .map(|(k, _)| k.clone());
         match victim {

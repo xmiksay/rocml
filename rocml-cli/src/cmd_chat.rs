@@ -15,7 +15,7 @@ use std::io::{self, BufRead, Write};
 
 use clap::Args;
 use rocml::chat::{Message, RenderOpts, ScanEvent, StreamScanner, ToolCall};
-use rocml::snapshot::turn::{run_turn, stable_boundary_tokens};
+use rocml::snapshot::turn::{run_turn, stable_boundary_tokens, HitSource};
 use rocml::snapshot::KvConfigStamp;
 use rocml::{LoadOptions, RocmlError};
 
@@ -196,7 +196,9 @@ pub fn run(args: &ChatArgs) -> Result<(), RocmlError> {
         println!();
         if outcome.reused_prefix > 0 {
             eprintln!(
-                "[snapshot hit: reused {} of {} prompt tokens, restore {:.1}ms, capture {:.1}ms]",
+                "[snapshot hit ({}): reused {} of {} prompt tokens, restore {:.1}ms, capture \
+                 {:.1}ms]",
+                outcome.hit_source.map_or("none", HitSource::as_str),
                 outcome.reused_prefix,
                 prompt_ids.len(),
                 outcome.restore_seconds * 1000.0,

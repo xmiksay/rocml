@@ -20,13 +20,19 @@
 //! Real hardware + the real Qwen3.5-2B-Q8_0 checkpoint required; skips
 //! itself if absent. Run via `make test-model` (`--release`).
 
-use rocml::snapshot::turn::run_turn;
+use rocml::snapshot::turn::{run_turn, HitSource};
 use rocml::snapshot::{KvConfigStamp, ModelStamp, SnapshotStore};
 use rocml::{KvCacheMode, LoadOptions, Model, SamplingParams};
 use rocml_core::testpaths::checkpoint;
 
+mod support;
+
+use support::snapshot_check::{
+    assert_continuations_match, assert_logits_close, greedy_continue, synthetic_prompt,
+    CONTINUATION_LEN,
+};
+
 const GGUF_REL: &str = "Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf";
-const CONTINUATION_LEN: usize = 8;
 /// Relative tolerance on the final logits — see the module doc for why this
 /// is near-exact rather than bitwise (reduction-order sensitivity from
 /// re-chunking at a non-128-aligned split), and issue #1's own text for why
@@ -45,75 +51,6 @@ const LOGITS_REL_TOL: f32 = 1e-2;
 /// top-2 gap was already this small (a real divergence has a much larger
 /// gap and fails the test).
 const NEAR_TIE_RELATIVE_GAP: f32 = 1e-2;
-
-fn synthetic_prompt(len: usize, vocab_size: u32) -> Vec<u32> {
-    (0..len as u32).map(|i| (i * 37 + 5) % vocab_size).collect()
-}
-
-fn top2_gap(logits: &[f32]) -> f32 {
-    let (mut best, mut second) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for &v in logits {
-        if v > best {
-            second = best;
-            best = v;
-        } else if v > second {
-            second = v;
-        }
-    }
-    (best - second) / best.abs().max(1.0)
-}
-
-fn argmax(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))
-        .map(|(i, _)| i as u32)
-        .expect("logits must be non-empty")
-}
-
-fn assert_logits_close(actual: &[f32], expected: &[f32], label: &str) {
-    assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
-    for (i, (&got, &want)) in actual.iter().zip(expected).enumerate() {
-        let diff = (got - want).abs();
-        let tol = LOGITS_REL_TOL * want.abs().max(1.0);
-        assert!(
-            diff <= tol,
-            "{label}[{i}]: got {got}, want {want} (diff {diff}, tol {tol})"
-        );
-    }
-}
-
-fn greedy_continue(model: &mut Model, mut logits: Vec<f32>, n: usize) -> Vec<(u32, f32)> {
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        let gap = top2_gap(&logits);
-        let next = argmax(&logits);
-        out.push((next, gap));
-        logits = model.forward_token(next).expect("forward_token failed");
-    }
-    out
-}
-
-fn assert_continuations_match(label: &str, full: &[(u32, f32)], restored: &[(u32, f32)]) {
-    for (step, ((full_tok, full_gap), (restored_tok, restored_gap))) in
-        full.iter().zip(restored).enumerate()
-    {
-        if full_tok == restored_tok {
-            continue;
-        }
-        assert!(
-            full_gap.abs() <= NEAR_TIE_RELATIVE_GAP || restored_gap.abs() <= NEAR_TIE_RELATIVE_GAP,
-            "{label} continuation step {step}: full-prefill picked {full_tok} (gap {full_gap}), \
-             restored picked {restored_tok} (gap {restored_gap}) — gap too large to be a \
-             documented near-tie"
-        );
-        eprintln!(
-            "{label} continuation step {step}: documented near-tie flip, full={full_tok} (gap \
-             {full_gap}) vs restored={restored_tok} (gap {restored_gap})"
-        );
-    }
-}
 
 /// Runs the equivalence check for one `(prompt, split)` pair: `model_full`
 /// does the reference full prefill; `model_restored` is deliberately dirtied
@@ -173,9 +110,15 @@ fn run_split_case(
     assert_logits_close(
         &restored_logits,
         &full_logits,
+        LOGITS_REL_TOL,
         &format!("{label} final logits"),
     );
-    assert_continuations_match(&label, &full_continuation, &restored_continuation);
+    assert_continuations_match(
+        &label,
+        &full_continuation,
+        &restored_continuation,
+        NEAR_TIE_RELATIVE_GAP,
+    );
 }
 
 /// Long enough to cross the 4096-token auto-snapshot boundary.
@@ -332,6 +275,10 @@ fn check_run_turn_reuses_a_prior_end_of_turn_snapshot(path: &std::path::Path) {
         turn1_prompt.len() + outcome1.stats.generated_ids.len(),
         "turn 2 should reuse exactly turn 1's whole final conversation length"
     );
+    // Same process, same model: the end-of-turn state is still resident on
+    // the GPU, so the hot tier (not the host store) serves it. The host
+    // tiers' own hit path is covered by `snapshot_rewind.rs`.
+    assert_eq!(outcome2.hit_source, Some(HitSource::Gpu));
 }
 
 /// One `#[test]` running every scenario above in sequence — deliberately not
