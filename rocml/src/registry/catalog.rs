@@ -61,15 +61,34 @@ const QWEN35_NON_THINKING_SAMPLING: SamplingParams = SamplingParams {
 /// The compiled-in catalog. Every entry's `hf_repo`/`hf_file` was verified
 /// live against the Hugging Face API before being hardcoded here (see the
 /// task report for the verification transcript); nothing below is a guess.
+/// Ornith-1.5-9B's Q6_K entry — pulled out to a named const (rather than
+/// inlined in [`REGISTRY`] like every other entry) purely so `ornith-9b`
+/// below can alias it via struct-update syntax instead of duplicating the
+/// same seven fields a second time.
+const ORNITH_1_5_9B_Q6: ModelSpec = ModelSpec {
+    name: "ornith-1.5-9b-q6",
+    family: ModelFamily::Qwen35Hybrid,
+    gguf_rel: "Ornith-1.5-9B-GGUF/Ornith-1.5-9B-Q6_K.gguf",
+    hf_repo: "ornith-ai/Ornith-1.5-9B-GGUF",
+    hf_file: "Ornith-1.5-9B-Q6_K.gguf",
+    default_ctx: 8192,
+    sampling: QWEN_THINKING_SAMPLING,
+    thinking_default: true,
+};
+
 pub const REGISTRY: &[ModelSpec] = &[
     ModelSpec {
-        name: "ornith-9b",
+        name: "ornith-1.0-9b",
         family: ModelFamily::Qwen35Hybrid,
-        // Q4_K_M promoted to the default entry by the issue-15 agentic eval
-        // (bench/eval/results/): identical agentic score to Q6_K (19/20,
-        // same single scenario-design failure), PPL 1.0807 vs 1.0800, for
-        // ~2x decode throughput (34.4 vs 18.6 tok/s) and ~1.7GB more KV
-        // headroom. Q6_K stays available as `ornith-9b-q6`.
+        // Q4_K_M is Ornith-1.0-9B's own default quant, promoted over Q6_K by
+        // the issue-15 agentic eval (bench/eval/results/): identical agentic
+        // score (19/20, same single scenario-design failure), PPL 1.0807 vs
+        // 1.0800, for ~2x decode throughput (34.4 vs 18.6 tok/s) and ~1.7GB
+        // more KV headroom. Q6_K stays available as `ornith-1.0-9b-q6`.
+        // (This entry was named `ornith-9b` before `ornith-9b` was
+        // repurposed as an alias for `ORNITH_1_5_9B_Q6` below — every
+        // historical measurement labeled `ornith-9b` elsewhere in this repo
+        // refers to this checkpoint.)
         gguf_rel: "Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf",
         // `deepreinforce-ai/Ornith-1.0-9B-GGUF` (the design doc's guess)
         // redirects here — the org was renamed, not an unofficial re-upload.
@@ -92,14 +111,15 @@ pub const REGISTRY: &[ModelSpec] = &[
         thinking_default: true,
     },
     ModelSpec {
-        name: "ornith-9b-q6",
+        name: "ornith-1.0-9b-q6",
         family: ModelFamily::Qwen35Hybrid,
         gguf_rel: "Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf",
         hf_repo: "ornith-ai/Ornith-1.0-9B-GGUF",
         hf_file: "ornith-1.0-9b-Q6_K.gguf",
         // Quality-reference variant (the #15 eval's fp16-KV baseline was
         // recorded on this quant); slower — the q6_k gemv is ALU-bound,
-        // see issue #7.
+        // see issue #7. Named `ornith-9b-q6` before the `ornith-9b` rename
+        // below — see that entry's own comment.
         default_ctx: 8192,
         sampling: SamplingParams {
             temperature: 0.6,
@@ -128,15 +148,18 @@ pub const REGISTRY: &[ModelSpec] = &[
         // Card: the assistant turn opens with a `<think>` block by default.
         thinking_default: true,
     },
+    ORNITH_1_5_9B_Q6,
+    // `ornith-9b` is the engine's default-model name — kept short since
+    // it's the one most examples/docs type — and currently tracks
+    // Ornith-1.5-9B's Q6_K via this alias (identical `ModelSpec`, just a
+    // different `name`). It previously named Ornith-1.0-9B's Q4_K_M
+    // directly (now `ornith-1.0-9b` above); re-pointing it here was a
+    // deliberate naming decision, not a conclusion this repo's eval data
+    // draws on its own — see `ornith-1.0-9b`'s own comment and
+    // `../../README.md`'s Model registry section.
     ModelSpec {
-        name: "ornith-1.5-9b-q6",
-        family: ModelFamily::Qwen35Hybrid,
-        gguf_rel: "Ornith-1.5-9B-GGUF/Ornith-1.5-9B-Q6_K.gguf",
-        hf_repo: "ornith-ai/Ornith-1.5-9B-GGUF",
-        hf_file: "Ornith-1.5-9B-Q6_K.gguf",
-        default_ctx: 8192,
-        sampling: QWEN_THINKING_SAMPLING,
-        thinking_default: true,
+        name: "ornith-9b",
+        ..ORNITH_1_5_9B_Q6
     },
     ModelSpec {
         name: "qwen3.5-2b",
@@ -225,6 +248,21 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), len_before, "duplicate name in REGISTRY");
+    }
+
+    #[test]
+    fn default_alias_matches_its_aliased_entry() {
+        let alias = REGISTRY.iter().find(|s| s.name == "ornith-9b").unwrap();
+        let target = REGISTRY
+            .iter()
+            .find(|s| s.name == "ornith-1.5-9b-q6")
+            .unwrap();
+        assert_eq!(alias.gguf_rel, target.gguf_rel);
+        assert_eq!(alias.hf_repo, target.hf_repo);
+        assert_eq!(alias.hf_file, target.hf_file);
+        assert_eq!(alias.default_ctx, target.default_ctx);
+        assert_eq!(alias.sampling, target.sampling);
+        assert_eq!(alias.thinking_default, target.thinking_default);
     }
 
     #[test]

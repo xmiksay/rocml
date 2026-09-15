@@ -128,12 +128,12 @@ bench-profile-json:
 # re-scoring already-graded scenarios.
 eval:
 	cargo run --release -p rocml-cli -- eval \
-		--model ornith-9b-q6 --ctx 16384 \
+		--model ornith-1.0-9b-q6 --ctx 16384 \
 		--label ornith-q6k-fp16kv \
 		--out bench/eval/results/ornith-q6k-fp16kv.json \
 		--resume
 	cargo run --release -p rocml-cli -- eval \
-		--model ornith-9b --ctx 16384 \
+		--model ornith-1.0-9b --ctx 16384 \
 		--label ornith-q4km-fp16kv \
 		--out bench/eval/results/ornith-q4km-fp16kv.json \
 		--resume
@@ -243,7 +243,7 @@ rotational-kv-sim-parity:
 # degradation is STOP.
 eval-rotational-v3:
 	cargo run --release -p rocml-cli -- eval \
-		--model ornith-9b --ctx 16384 \
+		--model ornith-1.0-9b --ctx 16384 \
 		--kv-cache q8 --kv-rot-sim 3 \
 		--label ornith-q4km-rotv3bpw \
 		--out bench/eval/results/ornith-q4km-rotv3bpw.json \
@@ -259,6 +259,6 @@ eval-rotational-v3:
 # the recorded healthy-build baseline in docs/llama-diff.md. Diagnostic
 # tool, not a correctness gate, hence `--ignored`. Skips itself if either
 # the checkpoint or LLAMA_DUMP is missing.
-LLAMA_DUMP ?= bench/eval/llama_ref/ornith-9b-ref.txt
+LLAMA_DUMP ?= bench/eval/llama_ref/ornith-1.0-9b-ref.txt
 llama-layer-diff:
 	LLAMA_DUMP=$(LLAMA_DUMP) cargo test --release -p rocml --test llama_layer_diff -- --ignored --nocapture

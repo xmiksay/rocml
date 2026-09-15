@@ -64,7 +64,7 @@ trailing MTP draft block (`blk.32`) that `Qwen35Config::from_gguf` excludes
 from `block_count`, so its 32 forward-pass layers have the identical
 `full_attention_interval = 4`/`num_v_heads`/`num_k_heads` layout as 1.0's.
 
-### `ornith-1.0-9b-Q4_K_M.gguf` (registry default `ornith-9b`)
+### `ornith-1.0-9b-Q4_K_M.gguf` (registry `ornith-1.0-9b`)
 
 | Category | Tensor(s) | Dtype found | Verdict |
 |---|---|---|---|
@@ -79,15 +79,18 @@ from `block_count`, so its 32 forward-pass layers have the identical
 | Lowest tolerable | `ffn_gate.weight`, `ffn_up.weight` | **Q4_K** uniformly | Compliant (no floor expected) |
 
 **Reconciliation with the issue-15 eval**: the eval (agentic tool-use score
-19/20, PPL 1.0807) already promoted this exact file to the registry default
-over Q6_K, on measured outcomes. Every violation above is real and is
+19/20, PPL 1.0807) already promoted this exact file to be Ornith-1.0-9B's
+own default quant (`ornith-1.0-9b`, originally named `ornith-9b` before that
+name was repurposed as an alias for Ornith-1.5-9B's Q6_K — see the registry
+catalog's own comment) over Q6_K, on measured outcomes. Every violation
+above is real and is
 exactly what a generic, GDN-unaware K-quant converter produces — but the
 eval is outcome-level ground truth and it says this file works. **The eval
 wins**: this is not "the checkpoint is broken", it's "the design-review
 prior turned out to be more conservative than the model needs at this
 scale". Kept as a documented, monitored tradeoff, not fixed by re-quanting.
 
-### `ornith-1.0-9b-Q6_K.gguf` (registry `ornith-9b-q6`)
+### `ornith-1.0-9b-Q6_K.gguf` (registry `ornith-1.0-9b-q6`)
 
 | Category | Dtype found | Verdict |
 |---|---|---|
@@ -190,8 +193,8 @@ tensor is actually loaded:
   Each line names the count and one example tensor, in the same
   `warning: ...` eprintln convention `registry::clamp_ctx`/`forward::Model::load`'s
   VRAM-budget warning already use. **Never fails the load** — this is
-  informational, existing checkpoints (including the registry default,
-  which does violate several rules) must keep loading unchanged.
+  informational, existing checkpoints (including `ornith-1.0-9b`, which
+  does violate several rules) must keep loading unchanged.
 
 Design choice worth calling out: "one step higher than the rest" is
 naturally *scheme-relative* (llama.cpp's real Q4_K_M convention bumps
@@ -215,10 +218,11 @@ The registry (`rocml/src/registry/catalog.rs`) resolves:
 
 | Registry name | `hf_repo` | `hf_file` | Local file | Size match | sha256 match |
 |---|---|---|---|---|---|
-| `ornith-9b` | `ornith-ai/Ornith-1.0-9B-GGUF` | `ornith-1.0-9b-Q4_K_M.gguf` | 5,629,108,704 B | Yes | Yes (`5720d1f6…6087b106`) |
-| `ornith-9b-q6` | `ornith-ai/Ornith-1.0-9B-GGUF` | `ornith-1.0-9b-Q6_K.gguf` | 7,359,259,072 B | Yes | Yes (`33b6f6a3…026e8387`) |
+| `ornith-1.0-9b` | `ornith-ai/Ornith-1.0-9B-GGUF` | `ornith-1.0-9b-Q4_K_M.gguf` | 5,629,108,704 B | Yes | Yes (`5720d1f6…6087b106`) |
+| `ornith-1.0-9b-q6` | `ornith-ai/Ornith-1.0-9B-GGUF` | `ornith-1.0-9b-Q6_K.gguf` | 7,359,259,072 B | Yes | Yes (`33b6f6a3…026e8387`) |
 | `ornith-1.5-9b` | `ornith-ai/Ornith-1.5-9B-GGUF` | `Ornith-1.5-9B-Q4_K_M.gguf` | 5,780,090,816 B | Yes | Yes (`70c11219…07e8fab6`) |
 | `ornith-1.5-9b-q6` | `ornith-ai/Ornith-1.5-9B-GGUF` | `Ornith-1.5-9B-Q6_K.gguf` | 7,558,901,696 B | Yes | Yes (`b6f76e74…81e4154a`) |
+| `ornith-9b` (alias of `ornith-1.5-9b-q6`, the default model — see README's Model registry section) | `ornith-ai/Ornith-1.5-9B-GGUF` | `Ornith-1.5-9B-Q6_K.gguf` | 7,558,901,696 B | Yes | Yes (`b6f76e74…81e4154a`) |
 | `qwen3.5-2b` | `unsloth/Qwen3.5-2B-GGUF` | `Qwen3.5-2B-Q8_0.gguf` | 2,012,012,800 B | Yes | Yes (`1b04acba…1021f2c1`) |
 
 Verified via the HF API (metadata/tree endpoints only — no re-download of

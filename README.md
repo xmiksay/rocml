@@ -28,7 +28,7 @@ rocml is a standalone Rust inference engine for Qwen3.5-hybrid/Ornith and dense 
 - `make bench` — run `rocml-cli bench` against `QWEN_MODEL`, JSON output
 - `make bench-profile` — profiled `bench` run, human-readable roofline table on stdout (`MODEL`/`DEPTH` override which checkpoint/context depth, e.g. `make bench-profile MODEL=ornith-9b DEPTH=8192`)
 - `make bench-profile-json` — same run, machine-readable roofline JSON written to `OUT` (default `bench/profile/$(DEPTH).json`) — see "Observability" below and `docs/prefill-gap-analysis.md`
-- `make eval` — run the agentic quality-eval harness (issue #15) for `ornith-9b-q6`/`ornith-9b` and `ornith-1.5-9b-q6`/`ornith-1.5-9b` (Q6_K/Q4_K_M each) at ctx 16384, writing `bench/eval/results/*.json`
+- `make eval` — run the agentic quality-eval harness (issue #15) for `ornith-1.0-9b-q6`/`ornith-1.0-9b` and `ornith-1.5-9b-q6`/`ornith-1.5-9b` (Q6_K/Q4_K_M each) at ctx 16384, writing `bench/eval/results/*.json`
 
 All cargo invocations are run with `CARGO_BUILD_JOBS=4` to avoid overloading the build machine.
 
@@ -38,8 +38,9 @@ All cargo invocations are run with `CARGO_BUILD_JOBS=4` to avoid overloading the
 
 | Name | Family | File | Default sampling | Thinking |
 |---|---|---|---|---|
-| `ornith-9b` | qwen3.5-hybrid | `Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
-| `ornith-9b-q6` | qwen3.5-hybrid | `Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
+| `ornith-9b` | qwen3.5-hybrid | alias of `ornith-1.5-9b-q6` (below) — **the engine's default model** | temp 0.6, top_p 0.95, top_k 20 | on |
+| `ornith-1.0-9b` | qwen3.5-hybrid | `Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
+| `ornith-1.0-9b-q6` | qwen3.5-hybrid | `Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
 | `ornith-1.5-9b` | qwen3.5-hybrid | `Ornith-1.5-9B-GGUF/Ornith-1.5-9B-Q4_K_M.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
 | `ornith-1.5-9b-q6` | qwen3.5-hybrid | `Ornith-1.5-9B-GGUF/Ornith-1.5-9B-Q6_K.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
 | `qwen3.5-2b` | qwen3.5-hybrid | `Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf` | temp 1.0, top_p 1.0, top_k 20 | off |
@@ -49,7 +50,9 @@ All cargo invocations are run with `CARGO_BUILD_JOBS=4` to avoid overloading the
 | `qwen3-4b` | qwen3-dense | `Qwen3-4B-GGUF/Qwen3-4B-Q4_K_M.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
 | `qwen3-8b` | qwen3-dense | `Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
 
-Sampling and thinking defaults are each model family's own documented recommendation, verified against its Hugging Face model card (see `rocml/src/registry/catalog.rs`'s doc comments for the source of each). `qwen3.5-2b`/`qwen3.5-0.8b` default to reasoning **off** — their own model cards state that's their default — unlike the Ornith entries/dense Qwen3, which default it on. `ornith-1.5-9b` uses its card's "precise coding tasks" preset: the card's general preset depends on a presence penalty the engine doesn't implement.
+`ornith-9b` is a plain alias (same `ModelSpec`, just a second `name`) for `ornith-1.5-9b-q6`, making Ornith-1.5-9B's Q6_K the default model this engine resolves when a name that short is typed. **Before this change, `ornith-9b`/`ornith-9b-q6` named Ornith-1.0-9B's Q4_K_M/Q6_K directly** (now `ornith-1.0-9b`/`ornith-1.0-9b-q6`); every historical measurement labeled `ornith-9b` elsewhere in this README and in `.claude/CLAUDE.md`/`docs/` refers to that 1.0 Q4_K_M checkpoint, not the current alias target. `ornith-9b-q6` (as a name) no longer exists.
+
+Sampling and thinking defaults are each model family's own documented recommendation, verified against its Hugging Face model card (see `rocml/src/registry/catalog.rs`'s doc comments for the source of each). `qwen3.5-2b`/`qwen3.5-0.8b` default to reasoning **off** — their own model cards state that's their default — unlike the Ornith entries/dense Qwen3, which default it on. `ornith-1.5-9b`/`ornith-1.5-9b-q6`/`ornith-9b` use the card's "precise coding tasks" preset: the card's general preset depends on a presence penalty the engine doesn't implement.
 
 Ornith-1.5-9B's GGUF also carries a multi-token-prediction draft block (`blk.32`, `qwen35.nextn_predict_layers = 1`, so `block_count` reads 33). The loader excludes it, so inference runs the same 32 layers as 1.0; the draft head itself isn't used yet.
 
@@ -80,7 +83,7 @@ See [Observability](#observability) below for `--profile`.
 rocml-cli eval --model <name-or-gguf> --label <label> --out <path.json> [--scenarios bench/eval/scenarios.json] [--corpus bench/eval/corpus.txt] [--ctx 16384] [--max-gen-tokens 2048] [--resume]
 ```
 
-A small, deterministic (greedy argmax, fixed everything) quality harness measuring quantization loss on real tool-use tasks rather than wikitext PPL — the harness that decided Q4_K_M replaces Q6_K as the default `ornith-9b` registry entry (identical 19/20 agentic score, PPL 1.0807 vs 1.0800, ~2x decode throughput). Runs entirely in-process (no `rocml-serve`), loading the model the same way `chat`/`generate` do and driving it through the real chat protocol (`rocml::chat::render`/`parse_assistant_output`) with thinking mode on (Ornith's own default).
+A small, deterministic (greedy argmax, fixed everything) quality harness measuring quantization loss on real tool-use tasks rather than wikitext PPL — the harness that decided Q4_K_M replaces Q6_K as Ornith-1.0-9B's own default quant (`ornith-1.0-9b`; identical 19/20 agentic score, PPL 1.0807 vs 1.0800, ~2x decode throughput). Runs entirely in-process (no `rocml-serve`), loading the model the same way `chat`/`generate` do and driving it through the real chat protocol (`rocml::chat::render`/`parse_assistant_output`) with thinking mode on (Ornith's own default).
 
 `bench/eval/scenarios.json` (checked in, hand-authored, 20 scenarios) has four kinds, each scored deterministically:
 
@@ -91,7 +94,7 @@ A small, deterministic (greedy argmax, fixed everything) quality harness measuri
 
 `bench/eval/corpus.txt` (a small public-domain text excerpt) feeds a secondary, informational signal: teacher-forced perplexity over the decode path (one forward pass per token). The pass/fail call is the agentic score, not PPL.
 
-Every scored scenario is written to `--out` immediately, so a run interrupted partway through (a 30-60 minute eval killed by, e.g., a wrapping timeout) can be resumed with `--resume`, which skips any scenario id already present in that file (and skips recomputing PPL if it's already recorded). `make eval` runs the Q6_K and Q4_K_M entries of both Ornith-1.0-9B and Ornith-1.5-9B at ctx 16384, `--resume` always on. Ornith-1.5-9B scores the same 19/20 agentic result as 1.0 at both quant levels (PPL 1.0918 Q6_K / 1.1183 Q4_K_M, vs. 1.0's 1.0800 / 1.0807) — the registry default stays 1.0's `ornith-9b`.
+Every scored scenario is written to `--out` immediately, so a run interrupted partway through (a 30-60 minute eval killed by, e.g., a wrapping timeout) can be resumed with `--resume`, which skips any scenario id already present in that file (and skips recomputing PPL if it's already recorded). `make eval` runs the Q6_K and Q4_K_M entries of both Ornith-1.0-9B and Ornith-1.5-9B at ctx 16384, `--resume` always on. Ornith-1.5-9B scores the same 19/20 agentic result as 1.0 at both quant levels (PPL 1.0918 Q6_K / 1.1183 Q4_K_M, vs. 1.0's 1.0800 / 1.0807) — this eval alone doesn't decide a registry default; see the Model registry section above for why `ornith-9b` now points at Ornith-1.5-9B's Q6_K anyway.
 
 ## Observability (issue #5)
 
@@ -118,7 +121,7 @@ decode ffn-gate-up: 294.821 ms wasted (312.0 ms actual vs 17.2 ms t_min, 6% effi
 
 Profiling is opt-in and costs nothing when off: every instrumented call site is `Profiler::scope(prof, ..., || { ... })`, a plain function call when `prof` is `None`. When on, per-op HIP events are recorded through the whole run and only synchronized once at the end (`Profiler::finish`), not inside the hot loop — see `rocml/src/profile/mod.rs`'s doc comment for the full design. Both the qwen35 hybrid architecture's (issue #6) and the dense Qwen3 architecture's (issue #16) prompt phases run through a batched, chunked forward pass with full per-op granularity, one event set per chunk. Decode keeps full per-op granularity on both architectures too. Byte/FLOP counts are analytical (weight sizes, KV/state sizes, dtype-aware), not measured — see `rocml/src/profile/cost.rs`.
 
-For kernel-level ground truth (real measured kernel time, occupancy, VGPR/SGPR usage) instead of the analytical view above, see `docs/profiling.md` for the `rocprofv3` workflow. `docs/prefill-gap-analysis.md` is this round's worked example of both together: ranking ornith-9b's real prefill wasted-time ops, categorizing each gap, and an Amdahl-arithmetic lever list with estimated tok/s upside.
+For kernel-level ground truth (real measured kernel time, occupancy, VGPR/SGPR usage) instead of the analytical view above, see `docs/profiling.md` for the `rocprofv3` workflow. `docs/prefill-gap-analysis.md` is this round's worked example of both together: ranking Ornith-1.0-9B's real prefill wasted-time ops, categorizing each gap, and an Amdahl-arithmetic lever list with estimated tok/s upside.
 
 ## rocml-serve
 
