@@ -147,6 +147,17 @@ impl AttnPlane {
     }
 }
 
+impl AttnPlane {
+    /// Byte size of what [`Self::capture`] would return at `filled`.
+    pub(super) fn snapshot_byte_size(&self, n_kv_heads: u32, head_dim: u32, filled: u32) -> usize {
+        let elems = n_kv_heads as usize * filled as usize * head_dim as usize;
+        match self.dtype() {
+            KvDtype::F16 => elems * 2 * 2,
+            KvDtype::F32 => elems * 4 * 2,
+        }
+    }
+}
+
 impl AttnLayerCache {
     pub(super) fn capture(
         &self,
@@ -172,6 +183,13 @@ impl AttnLayerCache {
         match self {
             Self::Dense(plane) => plane.restore(bytes, n_kv_heads, max_seq, head_dim, filled),
             Self::Mixed(plane) => plane.restore(bytes),
+        }
+    }
+
+    pub(super) fn snapshot_byte_size(&self, n_kv_heads: u32, head_dim: u32, filled: u32) -> usize {
+        match self {
+            Self::Dense(plane) => plane.snapshot_byte_size(n_kv_heads, head_dim, filled),
+            Self::Mixed(plane) => plane.snapshot_byte_size(),
         }
     }
 }
@@ -215,6 +233,24 @@ impl HybridCache {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok((gdn, attn))
+    }
+
+    /// Exactly `capture_all(..)`'s total `byte_size()` at `filled`, with no
+    /// D2H traffic — see `qwen35::forward::Model::snapshot_byte_size`.
+    pub fn snapshot_byte_size(&self, n_kv_heads: u32, head_dim: u32, filled: u32) -> usize {
+        let gdn: usize = self
+            .gdn
+            .iter()
+            .flatten()
+            .map(|s| (s.conv_len + s.state_len) * 4)
+            .sum();
+        let attn: usize = self
+            .attn
+            .iter()
+            .flatten()
+            .map(|c| c.snapshot_byte_size(n_kv_heads, head_dim, filled))
+            .sum();
+        gdn + attn
     }
 
     /// H2D-writes a captured snapshot's per-layer state back — errors (never

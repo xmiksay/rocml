@@ -26,9 +26,10 @@ pub struct BenchArgs {
     /// normal prefill path) before measuring decode throughput, instead of
     /// `--prompt-tokens` — the head-to-head metric vs llama.cpp at a given
     /// context depth (e.g. `--depth 2048`). Both the prefill-to-depth and
-    /// the subsequent decode rate are reported.
+    /// the subsequent decode rate are reported. With `--turns`, seeds the
+    /// simulated conversation with this many tokens before turn 1 instead.
     #[arg(long)]
-    depth: Option<usize>,
+    pub(crate) depth: Option<usize>,
     /// KV cache context length to allocate. Unset defaults to whatever
     /// `--depth`/`--decode-tokens` needs (so `bench --depth 16384` just
     /// works without also specifying `--ctx`), clamped to this
@@ -222,15 +223,11 @@ pub fn run(args: &BenchArgs) -> Result<(), RocmlError> {
 /// without the chat template, so the token count isn't skewed by template
 /// overhead.
 fn synthetic_prompt(loaded: &common::Loaded, target_len: usize) -> Vec<u32> {
-    const FILLER: &str = "The quick brown fox jumps over the lazy dog. ";
-    let mut text = String::with_capacity(FILLER.len() * (target_len / 4 + 4));
-    let mut ids = Vec::new();
-    while ids.len() < target_len {
-        text.push_str(FILLER);
-        ids = loaded.tokenizer.encode(&text);
-    }
-    ids.truncate(target_len.max(1));
-    ids
+    common::synthetic_tokens(
+        loaded,
+        "The quick brown fox jumps over the lazy dog. ",
+        target_len,
+    )
 }
 
 fn median(values: &mut [f64]) -> f64 {

@@ -21,6 +21,7 @@ mod kernels;
 pub(crate) mod kernels_flash_mixed;
 pub(crate) mod kernels_mixed;
 pub mod layer_capture;
+mod rewind;
 mod scratch;
 mod snapshot;
 
@@ -40,11 +41,15 @@ use scratch::Scratch;
 use super::cache::HybridCache;
 use super::config::{LayerKind, Qwen35Config};
 use super::weights::{LayerWeights, ModelWeights};
-use crate::budget::{mixed_kv_bytes_per_token, Budget, HIGH_USAGE_WARN_FRACTION};
+use crate::budget::{
+    mixed_kv_bytes_per_token, rewind_points_bytes, Budget, HIGH_USAGE_WARN_FRACTION,
+};
 use crate::error::RocmlError;
 use crate::forward::kernels::Kernels;
 use crate::load_opts::LoadOptions;
 use crate::profile::Profiler;
+
+pub use rewind::RewindSlot;
 
 pub struct Model {
     _device: Device,
@@ -78,6 +83,9 @@ pub struct Model {
     /// based on whether `head_k_dim`/`head_v_dim` are multiples of 16.
     gdn_cw_wmma_kernels: GdnChunkwiseWmmaKernels,
     chunk_scratch: ChunkScratch,
+    /// GPU-resident rewind points, the snapshot layer's hot tier — see
+    /// `rewind.rs`. Allocated lazily on first save, never on load.
+    rewind: rewind::RewindPoints,
     pos: u32,
 }
 
@@ -116,16 +124,41 @@ impl Model {
         if opts.kv_cache.is_quantized() {
             crate::kv_quant::validate_sink_window(opts.kv_sink, opts.kv_window, ctx)?;
         }
-        let (per_token, fixed_overhead) = mixed_kv_bytes_per_token(
-            opts.kv_cache,
-            n_boundary_layers,
-            n_mixed_layers,
-            config.head_count_kv,
-            config.head_dim,
-            v_bits,
-            opts.kv_sink,
-            opts.kv_window,
-        );
+        // Mirrors `budget::estimate_from_gguf`'s `"qwen35"` arm exactly: a
+        // dense KV mode has no mixed layers, so it must take the plain
+        // per-layer formula (the mixed one under-counts fp16 by nearly 2x
+        // on Ornith's shape); the GPU rewind points (`rewind.rs`) are a
+        // fixed cost reserved here so their lazy first allocation can't
+        // fail on a budget that only just fit the KV cache.
+        let n_mixed_layers = if opts.kv_cache.is_quantized() {
+            n_mixed_layers
+        } else {
+            0
+        };
+        let (per_token, fixed_overhead) = if opts.kv_cache.is_quantized() {
+            mixed_kv_bytes_per_token(
+                opts.kv_cache,
+                n_boundary_layers,
+                n_mixed_layers,
+                config.head_count_kv,
+                config.head_dim,
+                v_bits,
+                opts.kv_sink,
+                opts.kv_window,
+            )
+        } else {
+            (
+                crate::budget::kv_bytes_per_token(
+                    n_attn_layers,
+                    config.head_count_kv,
+                    config.head_dim,
+                    opts.kv_cache.dense_dtype(),
+                ),
+                0,
+            )
+        };
+        let fixed_overhead =
+            fixed_overhead + rewind_points_bytes(&config, n_mixed_layers, opts.kv_window);
         let mem = device.memory_info()?;
         let budget = Budget::for_loaded_weights_with_overhead(
             mem.total as u64,
@@ -186,6 +219,7 @@ impl Model {
             gdn_cw_kernels,
             gdn_cw_wmma_kernels,
             chunk_scratch,
+            rewind: rewind::RewindPoints::default(),
             pos: 0,
         })
     }
@@ -207,6 +241,10 @@ impl Model {
     /// `HybridCache::reset`'s doc comment).
     pub fn reset(&mut self) -> Result<(), RocmlError> {
         self.pos = 0;
+        // A fresh sequence rewrites positions from 0, so every GPU rewind
+        // point's saved prefix stops describing the live cache — see
+        // `rewind.rs`'s validity invariant.
+        self.invalidate_rewind_points();
         self.cache.reset()
     }
 

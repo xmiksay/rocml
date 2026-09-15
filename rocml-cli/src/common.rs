@@ -236,3 +236,21 @@ pub fn model_id(resolved: &ResolvedModel) -> String {
                 .unwrap_or_else(|| "model".to_string())
         })
 }
+
+/// A deterministic synthetic prompt of exactly `target_len.max(1)` tokens:
+/// `filler` repeated enough times, tokenized once, then truncated. Encoding
+/// once matters: re-encoding a growing string per repetition is quadratic
+/// and took minutes at `bench --turns --depth 40000`.
+pub fn synthetic_tokens(loaded: &Loaded, filler: &str, target_len: usize) -> Vec<u32> {
+    let target = target_len.max(1);
+    let per_filler = loaded.tokenizer.encode(filler).len().max(1);
+    let mut reps = target / per_filler + 2;
+    loop {
+        let mut ids = loaded.tokenizer.encode(&filler.repeat(reps));
+        if ids.len() >= target {
+            ids.truncate(target);
+            return ids;
+        }
+        reps *= 2;
+    }
+}

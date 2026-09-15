@@ -19,7 +19,7 @@
 
 mod mixed;
 
-pub use mixed::{estimate_from_gguf, mixed_kv_bytes_per_token};
+pub use mixed::{estimate_from_gguf, mixed_kv_bytes_per_token, rewind_points_bytes, REWIND_SLOTS};
 
 use crate::cache::KvDtype;
 

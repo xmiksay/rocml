@@ -37,6 +37,8 @@ test:
 		--skip chat_completions_end_to_end \
 		--skip two_turn_conversation_matches_output_with_snapshots_disabled \
 		--skip qwen35_snapshot_equivalence \
+		--skip qwen35_gpu_rewind_points \
+		--skip qwen35_gpu_rewind_run_turn_tiers \
 		--skip thinking_enabled_second_turn_hits_the_stable_boundary_snapshot \
 		--skip thinking_enabled_second_turn_hits_the_server_path_snapshot \
 		--skip profile_json_is_valid_and_well_shaped
@@ -71,6 +73,8 @@ test-model:
 	cargo test --release -p rocml --test dense_mixed_kv_parity
 	cargo test --release -p rocml --test dense_chunked_prefill_parity
 	cargo test --release -p rocml --test snapshot_equivalence
+	cargo test --release -p rocml --test snapshot_rewind
+	cargo test --release -p rocml --test snapshot_rewind_turns
 	cargo test --release -p rocml --test snapshot_thinking_e2e
 	cargo test --release -p rocml --test ornith_e2e -- --test-threads=1
 	cargo test --release -p rocml-serve --test server_e2e

@@ -63,6 +63,31 @@ pub fn mixed_kv_bytes_per_token(
     (boundary_per_token + mixed_per_token, fixed_overhead)
 }
 
+/// GPU rewind points `qwen35::forward::Model` keeps resident (see
+/// `qwen35::forward::rewind`: one for the render-stable boundary, one for
+/// the end of turn).
+pub const REWIND_SLOTS: u64 = 2;
+
+/// Fixed VRAM the hybrid model's GPU rewind points cost, so `Model::load`'s
+/// budget check reserves it up front instead of the first save discovering
+/// there was no room: `REWIND_SLOTS` x (every GDN layer's conv + recurrence
+/// state in f32, plus every mixed-KV layer's fp16 recent-window K/V pair —
+/// dense planes need no rewind storage at all, see
+/// `qwen35::cache::rewind`). `n_mixed_layers` is 0 for a dense KV mode.
+pub fn rewind_points_bytes(cfg: &Qwen35Config, n_mixed_layers: u32, window_len: u32) -> u64 {
+    let n_gdn = cfg
+        .layer_kinds
+        .iter()
+        .filter(|k| **k == LayerKind::LinearAttention)
+        .count() as u64;
+    let g = &cfg.gdn;
+    let gdn_floats = g.conv_dim as u64 * (g.conv_kernel as u64).saturating_sub(1)
+        + g.num_v_heads as u64 * g.head_k_dim as u64 * g.head_v_dim as u64;
+    let window_bytes_per_layer =
+        2 * cfg.head_count_kv as u64 * window_len as u64 * cfg.head_dim as u64 * 2;
+    REWIND_SLOTS * (n_gdn * gdn_floats * 4 + n_mixed_layers as u64 * window_bytes_per_layer)
+}
+
 /// Cheap pre-load budget estimate for `crate::registry::clamp_ctx`: opens
 /// the GGUF just far enough to read the handful of fields the
 /// KV-bytes-per-token formula needs (not the full architecture-specific
@@ -139,9 +164,13 @@ pub fn estimate_from_gguf(
                 .iter()
                 .filter(|k| **k == LayerKind::FullAttention)
                 .count() as u32;
+            let n_boundary = n_attn.min(2);
+            let n_mixed = if mode.is_quantized() {
+                n_attn.saturating_sub(n_boundary)
+            } else {
+                0
+            };
             let (per_token, fixed_overhead) = if mode.is_quantized() {
-                let n_boundary = n_attn.min(2);
-                let n_mixed = n_attn.saturating_sub(n_boundary);
                 let v_bits: u8 = if mode == KvCacheMode::Q4Mixed { 4 } else { 8 };
                 mixed_kv_bytes_per_token(
                     mode,
@@ -159,6 +188,7 @@ pub fn estimate_from_gguf(
                     0,
                 )
             };
+            let fixed_overhead = fixed_overhead + rewind_points_bytes(&c, n_mixed, window_len);
             (per_token, fixed_overhead, c.context_length)
         }
         other => {
@@ -177,4 +207,59 @@ pub fn estimate_from_gguf(
         fixed_overhead,
     );
     Ok((budget, model_ctx_cap as usize))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qwen35::config::GdnConfig;
+
+    /// Ornith-1.0-9B's shape: 24 GDN layers (conv_dim 8192, kernel 4, 32 v
+    /// heads x 128 x 128) and, under a quantized mode, 6 mixed layers with
+    /// 4 kv heads x 256 head_dim windows of 128.
+    fn ornith_like() -> Qwen35Config {
+        let mut layer_kinds = vec![LayerKind::LinearAttention; 32];
+        for i in (3..32).step_by(4) {
+            layer_kinds[i] = LayerKind::FullAttention;
+        }
+        Qwen35Config {
+            block_count: 32,
+            embedding_length: 4096,
+            feed_forward_length: 12288,
+            head_count: 16,
+            head_count_kv: 4,
+            head_dim: 256,
+            rope_freq_base: 10_000_000.0,
+            rope_dim_count: 64,
+            rms_eps: 1e-6,
+            context_length: 262_144,
+            vocab_size: 151_936,
+            layer_kinds,
+            gdn: GdnConfig {
+                conv_kernel: 4,
+                num_k_heads: 16,
+                num_v_heads: 32,
+                head_k_dim: 128,
+                head_v_dim: 128,
+                key_dim: 2048,
+                value_dim: 4096,
+                conv_dim: 8192,
+            },
+        }
+    }
+
+    #[test]
+    fn rewind_points_bytes_matches_hand_count() {
+        let cfg = ornith_like();
+        let gdn_per_layer = (8192 * 3 + 32 * 128 * 128) * 4;
+        let dense = rewind_points_bytes(&cfg, 0, 128);
+        assert_eq!(dense, REWIND_SLOTS * 24 * gdn_per_layer);
+        // ~53 MiB per slot on this shape, as the design notes claim.
+        assert!((50 << 20..55 << 20).contains(&(dense / REWIND_SLOTS)));
+        let window_per_layer = 2 * 4 * 128 * 256 * 2;
+        assert_eq!(
+            rewind_points_bytes(&cfg, 6, 128),
+            dense + REWIND_SLOTS * 6 * window_per_layer
+        );
+    }
 }
