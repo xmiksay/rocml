@@ -28,18 +28,20 @@ rocml is a standalone Rust inference engine for Qwen3.5-hybrid/Ornith and dense 
 - `make bench` — run `rocml-cli bench` against `QWEN_MODEL`, JSON output
 - `make bench-profile` — profiled `bench` run, human-readable roofline table on stdout (`MODEL`/`DEPTH` override which checkpoint/context depth, e.g. `make bench-profile MODEL=ornith-9b DEPTH=8192`)
 - `make bench-profile-json` — same run, machine-readable roofline JSON written to `OUT` (default `bench/profile/$(DEPTH).json`) — see "Observability" below and `docs/prefill-gap-analysis.md`
-- `make eval` — run the agentic quality-eval harness (issue #15) for both `ornith-9b-q6` (Q6_K) and `ornith-9b` (Q4_K_M) at ctx 16384, writing `bench/eval/results/*.json`
+- `make eval` — run the agentic quality-eval harness (issue #15) for `ornith-9b-q6`/`ornith-9b` and `ornith-1.5-9b-q6`/`ornith-1.5-9b` (Q6_K/Q4_K_M each) at ctx 16384, writing `bench/eval/results/*.json`
 
 All cargo invocations are run with `CARGO_BUILD_JOBS=4` to avoid overloading the build machine.
 
 ## Model registry
 
-`--model` on every binary below accepts either a path to a `.gguf` file (unchanged, no defaults applied) or one of these compiled-in names (`rocml/src/registry.rs`), which additionally supply a default context budget, sampling params, and thinking-mode default:
+`--model` on every binary below accepts either a path to a `.gguf` file (unchanged, no defaults applied) or one of these compiled-in names (`rocml/src/registry/catalog.rs`), which additionally supply a default context budget, sampling params, and thinking-mode default:
 
 | Name | Family | File | Default sampling | Thinking |
 |---|---|---|---|---|
 | `ornith-9b` | qwen3.5-hybrid | `Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q4_K_M.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
 | `ornith-9b-q6` | qwen3.5-hybrid | `Ornith-1.0-9B-GGUF/ornith-1.0-9b-Q6_K.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
+| `ornith-1.5-9b` | qwen3.5-hybrid | `Ornith-1.5-9B-GGUF/Ornith-1.5-9B-Q4_K_M.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
+| `ornith-1.5-9b-q6` | qwen3.5-hybrid | `Ornith-1.5-9B-GGUF/Ornith-1.5-9B-Q6_K.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
 | `qwen3.5-2b` | qwen3.5-hybrid | `Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf` | temp 1.0, top_p 1.0, top_k 20 | off |
 | `qwen3.5-0.8b` | qwen3.5-hybrid | `Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf` | temp 1.0, top_p 1.0, top_k 20 | off |
 | `qwen3-0.6b` | qwen3-dense | `Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
@@ -47,7 +49,9 @@ All cargo invocations are run with `CARGO_BUILD_JOBS=4` to avoid overloading the
 | `qwen3-4b` | qwen3-dense | `Qwen3-4B-GGUF/Qwen3-4B-Q4_K_M.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
 | `qwen3-8b` | qwen3-dense | `Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf` | temp 0.6, top_p 0.95, top_k 20 | on |
 
-Sampling and thinking defaults are each model family's own documented recommendation, verified against its Hugging Face model card (see `rocml/src/registry.rs`'s doc comments for the source of each). `qwen3.5-2b`/`qwen3.5-0.8b` default to reasoning **off** — their own model cards state that's their default — unlike `ornith-9b`/dense Qwen3, which default it on.
+Sampling and thinking defaults are each model family's own documented recommendation, verified against its Hugging Face model card (see `rocml/src/registry/catalog.rs`'s doc comments for the source of each). `qwen3.5-2b`/`qwen3.5-0.8b` default to reasoning **off** — their own model cards state that's their default — unlike the Ornith entries/dense Qwen3, which default it on. `ornith-1.5-9b` uses its card's "precise coding tasks" preset: the card's general preset depends on a presence penalty the engine doesn't implement.
+
+Ornith-1.5-9B's GGUF also carries a multi-token-prediction draft block (`blk.32`, `qwen35.nextn_predict_layers = 1`, so `block_count` reads 33). The loader excludes it, so inference runs the same 32 layers as 1.0; the draft head itself isn't used yet.
 
 `rocml::registry::resolve(name_or_path, download)` turns a `--model` argument into a path: anything containing `/`, ending in `.gguf`, or that already exists as a file is treated as a path outright (no preset applied); anything else is looked up by name. A registry hit whose file is missing under the checkpoint dir (`$ROCML_CHECKPOINT_DIR`, else `$HOME/checkpoints` — see `rocml_core::testpaths`) is downloaded via the `hf` CLI unless `--no-download` is passed, in which case the error names the exact missing path, the source repo, and both remedies.
 
@@ -87,7 +91,7 @@ A small, deterministic (greedy argmax, fixed everything) quality harness measuri
 
 `bench/eval/corpus.txt` (a small public-domain text excerpt) feeds a secondary, informational signal: teacher-forced perplexity over the decode path (one forward pass per token). The pass/fail call is the agentic score, not PPL.
 
-Every scored scenario is written to `--out` immediately, so a run interrupted partway through (a 30-60 minute eval killed by, e.g., a wrapping timeout) can be resumed with `--resume`, which skips any scenario id already present in that file (and skips recomputing PPL if it's already recorded). `make eval` runs both the `ornith-9b-q6` (Q6_K) baseline and the `ornith-9b` (Q4_K_M) default at ctx 16384, `--resume` always on.
+Every scored scenario is written to `--out` immediately, so a run interrupted partway through (a 30-60 minute eval killed by, e.g., a wrapping timeout) can be resumed with `--resume`, which skips any scenario id already present in that file (and skips recomputing PPL if it's already recorded). `make eval` runs the Q6_K and Q4_K_M entries of both Ornith-1.0-9B and Ornith-1.5-9B at ctx 16384, `--resume` always on. Ornith-1.5-9B scores the same 19/20 agentic result as 1.0 at both quant levels (PPL 1.0918 Q6_K / 1.1183 Q4_K_M, vs. 1.0's 1.0800 / 1.0807) — the registry default stays 1.0's `ornith-9b`.
 
 ## Observability (issue #5)
 

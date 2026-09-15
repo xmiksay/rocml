@@ -112,6 +112,33 @@ pub const REGISTRY: &[ModelSpec] = &[
         thinking_default: true,
     },
     ModelSpec {
+        name: "ornith-1.5-9b",
+        family: ModelFamily::Qwen35Hybrid,
+        // Same qwen35 architecture, tokenizer and official
+        // `chat_template.jinja` as 1.0 (byte-identical but for a trailing
+        // newline), and the identical per-tensor quant mix. The GGUF adds one
+        // MTP draft block, which `Qwen35Config` excludes from the forward pass.
+        gguf_rel: "Ornith-1.5-9B-GGUF/Ornith-1.5-9B-Q4_K_M.gguf",
+        hf_repo: "ornith-ai/Ornith-1.5-9B-GGUF",
+        hf_file: "Ornith-1.5-9B-Q4_K_M.gguf",
+        default_ctx: 8192,
+        // The model card's "precise coding tasks" preset; its general preset
+        // depends on presence_penalty 1.5, which the engine can't apply.
+        sampling: QWEN_THINKING_SAMPLING,
+        // Card: the assistant turn opens with a `<think>` block by default.
+        thinking_default: true,
+    },
+    ModelSpec {
+        name: "ornith-1.5-9b-q6",
+        family: ModelFamily::Qwen35Hybrid,
+        gguf_rel: "Ornith-1.5-9B-GGUF/Ornith-1.5-9B-Q6_K.gguf",
+        hf_repo: "ornith-ai/Ornith-1.5-9B-GGUF",
+        hf_file: "Ornith-1.5-9B-Q6_K.gguf",
+        default_ctx: 8192,
+        sampling: QWEN_THINKING_SAMPLING,
+        thinking_default: true,
+    },
+    ModelSpec {
         name: "qwen3.5-2b",
         family: ModelFamily::Qwen35Hybrid,
         gguf_rel: "Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf",

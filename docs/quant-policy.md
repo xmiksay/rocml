@@ -59,6 +59,10 @@ Ornith-1.0-9B: `qwen35.block_count = 32`, `full_attention_interval = 4`
 rest are GDN), `num_v_heads = 32`, `num_k_heads = 16` (grouped GDN heads).
 Qwen3.5-2B: `block_count = 24`, same `full_attention_interval = 4` (6 of 24
 full-attention), `num_v_heads = num_k_heads = 16` (no grouping).
+Ornith-1.5-9B: `qwen35.block_count = 33`/`nextn_predict_layers = 1` — one
+trailing MTP draft block (`blk.32`) that `Qwen35Config::from_gguf` excludes
+from `block_count`, so its 32 forward-pass layers have the identical
+`full_attention_interval = 4`/`num_v_heads`/`num_k_heads` layout as 1.0's.
 
 ### `ornith-1.0-9b-Q4_K_M.gguf` (registry default `ornith-9b`)
 
@@ -103,6 +107,56 @@ generic-treated worse than others" problem by construction. This is the
 
 Zero violations, same reasoning as the Q6_K file above — Q8_0 (~8.5
 bits/weight) clears every floor this policy defines.
+
+### `Ornith-1.5-9B-Q4_K_M.gguf` / `Ornith-1.5-9B-Q6_K.gguf` (registry `ornith-1.5-9b` / `ornith-1.5-9b-q6`)
+
+Per-category dtypes across the 32 forward-pass layers (`blk.0`-`blk.31`) are
+identical to the matching 1.0 files above: Q4_K_M reproduces the exact same
+GDN-in-projection/`ssm_out`/`token_embd` Q4_K findings (`ssm_alpha`/
+`ssm_beta`/`attn_gate`/`ssm_out` 24 Q4_K each; `attn_qkv` 12 Q4_K/12 Q6_K;
+`ffn_down` 16 Q4_K/16 Q6_K; `token_embd.weight` Q4_K; `output.weight`
+Q6_K), and Q6_K is uniform Q6_K/F32 throughout with zero violations —
+confirmed directly against both files' tensor tables
+(`inspect_gguf --full`), not assumed from the file names.
+
+`audit()` iterates every tensor in the GGUF (`gguf.tensors()`), not just the
+forward pass's own `block_count` layers, so it also walks `blk.32` — the
+trailing MTP draft block `Qwen35Config::from_gguf` excludes from
+`block_count` (see "MTP speculative decoding" in `.claude/CLAUDE.md`) and
+whose tensors are therefore never uploaded to the GPU. `blk.32` is itself an
+ordinary full-attention+FFN layer (separate `attn_q`/`attn_k`/`attn_v`, no
+`ssm_*`/`attn_qkv`/`attn_gate` at all, so a `GDN_RULES` match is
+structurally impossible for it) that llama.cpp's own per-tensor importance
+heuristic quantized the same way as any other layer: `attn_output`/
+`attn_q`/`ffn_gate`/`ffn_up` Q4_K, `attn_v`/`ffn_down` Q6_K in the Q4_K_M
+file; uniform Q6_K in the Q6_K file. That gives Q4_K_M exactly one extra
+`COMMON_RULES` violation over 1.0's own count — `o_proj`
+(residual-stream output projection) rises from 8 to **9** tensors
+(`blk.32.attn_output.weight = Q4_K`, confirmed via the real
+`warning: quant-policy: ...` line at load time) — every other violation
+count unchanged (`ffn_down`'s own 16-tensor count doesn't move since
+`blk.32.ffn_down.weight` is Q6_K, compliant). On Q6_K, `blk.32` is uniformly
+Q6_K/F32, adding zero violations, so `report.is_clean()` still holds.
+This is a correct, documented byproduct of `audit()` having no MTP-block
+concept — not a bug, and not worth teaching it to skip `blk.32`: a
+converter-quality question ("did anything in this file drop below the
+floor") should cover every tensor the file actually ships, whether or not
+this engine's own forward pass happens to upload it.
+
+**Reconciliation with the issue-15 eval**: `make eval`'s Ornith-1.5-9B runs
+(`bench/eval/results/ornith15-{q6k,q4km}-fp16kv.json`) score both
+`ornith-1.5-9b-q6` and `ornith-1.5-9b` (Q4_K_M) at 19/20 — identical to
+1.0's own pass count — with PPL 1.0918 (Q6_K) vs 1.1183 (Q4_K_M), a larger
+Q6_K-to-Q4_K_M PPL gap than 1.0's own (1.0800 vs 1.0807) but still not
+enough to move the agentic pass count at all. Both 1.5 configs fail the
+identical single scenario 1.0 already fails (`two_city_weather`, "expected
+exactly 1 tool call, got 2") — a pre-existing model-family quirk, not
+something this round's extra `o_proj` violation introduced. See
+`.claude/CLAUDE.md`'s "Agentic eval" section for the full four-checkpoint
+comparison table. Same conclusion as 1.0's own reconciliation above: the
+design-review prior is more conservative than the model needs at this
+scale, and this file is kept as a documented, monitored tradeoff rather
+than fixed by re-quanting.
 
 ## Load-time policy check
 
@@ -163,6 +217,8 @@ The registry (`rocml/src/registry/catalog.rs`) resolves:
 |---|---|---|---|---|---|
 | `ornith-9b` | `ornith-ai/Ornith-1.0-9B-GGUF` | `ornith-1.0-9b-Q4_K_M.gguf` | 5,629,108,704 B | Yes | Yes (`5720d1f6…6087b106`) |
 | `ornith-9b-q6` | `ornith-ai/Ornith-1.0-9B-GGUF` | `ornith-1.0-9b-Q6_K.gguf` | 7,359,259,072 B | Yes | Yes (`33b6f6a3…026e8387`) |
+| `ornith-1.5-9b` | `ornith-ai/Ornith-1.5-9B-GGUF` | `Ornith-1.5-9B-Q4_K_M.gguf` | 5,780,090,816 B | Yes | Yes (`70c11219…07e8fab6`) |
+| `ornith-1.5-9b-q6` | `ornith-ai/Ornith-1.5-9B-GGUF` | `Ornith-1.5-9B-Q6_K.gguf` | 7,558,901,696 B | Yes | Yes (`b6f76e74…81e4154a`) |
 | `qwen3.5-2b` | `unsloth/Qwen3.5-2B-GGUF` | `Qwen3.5-2B-Q8_0.gguf` | 2,012,012,800 B | Yes | Yes (`1b04acba…1021f2c1`) |
 
 Verified via the HF API (metadata/tree endpoints only — no re-download of
@@ -186,6 +242,18 @@ disk, not fetched over the network):
   `$ROCML_CHECKPOINT_DIR/Ornith-1.0-9B-GGUF/` exactly (`sha256sum` run
   locally against the already-downloaded files, no network transfer of the
   GGUF content itself).
+- **`ornith-ai/Ornith-1.5-9B-GGUF` file identity**: `GET
+  /api/models/ornith-ai/Ornith-1.5-9B-GGUF/tree/main?recursive=true` reports
+  `Ornith-1.5-9B-Q4_K_M.gguf` at 5,780,090,816 bytes (LFS oid
+  `70c112196e0b7023803c9762752e46d29e612a92c83f995bc3ba1ceb07e8fab6`) and
+  `Ornith-1.5-9B-Q6_K.gguf` at 7,558,901,696 bytes (LFS oid
+  `b6f76e74f86245b3caee014b797c10dca931c4dfdaabfb134eab655f81e4154a`) — both
+  byte-size and sha256 match the local files under
+  `$ROCML_CHECKPOINT_DIR/Ornith-1.5-9B-GGUF/` exactly (`sha256sum` run
+  locally, no network transfer of the GGUF content itself). Repo is live,
+  public, non-gated (5.1M downloads, 387 likes at audit time); no rename
+  redirect involved for this one (unlike 1.0's `deepreinforce-ai` origin
+  above) — `ornith-ai/Ornith-1.5-9B-GGUF` is the repo's only, original name.
 - **`unsloth/Qwen3.5-2B-GGUF`**: repo exists, author `unsloth`, no rename
   redirect involved. `Qwen3.5-2B-Q8_0.gguf` is 2,012,012,800 bytes (LFS oid
   `1b04acba824817554f4ce23639bc8495ff70453b8fcb047900c731521021f2c1`),
@@ -202,7 +270,10 @@ resolves the `main` branch's current commit — `ornith-ai/Ornith-1.0-9B-GGUF`
 was at commit `3296bc7a404871a72ac3f1903f561459c09b5c17` at audit time). This
 predates issue #4 and isn't changed by it; noted here only so a future
 "why did this file change under us" question has the commit this audit was
-run against.
+run against. `ornith-ai/Ornith-1.5-9B-GGUF` was at commit
+`abdd624b12ebf020b767fff532ff44fe552b28c3` (`GET
+/api/models/ornith-ai/Ornith-1.5-9B-GGUF`'s `sha` field) when this section
+was written, for the same reason.
 
 ## Bottom line
 
