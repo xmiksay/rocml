@@ -1,14 +1,28 @@
 //! Model hyperparameters read from GGUF metadata for `general.architecture =
-//! "qwen35"` (the Qwen 3.5 hybrid Gated-Delta-Net + full-attention arch).
-//! Every field is read from the file, matching llama.cpp's `qwen35` GGUF
-//! layout (verified against a real Qwen3.5-2B-Q8_0.gguf and against Crane's
-//! independent implementation of the same architecture).
+//! "qwen35"` (the Qwen 3.5 hybrid Gated-Delta-Net + full-attention arch) and
+//! `"qwen35moe"` (Ornith-1.5-35B-A3B: the identical hybrid GDN/full-attention
+//! body, but every layer's dense SwiGLU FFN is replaced by a
+//! softmax-routed mixture of experts plus one always-on shared expert — see
+//! [`MoeConfig`] and `crate::qwen35::weights::moe`). Every field is read
+//! from the file, matching llama.cpp's `qwen35`/`qwen35moe` GGUF layout
+//! (verified against a real Qwen3.5-2B-Q8_0.gguf and against Crane's
+//! independent implementation of the dense-FFN case; the MoE fields were
+//! verified against a real Ornith-1.5-35B-A3B-GGUF header).
+//!
+//! GGUF's metadata-key namespace prefix matches `general.architecture`
+//! exactly (`"qwen35.block_count"` vs. `"qwen35moe.block_count"` — the two
+//! architectures do **not** share one key namespace despite sharing every
+//! other convention), so every key read below is built from the actual
+//! `arch` string rather than a hardcoded `"qwen35"` prefix. Per-layer
+//! *tensor* names (`blk.N.*`) are unaffected by this — both architectures
+//! use identical tensor names for the parts they share.
 
 use rocml_core::gguf::{GgufError, GgufFile};
 
 use crate::error::RocmlError;
 
-const ARCH: &str = "qwen35";
+const ARCH_HYBRID: &str = "qwen35";
+const ARCH_MOE: &str = "qwen35moe";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerKind {
@@ -40,7 +54,39 @@ pub struct Qwen35Config {
     /// full-attention, indexed by layer.
     pub layer_kinds: Vec<LayerKind>,
     pub gdn: GdnConfig,
+    /// `Some` for `general.architecture = "qwen35moe"`: every layer's FFN is
+    /// a mixture of experts instead of one dense SwiGLU MLP. `None` for
+    /// plain `"qwen35"`.
+    pub moe: Option<MoeConfig>,
 }
+
+/// Mixture-of-experts routing/sizing, read from `qwen35moe.expert_*`
+/// metadata. Routing semantics (verified against llama.cpp's
+/// `build_moe_ffn`/`qwen35moe.cpp`, not guessed): softmax over
+/// `expert_count` logits, select the top `expert_used_count`, renormalize
+/// their weights to sum to 1 (sum clamped to [`MOE_WEIGHT_SUM_EPS`]),
+/// `SiLU(gate) * up -> down` per selected expert, plus one always-on shared
+/// expert gated by `sigmoid(ffn_gate_inp_shexp . x)` — see
+/// `crate::qwen35::weights::moe` for the loader and
+/// `crate::qwen35::forward::moe` for the forward pass.
+#[derive(Debug, Clone, Copy)]
+pub struct MoeConfig {
+    pub expert_count: u32,
+    pub expert_used_count: u32,
+    /// `qwen35moe.expert_feed_forward_length` — one routed expert's FFN
+    /// width (512 on Ornith-1.5-35B-A3B, far smaller than a dense model's
+    /// `feed_forward_length`).
+    pub expert_ff_len: u32,
+    /// `qwen35moe.expert_shared_feed_forward_length` — the shared expert's
+    /// own FFN width (independent of `expert_ff_len`, though equal on this
+    /// checkpoint).
+    pub shared_ff_len: u32,
+}
+
+/// llama.cpp's `build_moe_ffn` floor on the renormalized top-k weight sum —
+/// guards a pathological near-all-zero softmax from blowing up the
+/// per-expert weights when dividing by it.
+pub const MOE_WEIGHT_SUM_EPS: f32 = 6.1e-5;
 
 /// Gated Delta Net dimensions, derived from `qwen35.ssm.*` metadata the same
 /// way Crane's `GdnDims::new` does (see `crate::ops::gdn::config` there).
@@ -59,27 +105,71 @@ pub struct GdnConfig {
 impl Qwen35Config {
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, RocmlError> {
         let arch = gguf.get_str("general.architecture")?;
-        if arch != ARCH {
-            return Err(RocmlError::UnsupportedArchitecture {
-                found: arch.to_string(),
-            });
-        }
+        let is_moe = match arch {
+            ARCH_HYBRID => false,
+            ARCH_MOE => true,
+            other => {
+                return Err(RocmlError::UnsupportedArchitecture {
+                    found: other.to_string(),
+                })
+            }
+        };
+        // GGUF's metadata-key namespace matches `general.architecture`
+        // exactly for this family — see the module doc.
+        let ns = arch;
 
-        let nextn_layers = match gguf.get_u32("qwen35.nextn_predict_layers") {
+        let nextn_layers = match gguf.get_u32(&format!("{ns}.nextn_predict_layers")) {
             Ok(n) => n,
             Err(GgufError::MissingKey(_)) => 0,
             Err(e) => return Err(e.into()),
         };
-        let block_count = main_block_count(gguf.get_u32("qwen35.block_count")?, nextn_layers)?;
-        let embedding_length = gguf.get_u32("qwen35.embedding_length")?;
-        let feed_forward_length = gguf.get_u32("qwen35.feed_forward_length")?;
-        let head_count = gguf.get_u32("qwen35.attention.head_count")?;
-        let head_count_kv = gguf.get_u32("qwen35.attention.head_count_kv")?;
-        let head_dim = gguf.get_u32("qwen35.attention.key_length")?;
-        let rope_freq_base = gguf.get_f32("qwen35.rope.freq_base")?;
-        let rope_dim_count = gguf.get_u32("qwen35.rope.dimension_count")?;
-        let rms_eps = gguf.get_f32("qwen35.attention.layer_norm_rms_epsilon")?;
-        let context_length = gguf.get_u32("qwen35.context_length")?;
+        let block_count =
+            main_block_count(gguf.get_u32(&format!("{ns}.block_count"))?, nextn_layers)?;
+        let embedding_length = gguf.get_u32(&format!("{ns}.embedding_length"))?;
+        let head_count = gguf.get_u32(&format!("{ns}.attention.head_count"))?;
+        let head_count_kv = gguf.get_u32(&format!("{ns}.attention.head_count_kv"))?;
+        let head_dim = gguf.get_u32(&format!("{ns}.attention.key_length"))?;
+        let rope_freq_base = gguf.get_f32(&format!("{ns}.rope.freq_base"))?;
+        let rope_dim_count = gguf.get_u32(&format!("{ns}.rope.dimension_count"))?;
+        let rms_eps = gguf.get_f32(&format!("{ns}.attention.layer_norm_rms_epsilon"))?;
+        let context_length = gguf.get_u32(&format!("{ns}.context_length"))?;
+
+        // `qwen35moe` has no `feed_forward_length` key at all (there is no
+        // dense FFN — every layer is MoE); `feed_forward_length` is then
+        // only used to size the dense-FFN scratch buffers `Scratch`/
+        // `ChunkScratch` allocate unconditionally, which stay unused for an
+        // all-MoE model — `expert_ff_len` is a harmless, always-valid
+        // placeholder value for that dead allocation (see `MoeConfig`'s own
+        // fields for the real per-expert width).
+        let moe = if is_moe {
+            Some(MoeConfig {
+                expert_count: gguf.get_u32(&format!("{ns}.expert_count"))?,
+                expert_used_count: gguf.get_u32(&format!("{ns}.expert_used_count"))?,
+                expert_ff_len: gguf.get_u32(&format!("{ns}.expert_feed_forward_length"))?,
+                shared_ff_len: gguf.get_u32(&format!("{ns}.expert_shared_feed_forward_length"))?,
+            })
+        } else {
+            None
+        };
+        let feed_forward_length = match moe {
+            Some(m) => m.expert_ff_len,
+            None => gguf.get_u32(&format!("{ns}.feed_forward_length"))?,
+        };
+        if let Some(m) = moe {
+            if m.expert_count == 0 || m.expert_ff_len == 0 || m.shared_ff_len == 0 {
+                return Err(RocmlError::Config(
+                    "expert_count/expert_feed_forward_length/expert_shared_feed_forward_length \
+                     must be nonzero"
+                        .to_string(),
+                ));
+            }
+            if m.expert_used_count == 0 || m.expert_used_count > m.expert_count {
+                return Err(RocmlError::Config(format!(
+                    "expert_used_count {} must be nonzero and at most expert_count {}",
+                    m.expert_used_count, m.expert_count
+                )));
+            }
+        }
 
         let embd_shape = gguf.tensor("token_embd.weight")?.shape().to_vec();
         let &vocab_ne = embd_shape.get(1).ok_or_else(|| {
@@ -90,11 +180,11 @@ impl Qwen35Config {
         let vocab_size = u32::try_from(vocab_ne)
             .map_err(|_| RocmlError::Config(format!("vocab size {vocab_ne} overflows u32")))?;
 
-        let conv_kernel = gguf.get_u32("qwen35.ssm.conv_kernel")?;
-        let num_k_heads = gguf.get_u32("qwen35.ssm.group_count")?;
-        let num_v_heads = gguf.get_u32("qwen35.ssm.time_step_rank")?;
-        let inner_size = gguf.get_u32("qwen35.ssm.inner_size")?;
-        let head_k_dim = gguf.get_u32("qwen35.ssm.state_size")?;
+        let conv_kernel = gguf.get_u32(&format!("{ns}.ssm.conv_kernel"))?;
+        let num_k_heads = gguf.get_u32(&format!("{ns}.ssm.group_count"))?;
+        let num_v_heads = gguf.get_u32(&format!("{ns}.ssm.time_step_rank"))?;
+        let inner_size = gguf.get_u32(&format!("{ns}.ssm.inner_size"))?;
+        let head_k_dim = gguf.get_u32(&format!("{ns}.ssm.state_size"))?;
 
         if num_k_heads == 0 || num_v_heads == 0 || inner_size == 0 {
             return Err(RocmlError::Config(
@@ -192,6 +282,7 @@ impl Qwen35Config {
                 value_dim,
                 conv_dim,
             },
+            moe,
         })
     }
 
