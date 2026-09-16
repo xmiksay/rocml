@@ -206,84 +206,114 @@ pub(crate) fn moe_ffn_step(
     let mut idx_host = vec![0i32; top_k];
     scratch.topk_idx.copy_to_host(&mut idx_host)?;
 
-    for (k, &raw_idx) in idx_host.iter().enumerate() {
-        let expert = u32::try_from(raw_idx).map_err(|_| {
-            RocmlError::Config(format!(
-                "moe router produced an invalid expert index {raw_idx} (must be in \
-                 [0, {}))",
-                moe_cfg.expert_count
-            ))
-        })?;
-        if expert >= moe_cfg.expert_count {
-            return Err(RocmlError::Config(format!(
-                "moe router selected expert {expert}, out of range for expert_count {}",
-                moe_cfg.expert_count
-            )));
-        }
-
-        let (gate_ptr, up_ptr, down_ptr) = match expert_cache.as_mut() {
-            Some(cache) => {
-                cache.ensure_loaded(gguf, (layer_idx, expert), &moe.gate, &moe.up, &moe.down)?
+    // M4 lever 2: the decode-overlap pipeline only ever applies to a real
+    // decode step (`row_capture.is_none()` — the `LayerCapture` diagnostic
+    // prefill path always passes `Some`, see this module's doc comment and
+    // `moe_decode_overlap`'s own module doc) on a cache built with the
+    // overlap flag on. The `else` branch below is the original, unmodified
+    // M1/M2 inline loop — bit-identical whenever the `if` isn't taken,
+    // which is every call site until `LoadOptions::moe_decode_overlap`/
+    // `--moe-decode-overlap` is set.
+    let overlap_active = row_capture.is_none()
+        && expert_cache
+            .as_deref()
+            .is_some_and(super::moe_cache::ExpertCache::overlap_enabled);
+    if overlap_active {
+        let cache = expert_cache
+            .as_deref_mut()
+            .expect("overlap_active implies expert_cache is Some (checked above)");
+        super::moe_decode_overlap::routed_experts_overlap(
+            kernels,
+            moe_kernels,
+            gguf,
+            moe,
+            moe_cfg,
+            hidden,
+            scratch,
+            layer_idx,
+            cache,
+            &idx_host,
+        )?;
+    } else {
+        for (k, &raw_idx) in idx_host.iter().enumerate() {
+            let expert = u32::try_from(raw_idx).map_err(|_| {
+                RocmlError::Config(format!(
+                    "moe router produced an invalid expert index {raw_idx} (must be in \
+                     [0, {}))",
+                    moe_cfg.expert_count
+                ))
+            })?;
+            if expert >= moe_cfg.expert_count {
+                return Err(RocmlError::Config(format!(
+                    "moe router selected expert {expert}, out of range for expert_count {}",
+                    moe_cfg.expert_count
+                )));
             }
-            None => {
-                let gate_bytes = moe.gate.expert_bytes(gguf, expert)?;
-                let up_bytes = moe.up.expert_bytes(gguf, expert)?;
-                let down_bytes = moe.down.expert_bytes(gguf, expert)?;
-                scratch.stage_gate.copy_prefix_from_host(gate_bytes)?;
-                scratch.stage_up.copy_prefix_from_host(up_bytes)?;
-                scratch.stage_down.copy_prefix_from_host(down_bytes)?;
-                (
-                    offset(&scratch.stage_gate, 0),
-                    offset(&scratch.stage_up, 0),
-                    offset(&scratch.stage_down, 0),
-                )
-            }
-        };
 
-        kernels.gemv_quant(
-            moe.gate.dtype,
-            gate_ptr,
-            offset(&scratch.xn, 0),
-            offset(&scratch.ffn_a, 0),
-            moe_cfg.expert_ff_len,
-            hidden,
-        )?;
-        kernels.gemv_quant(
-            moe.up.dtype,
-            up_ptr,
-            offset(&scratch.xn, 0),
-            offset(&scratch.ffn_b, 0),
-            moe_cfg.expert_ff_len,
-            hidden,
-        )?;
-        kernels.silu_mul(
-            offset(&scratch.ffn_a, 0),
-            offset(&scratch.ffn_b, 0),
-            offset(&scratch.ffn_a, 0),
-            moe_cfg.expert_ff_len,
-        )?;
-        kernels.gemv_quant(
-            moe.down.dtype,
-            down_ptr,
-            offset(&scratch.ffn_a, 0),
-            offset(&scratch.expert_out, 0),
-            hidden,
-            moe_cfg.expert_ff_len,
-        )?;
+            let (gate_ptr, up_ptr, down_ptr) = match expert_cache.as_mut() {
+                Some(cache) => {
+                    cache.ensure_loaded(gguf, (layer_idx, expert), &moe.gate, &moe.up, &moe.down)?
+                }
+                None => {
+                    let gate_bytes = moe.gate.expert_bytes(gguf, expert)?;
+                    let up_bytes = moe.up.expert_bytes(gguf, expert)?;
+                    let down_bytes = moe.down.expert_bytes(gguf, expert)?;
+                    scratch.stage_gate.copy_prefix_from_host(gate_bytes)?;
+                    scratch.stage_up.copy_prefix_from_host(up_bytes)?;
+                    scratch.stage_down.copy_prefix_from_host(down_bytes)?;
+                    (
+                        offset(&scratch.stage_gate, 0),
+                        offset(&scratch.stage_up, 0),
+                        offset(&scratch.stage_down, 0),
+                    )
+                }
+            };
 
-        moe_kernels.weighted_accum(
-            offset(&scratch.expert_out, 0),
-            offset(&scratch.topk_weight, k),
-            offset(&scratch.accum, 0),
-            hidden,
-        )?;
-        if row_capture.is_some() {
+            kernels.gemv_quant(
+                moe.gate.dtype,
+                gate_ptr,
+                offset(&scratch.xn, 0),
+                offset(&scratch.ffn_a, 0),
+                moe_cfg.expert_ff_len,
+                hidden,
+            )?;
+            kernels.gemv_quant(
+                moe.up.dtype,
+                up_ptr,
+                offset(&scratch.xn, 0),
+                offset(&scratch.ffn_b, 0),
+                moe_cfg.expert_ff_len,
+                hidden,
+            )?;
+            kernels.silu_mul(
+                offset(&scratch.ffn_a, 0),
+                offset(&scratch.ffn_b, 0),
+                offset(&scratch.ffn_a, 0),
+                moe_cfg.expert_ff_len,
+            )?;
+            kernels.gemv_quant(
+                moe.down.dtype,
+                down_ptr,
+                offset(&scratch.ffn_a, 0),
+                offset(&scratch.expert_out, 0),
+                hidden,
+                moe_cfg.expert_ff_len,
+            )?;
+
             moe_kernels.weighted_accum(
                 offset(&scratch.expert_out, 0),
                 offset(&scratch.topk_weight, k),
-                offset(&scratch.routed_sum, 0),
+                offset(&scratch.accum, 0),
                 hidden,
             )?;
+            if row_capture.is_some() {
+                moe_kernels.weighted_accum(
+                    offset(&scratch.expert_out, 0),
+                    offset(&scratch.topk_weight, k),
+                    offset(&scratch.routed_sum, 0),
+                    hidden,
+                )?;
+            }
         }
     }
     // The routed-only sum, before adding the shared expert's contribution —

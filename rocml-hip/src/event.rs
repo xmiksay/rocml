@@ -41,6 +41,11 @@ impl Event {
         // SAFETY: self.handle was created by hipEventCreate and not yet destroyed.
         check(unsafe { ffi::hipEventSynchronize(self.handle) })
     }
+
+    /// Raw handle for crate-internal use (`Stream::wait_event`).
+    pub(crate) fn handle(&self) -> ffi::hipEvent_t {
+        self.handle
+    }
 }
 
 impl Drop for Event {
@@ -53,6 +58,21 @@ impl Drop for Event {
             }
         }
     }
+}
+
+/// Makes the default (null) stream wait on `event` before executing any
+/// kernel launched on it afterward — the `Stream::wait_event` a *non*-
+/// default stream gets, for the one stream this codebase can't name as a
+/// `Stream` value (every kernel launch's `stream: Option<&Stream>` uses
+/// `None` for it). Used by the qwen35moe decode-overlap lever (M4) so a
+/// default-stream `gemv_quant` read waits for an async copy on the overlap
+/// stream to finish, without the host blocking on either.
+pub fn wait_on_default_stream(event: &Event) -> Result<(), HipError> {
+    // SAFETY: event.handle was created by hipEventCreate and not yet
+    // destroyed; a null stream handle is HIP's documented spelling for the
+    // default stream (same convention `Event::record`/`Function::launch`
+    // already use for `stream: None`).
+    check(unsafe { ffi::hipStreamWaitEvent(ptr::null_mut(), event.handle(), 0) })
 }
 
 /// Milliseconds elapsed between `start` and `stop`'s recorded points.

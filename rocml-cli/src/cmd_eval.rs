@@ -103,6 +103,7 @@ pub fn run(args: &EvalArgs) -> Result<(), RocmlError> {
             kv_rot_sim: args.model_args.kv_rot_sim,
             kv_rot_sim_k: args.model_args.kv_rot_sim_k,
             moe_cache_slots: args.model_args.moe_cache_slots,
+            moe_decode_overlap: args.model_args.moe_decode_overlap,
         },
     )?;
     eprintln!(

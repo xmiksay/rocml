@@ -18,6 +18,6 @@ pub mod module;
 pub use buffer::DeviceBuffer;
 pub use device::{Device, MemoryInfo, Stream};
 pub use error::HipError;
-pub use event::{elapsed_ms, Event};
+pub use event::{elapsed_ms, wait_on_default_stream, Event};
 pub use host_register::{host_register_readonly, host_unregister};
 pub use module::{Function, LaunchConfig, Module};

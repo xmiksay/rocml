@@ -131,6 +131,22 @@ pub struct LoadOptions {
     /// clamped, never an error — this is a performance knob, not a
     /// correctness one). No effect on a non-MoE checkpoint.
     pub moe_cache_slots: Option<usize>,
+    /// M4 lever 2's qwen35moe decode-overlap flag — off by default. When
+    /// on, `moe::moe_ffn_step`'s decode-path routed-expert loop pipelines a
+    /// cache miss's H2D copy (`~146us` for 1.816 MiB, measured
+    /// bandwidth-bound — `.claude/CLAUDE.md`'s M3/M4 sections) on a
+    /// `hipStreamNonBlocking` stream concurrently with the *previous*
+    /// expert's `gemv_quant` compute, instead of paying it inline on the
+    /// default stream before that expert's reads can even be issued. See
+    /// `qwen35::forward::moe_decode_overlap`'s module doc for the full
+    /// event-ordering argument and `.claude/CLAUDE.md` for this lever's
+    /// measured status — **only ever promoted past this off-by-default
+    /// state once `moe_decode_overlap_parity` (bit-identical overlap-on-
+    /// vs-off logits and greedy tokens) and `make test-model` both pass**,
+    /// per the plan's own stream/event correctness guard. No effect on a
+    /// non-MoE checkpoint or when `moe_cache_slots` resolves to 0 (no cache
+    /// at all, M1's always-copy fallback — nothing to overlap).
+    pub moe_decode_overlap: bool,
 }
 
 impl LoadOptions {
@@ -144,11 +160,17 @@ impl LoadOptions {
             kv_rot_sim: None,
             kv_rot_sim_k: false,
             moe_cache_slots: None,
+            moe_decode_overlap: false,
         }
     }
 
     pub fn with_moe_cache_slots(mut self, slots: Option<usize>) -> Self {
         self.moe_cache_slots = slots;
+        self
+    }
+
+    pub fn with_moe_decode_overlap(mut self, overlap: bool) -> Self {
+        self.moe_decode_overlap = overlap;
         self
     }
 

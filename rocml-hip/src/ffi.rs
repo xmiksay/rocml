@@ -16,6 +16,9 @@ pub const hipSuccess: hipError_t = 0;
 /// read-only mmap'd GGUF expert weights this is registering).
 pub const hip_host_register_read_only: u32 = 0x08;
 
+/// Flag for `hipStreamCreateWithFlags` — see that function's doc comment.
+pub const hip_stream_non_blocking: u32 = 0x01;
+
 /// Opaque handles — HIP only ever hands these back and forth as pointers.
 pub type hipStream_t = *mut c_void;
 pub type hipModule_t = *mut c_void;
@@ -71,8 +74,22 @@ extern "C" {
 
     // -- streams --
     pub fn hipStreamCreate(stream: *mut hipStream_t) -> hipError_t;
+    /// Like `hipStreamCreate`, but with `hipStreamNonBlocking`: the created
+    /// stream does *not* implicitly synchronize with the legacy default
+    /// (null) stream the rest of this codebase launches every kernel on.
+    /// Used by the qwen35moe decode-overlap lever (M4) to run an expert-
+    /// weight H2D copy concurrently with default-stream compute — callers
+    /// must establish their own ordering via events (`hipStreamWaitEvent`)
+    /// since the driver no longer does it for them.
+    pub fn hipStreamCreateWithFlags(stream: *mut hipStream_t, flags: u32) -> hipError_t;
     pub fn hipStreamDestroy(stream: hipStream_t) -> hipError_t;
     pub fn hipStreamSynchronize(stream: hipStream_t) -> hipError_t;
+    /// Makes every subsequent operation enqueued on `stream` wait until
+    /// `event` has fired, without blocking the host — the GPU-side ordering
+    /// primitive a non-blocking stream needs in place of the legacy default
+    /// stream's implicit synchronization. `flags` is always 0 (HIP currently
+    /// defines no other value).
+    pub fn hipStreamWaitEvent(stream: hipStream_t, event: hipEvent_t, flags: u32) -> hipError_t;
 
     // -- events (profiling) --
     pub fn hipEventCreate(event: *mut hipEvent_t) -> hipError_t;

@@ -35,6 +35,8 @@ test:
 		--skip dense_fp16_kv_matches_f32_kv_logits_and_greedy_decode \
 		--skip dense_q8_mixed_kv_vs_fp16_logits_and_greedy_stability \
 		--skip dense_q4_mixed_kv_vs_fp16_logits_and_greedy_stability \
+		--skip overlap_on_and_off_produce_bit_identical_output_tiny_cache \
+		--skip overlap_on_and_off_produce_bit_identical_output_production_cache \
 		--skip chat_completions_end_to_end \
 		--skip two_turn_conversation_matches_output_with_snapshots_disabled \
 		--skip qwen35_snapshot_equivalence \
@@ -62,7 +64,11 @@ test-integration:
 # mixed_kv_chunked_prefill_parity's three tests each load two full
 # Qwen3.5-2B models (serial + chunked) — --test-threads=1 avoids up to six
 # concurrent model loads exceeding a 16GB card's VRAM under cargo's default
-# parallel test harness.
+# parallel test harness. moe_decode_overlap_parity's two tests each load two
+# full Ornith-1.5-35B-A3B models sequentially within the test itself, but
+# cargo would still run the two #[test] fns concurrently without
+# --test-threads=1 — four ~35B models competing for one card's VRAM/HIP
+# context segfaults instead of erroring cleanly (measured: SIGSEGV).
 test-model:
 	cargo test --release -p rocml --test greedy_parity
 	cargo test --release -p rocml --test qwen35_cpu_reference
@@ -74,6 +80,7 @@ test-model:
 	cargo test --release -p rocml --test dense_mixed_kv_parity
 	cargo test --release -p rocml --test dense_chunked_prefill_parity
 	cargo test --release -p rocml --test moe_expert_cache_parity
+	cargo test --release -p rocml --test moe_decode_overlap_parity -- --test-threads=1
 	cargo test --release -p rocml --test qwen35moe_chunked_prefill_parity
 	cargo test --release -p rocml --test snapshot_equivalence
 	cargo test --release -p rocml --test snapshot_rewind

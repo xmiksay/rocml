@@ -36,6 +36,10 @@ pub struct ServerConfig {
     /// `rocml::LoadOptions::moe_cache_slots`'s doc comment. `None` (default):
     /// auto-derive from free VRAM.
     pub moe_cache_slots: Option<usize>,
+    /// M4 lever 2's qwen35moe decode-overlap flag — see
+    /// `rocml::LoadOptions::moe_decode_overlap`'s doc comment. `false`
+    /// (default) end to end.
+    pub moe_decode_overlap: bool,
     pub max_tokens_default: usize,
     pub no_think: bool,
     /// Sampling defaults for requests that omit a field — from the resolved
@@ -87,6 +91,7 @@ pub fn build(config: ServerConfig) -> Result<(axum::Router, std::thread::JoinHan
         kv_sink: config.kv_sink,
         kv_window: config.kv_window,
         moe_cache_slots: config.moe_cache_slots,
+        moe_decode_overlap: config.moe_decode_overlap,
         // Issue #14 phase 2's debug quality-simulation flag is
         // research-only (driven through `rocml-cli`'s `eval`/`bench`), not
         // exposed by the server.

@@ -14,13 +14,16 @@
 //! element prefix their own shape needs, the same reasoning `MoeScratch`'s
 //! own oversized buffers already relied on in M1).
 
+mod overlap;
+
 use rocml_core::gguf::GgufFile;
-use rocml_hip::DeviceBuffer;
+use rocml_hip::{DeviceBuffer, Event, Stream};
 
 use super::expert_lru::{ExpertKey, ExpertLru};
 use crate::error::RocmlError;
 use crate::forward::kernels::{offset, DevPtr};
 use crate::qwen35::weights::moe::ExpertTensorMeta;
+use overlap::Overlap;
 
 /// VRAM headroom left unused when auto-sizing the cache from free memory at
 /// load time (`Model::load`) — insurance against driver bookkeeping and
@@ -42,6 +45,7 @@ pub struct ExpertCache {
     down_stride: usize,
     hits: u64,
     misses: u64,
+    overlap: Option<Overlap>,
 }
 
 impl ExpertCache {
@@ -51,15 +55,35 @@ impl ExpertCache {
     /// anything, or an explicit `--moe-cache-slots 0` override) rather than
     /// allocating a degenerate zero-slot cache — callers fall back to
     /// `MoeScratch`'s single-slot stage buffers in that case (the M1 path).
+    /// `overlap` (M4 lever 2, default `false` end to end) allocates the
+    /// non-blocking copy stream and events `super::moe_decode_overlap`
+    /// needs; `false` costs nothing extra.
     pub fn new(
         capacity: usize,
         gate_stride: usize,
         up_stride: usize,
         down_stride: usize,
+        overlap: bool,
     ) -> Result<Option<Self>, RocmlError> {
         if capacity == 0 {
             return Ok(None);
         }
+        let overlap = if overlap {
+            let last_compute_done = Event::new()?;
+            // Recorded once, right here, on the default stream: the very
+            // first `start_copy_async` call (before any real per-token
+            // compute has run) needs a valid, already-fired event to wait
+            // on rather than one that was created but never recorded —
+            // `hipStreamWaitEvent` on an unrecorded event is undefined.
+            last_compute_done.record(None)?;
+            Some(Overlap {
+                stream: Stream::new_non_blocking()?,
+                last_compute_done,
+                copy_done: Event::new()?,
+            })
+        } else {
+            None
+        };
         Ok(Some(Self {
             lru: ExpertLru::new(capacity),
             gate_pool: DeviceBuffer::new(capacity * gate_stride)?,
@@ -70,6 +94,7 @@ impl ExpertCache {
             down_stride,
             hits: 0,
             misses: 0,
+            overlap,
         }))
     }
 
@@ -172,7 +197,7 @@ mod tests {
 
     #[test]
     fn zero_capacity_yields_none() {
-        let cache = ExpertCache::new(0, 1024, 1024, 1024).expect("alloc");
+        let cache = ExpertCache::new(0, 1024, 1024, 1024, false).expect("alloc");
         assert!(cache.is_none());
     }
 
@@ -191,7 +216,7 @@ mod tests {
         let up_stride = up0.per_expert_bytes.max(up1.per_expert_bytes);
         let down_stride = down0.per_expert_bytes.max(down1.per_expert_bytes);
 
-        let mut cache = ExpertCache::new(2, gate_stride, up_stride, down_stride)
+        let mut cache = ExpertCache::new(2, gate_stride, up_stride, down_stride, false)
             .expect("alloc")
             .expect("capacity 2 must yield Some");
 
@@ -245,6 +270,7 @@ mod tests {
             gate.per_expert_bytes,
             up.per_expert_bytes,
             down.per_expert_bytes,
+            false,
         )
         .expect("alloc")
         .expect("capacity 1 must yield Some");

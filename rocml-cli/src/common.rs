@@ -101,6 +101,15 @@ pub struct ModelArgs {
     /// checkpoint.
     #[arg(long)]
     pub moe_cache_slots: Option<usize>,
+    /// M4 lever 2's qwen35moe decode-overlap flag — see
+    /// `rocml::LoadOptions::moe_decode_overlap`'s doc comment. Off by
+    /// default: overlaps a decode-step cache miss's H2D copy with the
+    /// previous expert's compute via a non-blocking stream. This
+    /// codebase's own stream/event correctness guard keeps it off by
+    /// default even here — only `moe_decode_overlap_parity`'s bit-identical
+    /// gate decides whether that default should ever change.
+    #[arg(long)]
+    pub moe_decode_overlap: bool,
 }
 
 impl ModelArgs {

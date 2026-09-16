@@ -29,6 +29,7 @@ mod moe;
 mod moe_cache;
 mod moe_chunk;
 mod moe_chunk_scratch;
+mod moe_decode_overlap;
 mod moe_scratch;
 mod rewind;
 mod scratch;
@@ -312,7 +313,13 @@ impl Model {
                     (capacity * bytes_per_slot) as f64 / (1024.0 * 1024.0),
                     bytes_per_slot as f64 / (1024.0 * 1024.0),
                 );
-                ExpertCache::new(capacity, gate_stride, up_stride, down_stride)?
+                ExpertCache::new(
+                    capacity,
+                    gate_stride,
+                    up_stride,
+                    down_stride,
+                    opts.moe_decode_overlap,
+                )?
             }
             None => None,
         };

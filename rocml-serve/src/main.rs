@@ -85,6 +85,12 @@ struct Args {
     /// non-MoE checkpoint.
     #[arg(long)]
     moe_cache_slots: Option<usize>,
+    /// M4 lever 2's qwen35moe decode-overlap flag — see
+    /// `rocml::LoadOptions::moe_decode_overlap`'s doc comment. Off by
+    /// default; only promoted once `moe_decode_overlap_parity` and
+    /// `make test-model` both pass.
+    #[arg(long)]
+    moe_decode_overlap: bool,
     #[arg(long = "max-tokens-default", default_value_t = 512)]
     max_tokens_default: usize,
     /// Pre-close the `<think>` block on every request (reasoning off).
@@ -166,6 +172,7 @@ async fn run(args: Args) -> Result<(), String> {
         kv_sink: args.kv_sink,
         kv_window: args.kv_window,
         moe_cache_slots: args.moe_cache_slots,
+        moe_decode_overlap: args.moe_decode_overlap,
         max_tokens_default: args.max_tokens_default,
         no_think,
         default_sampling,
