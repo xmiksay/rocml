@@ -15,6 +15,47 @@ use crate::error::RocmlError;
 use crate::load_opts::KvCacheMode;
 use crate::qwen35::config::{LayerKind, Qwen35Config};
 
+/// qwen35moe's routed-expert tensors (`ffn_{gate,up,down}_exps.weight`) are
+/// never uploaded to the GPU (see `crate::qwen35::weights::moe`'s module
+/// doc) — at 18.16 GiB for Ornith-1.5-35B-A3B, treating the whole GGUF file
+/// size as a proxy for uploaded weight bytes (the way every other
+/// architecture's pre-load estimate does, see this module's own doc
+/// comment) would make `registry::clamp_ctx` think a 16GB card can't fit
+/// even the model's non-expert weights, silently clamping `ctx` down to a
+/// tiny number for a model that in reality leaves most of its VRAM free.
+/// This sums only the *non*-expert tensors' on-disk bytes, keeping the same
+/// generous-proxy methodology (on-disk bytes as an upload-byte stand-in)
+/// scoped to the tensors that actually get uploaded.
+fn is_moe_expert_tensor(name: &str) -> bool {
+    name.ends_with(".ffn_gate_exps.weight")
+        || name.ends_with(".ffn_up_exps.weight")
+        || name.ends_with(".ffn_down_exps.weight")
+}
+
+fn tensor_disk_bytes(t: &rocml_core::gguf::TensorInfo) -> u64 {
+    let Some(elems) = t.n_elements() else {
+        return 0;
+    };
+    let block_elems = t.dtype.block_elements() as u64;
+    if block_elems == 0 {
+        return 0;
+    }
+    (elems / block_elems) * t.dtype.block_bytes() as u64
+}
+
+/// Fixed VRAM the MoE per-expert staging pool costs (`MoeScratch`'s three
+/// `stage_{gate,up,down}` buffers) — a few hundred KB to ~1MB each on this
+/// checkpoint's shape, rounded generously up.
+const MOE_STAGING_HEADROOM_BYTES: u64 = 8 * 1024 * 1024;
+
+fn qwen35moe_non_expert_weight_bytes(gguf: &GgufFile) -> u64 {
+    gguf.tensors()
+        .iter()
+        .filter(|t| !is_moe_expert_tensor(&t.name))
+        .map(tensor_disk_bytes)
+        .sum()
+}
+
 /// VRAM accounting for the KIVI-style mixed KV cache (issue #2):
 /// `n_boundary_layers` full-attention layers stay dense fp16 (the plain
 /// [`kv_bytes_per_token`] formula); `n_mixed_layers` split into a per-token
@@ -127,6 +168,15 @@ pub fn estimate_from_gguf(
     let file_bytes = std::fs::metadata(gguf_path).map(|m| m.len()).unwrap_or(0);
     let gguf = GgufFile::open(gguf_path)?;
     let arch = gguf.get_str("general.architecture")?;
+    // Every architecture but qwen35moe uploads (an approximation of) the
+    // whole file as weights, so `file_bytes` is already the right proxy —
+    // see `qwen35moe_non_expert_weight_bytes`'s own doc comment for why
+    // that one architecture needs a different number.
+    let weights_bytes = if arch == "qwen35moe" {
+        qwen35moe_non_expert_weight_bytes(&gguf)
+    } else {
+        file_bytes
+    };
     let (per_token, fixed_overhead, model_ctx_cap) = match arch {
         "qwen3" => {
             let c = ModelConfig::from_gguf(&gguf)?;
@@ -157,7 +207,7 @@ pub fn estimate_from_gguf(
             };
             (per_token, fixed_overhead, c.context_length)
         }
-        "qwen35" => {
+        "qwen35" | "qwen35moe" => {
             let c = Qwen35Config::from_gguf(&gguf)?;
             let n_attn = c
                 .layer_kinds
@@ -188,7 +238,13 @@ pub fn estimate_from_gguf(
                     0,
                 )
             };
-            let fixed_overhead = fixed_overhead + rewind_points_bytes(&c, n_mixed, window_len);
+            let fixed_overhead = fixed_overhead
+                + rewind_points_bytes(&c, n_mixed, window_len)
+                + if c.moe.is_some() {
+                    MOE_STAGING_HEADROOM_BYTES
+                } else {
+                    0
+                };
             (per_token, fixed_overhead, c.context_length)
         }
         other => {
@@ -202,7 +258,7 @@ pub fn estimate_from_gguf(
     let budget = Budget::for_estimated_weights_with_overhead(
         mem.total as u64,
         mem.free as u64,
-        file_bytes,
+        weights_bytes,
         per_token,
         fixed_overhead,
     );
@@ -245,6 +301,7 @@ mod tests {
                 value_dim: 4096,
                 conv_dim: 8192,
             },
+            moe: None,
         }
     }
 

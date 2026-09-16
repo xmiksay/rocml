@@ -36,9 +36,9 @@ impl Model {
             "qwen3" => Ok(Self::Dense(Box::new(crate::forward::Model::load(
                 path, opts,
             )?))),
-            "qwen35" => Ok(Self::Hybrid(Box::new(crate::qwen35::forward::Model::load(
-                path, opts,
-            )?))),
+            "qwen35" | "qwen35moe" => Ok(Self::Hybrid(Box::new(
+                crate::qwen35::forward::Model::load(path, opts)?,
+            ))),
             other => Err(RocmlError::UnsupportedArchitecture {
                 found: other.to_string(),
             }),
