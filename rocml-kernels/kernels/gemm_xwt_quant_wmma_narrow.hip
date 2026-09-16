@@ -33,20 +33,20 @@
 
 extern "C" __global__ void gemm_xwt_wmma_q8_0_narrow(
     const float* x, const void* w, float* out, unsigned rows, unsigned m, unsigned n) {
-    gemm_xwt_wmma_impl<32, 34, 64, 8, 2>(x, (const unsigned char*)w, out, rows, m, n, DequantQ8_0{});
+    gemm_xwt_wmma_impl<32, 34, 128, 64, 8, 2>(x, (const unsigned char*)w, out, rows, m, n, DequantQ8_0{});
 }
 
 extern "C" __global__ void gemm_xwt_wmma_q4_k_narrow(
     const float* x, const void* w, float* out, unsigned rows, unsigned m, unsigned n) {
-    gemm_xwt_wmma_impl<256, 144, 64, 8, 2>(x, (const unsigned char*)w, out, rows, m, n, DequantQ4K{});
+    gemm_xwt_wmma_impl<256, 144, 128, 64, 8, 2>(x, (const unsigned char*)w, out, rows, m, n, DequantQ4K{});
 }
 
 extern "C" __global__ void gemm_xwt_wmma_q5_k_narrow(
     const float* x, const void* w, float* out, unsigned rows, unsigned m, unsigned n) {
-    gemm_xwt_wmma_impl<256, 176, 64, 8, 2>(x, (const unsigned char*)w, out, rows, m, n, DequantQ5K{});
+    gemm_xwt_wmma_impl<256, 176, 128, 64, 8, 2>(x, (const unsigned char*)w, out, rows, m, n, DequantQ5K{});
 }
 
 extern "C" __global__ void gemm_xwt_wmma_q6_k_narrow(
     const float* x, const void* w, float* out, unsigned rows, unsigned m, unsigned n) {
-    gemm_xwt_wmma_impl<256, 210, 64, 8, 2>(x, (const unsigned char*)w, out, rows, m, n, DequantQ6K{});
+    gemm_xwt_wmma_impl<256, 210, 128, 64, 8, 2>(x, (const unsigned char*)w, out, rows, m, n, DequantQ6K{});
 }

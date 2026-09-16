@@ -60,6 +60,23 @@ pub const GEMM_XWT_WMMA_Q5_K_NARROW_KERNEL: &str = "gemm_xwt_wmma_q5_k_narrow";
 pub const GEMM_XWT_WMMA_Q6_K_NARROW_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_NARROW_HSACO;
 pub const GEMM_XWT_WMMA_Q6_K_NARROW_KERNEL: &str = "gemm_xwt_wmma_q6_k_narrow";
 
+/// `kernels/gemm_xwt_quant_wmma_micro.hip` (qwen35moe M4, lever 1): same
+/// contract as the `GEMM_XWT_WMMA_Q*` kernels above, built with the
+/// micro tile config (`TILE_ROWS`=16/`TILE_M`=64/`WARPS_M`=1/`WARPS_N`=4) for
+/// MoE's grouped-by-expert batched GEMM, whose per-expert row groups
+/// (typically 2-16 rows on a 512-token chunk) are far below the default/
+/// narrow configs' `rows >= 128` floor. Opt-in only (`allow_micro` in
+/// `rocml/src/forward/kernels_quant_dispatch.rs`) — see that module's doc.
+pub const GEMM_XWT_WMMA_Q8_0_MICRO_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_xwt_quant_wmma_micro.hsaco"));
+pub const GEMM_XWT_WMMA_Q8_0_MICRO_KERNEL: &str = "gemm_xwt_wmma_q8_0_micro";
+pub const GEMM_XWT_WMMA_Q4_K_MICRO_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_MICRO_HSACO;
+pub const GEMM_XWT_WMMA_Q4_K_MICRO_KERNEL: &str = "gemm_xwt_wmma_q4_k_micro";
+pub const GEMM_XWT_WMMA_Q5_K_MICRO_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_MICRO_HSACO;
+pub const GEMM_XWT_WMMA_Q5_K_MICRO_KERNEL: &str = "gemm_xwt_wmma_q5_k_micro";
+pub const GEMM_XWT_WMMA_Q6_K_MICRO_HSACO: &[u8] = GEMM_XWT_WMMA_Q8_0_MICRO_HSACO;
+pub const GEMM_XWT_WMMA_Q6_K_MICRO_KERNEL: &str = "gemm_xwt_wmma_q6_k_micro";
+
 /// `kernels/gemm_xwt_wmma_splitk.hip` (issue #6's split-K follow-up, for
 /// narrow-grid shapes like ffn-down's `m=hidden, n=intermediate`): same
 /// default `TILE_M`=128 tile config as `GEMM_XWT_WMMA_Q*` above, but a third

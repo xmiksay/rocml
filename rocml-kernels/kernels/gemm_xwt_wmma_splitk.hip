@@ -13,27 +13,27 @@
 extern "C" __global__ void gemm_xwt_wmma_splitk_q8_0(
     const float* x, const void* w, float* partial_out, unsigned rows, unsigned m, unsigned n,
     unsigned num_splits) {
-    gemm_xwt_wmma_splitk_impl<32, 34, 128, 4, 4>(
+    gemm_xwt_wmma_splitk_impl<32, 34, 128, 128, 4, 4>(
         x, (const unsigned char*)w, partial_out, rows, m, n, num_splits, DequantQ8_0{});
 }
 
 extern "C" __global__ void gemm_xwt_wmma_splitk_q4_k(
     const float* x, const void* w, float* partial_out, unsigned rows, unsigned m, unsigned n,
     unsigned num_splits) {
-    gemm_xwt_wmma_splitk_impl<256, 144, 128, 4, 4>(
+    gemm_xwt_wmma_splitk_impl<256, 144, 128, 128, 4, 4>(
         x, (const unsigned char*)w, partial_out, rows, m, n, num_splits, DequantQ4K{});
 }
 
 extern "C" __global__ void gemm_xwt_wmma_splitk_q5_k(
     const float* x, const void* w, float* partial_out, unsigned rows, unsigned m, unsigned n,
     unsigned num_splits) {
-    gemm_xwt_wmma_splitk_impl<256, 176, 128, 4, 4>(
+    gemm_xwt_wmma_splitk_impl<256, 176, 128, 128, 4, 4>(
         x, (const unsigned char*)w, partial_out, rows, m, n, num_splits, DequantQ5K{});
 }
 
 extern "C" __global__ void gemm_xwt_wmma_splitk_q6_k(
     const float* x, const void* w, float* partial_out, unsigned rows, unsigned m, unsigned n,
     unsigned num_splits) {
-    gemm_xwt_wmma_splitk_impl<256, 210, 128, 4, 4>(
+    gemm_xwt_wmma_splitk_impl<256, 210, 128, 128, 4, 4>(
         x, (const unsigned char*)w, partial_out, rows, m, n, num_splits, DequantQ6K{});
 }

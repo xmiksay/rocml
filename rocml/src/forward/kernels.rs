@@ -354,7 +354,12 @@ impl Kernels {
 
     /// `out[rows,m] = X[rows,n] * dequant(W)^T` where `W`'s rows are raw
     /// GGUF `dtype` blocks — batched sibling of [`Self::gemv_quant`], see
-    /// [`LinearWeight`](crate::weights::LinearWeight)`::matmul`.
+    /// [`LinearWeight`](crate::weights::LinearWeight)`::matmul`. `allow_micro`
+    /// (qwen35moe M4 lever 1) opts into the micro-tile WMMA fallback for
+    /// shapes with `rows < 128` — see `kernels_quant_dispatch.rs`'s `gemm`
+    /// doc. `LinearWeight::matmul` (every non-MoE caller) always passes
+    /// `false`; only qwen35moe's grouped-by-expert batched GEMM
+    /// (`qwen35::forward::moe_chunk`) passes `true`.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_quant(
         &self,
@@ -368,6 +373,7 @@ impl Kernels {
         mmq_scratch: MmqScratch,
         mmq_eligible: bool,
         splitk_scratch: SplitKScratch,
+        allow_micro: bool,
     ) -> Result<(), RocmlError> {
         self.quant.gemm(
             dtype,
@@ -380,6 +386,7 @@ impl Kernels {
             mmq_scratch,
             mmq_eligible,
             splitk_scratch,
+            allow_micro,
         )
     }
 

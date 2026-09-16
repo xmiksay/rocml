@@ -134,6 +134,24 @@ const SPLITK_MIN_N: u32 = 256;
 /// section requires.
 const SPLITK_CANDIDATE_SPLITS: [u32; 2] = [4, 2];
 
+/// Output rows a `gemm_xwt_wmma_q*_micro` workgroup tile covers — mirrors
+/// the kernel's `TR` (fixes the launch's grid.y). 16 is WMMA's minimum row
+/// tile (one 16x16 fragment row) — see `gemm_xwt_quant_wmma_micro.hip`'s
+/// module doc for why this exists (qwen35moe M4 lever 1: MoE's grouped-by-
+/// expert batched GEMM averages ~2-16 rows per expert group, far below
+/// `GEMM_WMMA_TILE_ROWS`).
+const GEMM_WMMA_MICRO_TILE_ROWS: u32 = 16;
+/// Output columns the micro `gemm_xwt_wmma_q*_micro` workgroup tile covers
+/// — mirrors the kernel's `TM`. 64 (not 128) to maximize `grid.x` at this
+/// lever's real shapes (`m` in {512, 2048} on Ornith-1.5-35B-A3B's expert
+/// gate/up/down projections) — more, smaller blocks fill the GPU better
+/// than fewer, larger ones when `grid.y` is already tiny.
+const GEMM_WMMA_MICRO_TILE_M: u32 = 64;
+/// Warps per micro WMMA workgroup — fixes the launch's block.y. `WM`=1
+/// (forced: `TR/16`=1 has no other divisor) times `WN`=4
+/// (`TM`/16/WN`=1`, one 16x16 subtile per warp).
+const GEMM_WMMA_MICRO_WARPS_PER_BLOCK: u32 = 4;
+
 /// Picks a fixed, deterministic split count for `(m, n, rows)` — `1` means
 /// "don't split" (falls back to the narrow/default WMMA dispatch below,
 /// unchanged). Pure function of the shape, so the same GEMM call always
@@ -231,6 +249,30 @@ impl QuantKernels {
     /// plus its deterministic ascending-order reduce pass); `1` falls
     /// through to the narrow/default WMMA dispatch below unchanged. See
     /// `SPLITK_BLOCK_THRESHOLD`'s doc for the measured crossover.
+    ///
+    /// **Micro tile, `m >= n` gate (qwen35moe M4 lever 1)**: a standalone
+    /// interleaved perf probe (`rocml-kernels/tests/
+    /// gemm_xwt_quant_wmma_micro_perf.rs`, `rows` in {1,2,4,8,...,127}) at
+    /// Ornith-1.5-35B-A3B's two real expert-projection shapes found the
+    /// micro kernel's own wall time is dominated by `n` (its K-reduction
+    /// depth, `n/K_STAGE`=128 sequential `__syncthreads`-gated iterations
+    /// for `n`=2048) almost independent of `m`/grid width — widening the
+    /// micro block's warp count (a scratch `TM`=128/`WN`=8 experiment) or
+    /// `m` itself (a `m` sweep at fixed `n`=2048, rows=8: 512->2048 moved
+    /// scalar's cost 78->330us but micro's stayed flat at ~300-302us) never
+    /// moved this kernel's time — a genuine architectural property of this
+    /// tiny-block (1-8 warps), heavily-`__syncthreads`-serialized design,
+    /// not a tunable dispatch-layer parameter. Scalar's own cost instead
+    /// scales with `m` (it always gets `m` grid blocks, queuing in waves
+    /// once `m` exceeds the GPU's CU count). Net: down's shape (`m=hidden`
+    /// 2048 `>= n=expert_ff_len` 512) measures a clean 1.3x-2.7x win across
+    /// the whole `rows` range; gate/up's shape (`m=expert_ff_len` 512
+    /// `< n=hidden` 2048) measures a 2.6x-3.8x **regression** at the same
+    /// `rows`, closing to parity only once `m` grows to ~`n` (the `m`-sweep
+    /// crosses 1.0x between `m`=1792 and `m`=2048 at `n`=2048). `m >= n`
+    /// captures this measured crossover directly and routes each of this
+    /// checkpoint's two real shapes to whichever kernel actually wins it,
+    /// rather than a blanket "opt-in always dispatches" rule.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn gemm(
         &self,
@@ -244,6 +286,7 @@ impl QuantKernels {
         mmq_scratch: MmqScratch,
         mmq_eligible: bool,
         splitk_scratch: SplitKScratch,
+        allow_micro: bool,
     ) -> Result<(), RocmlError> {
         let wmma_eligible = rows >= GEMM_WMMA_TILE_ROWS
             && m >= GEMM_WMMA_NARROW_TILE_M
@@ -254,6 +297,18 @@ impl QuantKernels {
         } else {
             1
         };
+        // Micro tile (qwen35moe M4 lever 1): only reachable when the shape
+        // isn't already WMMA-eligible above (`rows < GEMM_WMMA_TILE_ROWS`,
+        // the scalar-fallback zone) and the caller opted in — see
+        // `gemm_wmma_micro_cfg`'s doc for why this stays opt-in rather than
+        // a blanket small-`rows` dispatch for every caller.
+        let micro_eligible = !wmma_eligible
+            && allow_micro
+            && rows >= 1
+            && m >= GEMM_WMMA_MICRO_TILE_M
+            && m >= n
+            && m.is_multiple_of(16)
+            && n.is_multiple_of(16);
         if wmma_eligible && self.mmq_enabled && mmq_eligible && MmqKernels::supports(dtype) {
             self.mmq.gemm(dtype, x, w, out, rows, m, n, mmq_scratch)
         } else if wmma_eligible && num_splits > 1 {
@@ -281,6 +336,8 @@ impl QuantKernels {
                 m,
                 n,
             )
+        } else if micro_eligible {
+            self.gemm_wmma_micro_cfg(self.wmma_micro_fn(dtype)?, x, w, out, rows, m, n)
         } else {
             self.gemm_scalar(dtype, x, w, out, rows, m, n)
         }
@@ -306,6 +363,18 @@ impl QuantKernels {
             GgmlDType::Q6_K => Ok(&self.gemm_wmma_q6_k_narrow_fn),
             other => Err(RocmlError::Config(format!(
                 "gemm_quant: {other:?} has no fused narrow WMMA kernel (internal loader bug)"
+            ))),
+        }
+    }
+
+    fn wmma_micro_fn(&self, dtype: GgmlDType) -> Result<&Function, RocmlError> {
+        match dtype {
+            GgmlDType::Q8_0 => Ok(&self.gemm_wmma_q8_0_micro_fn),
+            GgmlDType::Q4_K => Ok(&self.gemm_wmma_q4_k_micro_fn),
+            GgmlDType::Q5_K => Ok(&self.gemm_wmma_q5_k_micro_fn),
+            GgmlDType::Q6_K => Ok(&self.gemm_wmma_q6_k_micro_fn),
+            other => Err(RocmlError::Config(format!(
+                "gemm_quant: {other:?} has no fused micro WMMA kernel (internal loader bug)"
             ))),
         }
     }
@@ -376,6 +445,47 @@ impl QuantKernels {
         // block/grid/shared_mem_bytes match `function`'s compiled-in
         // TILE_ROWS/tile_m/K_STAGE tiling (caller picks the `function`/
         // `tile_m` pair that match each other).
+        unsafe { function.launch(&cfg, &mut params, None) }.map_err(Into::into)
+    }
+
+    /// Micro-tile WMMA launch (qwen35moe M4 lever 1) — a separate helper
+    /// from [`Self::gemm_wmma_cfg`] rather than a third `tile_rows`/
+    /// `warps_per_block` parameter on it: the micro config's block shape
+    /// (`GEMM_WMMA_MICRO_WARPS_PER_BLOCK`=4, vs 16 for the default/narrow
+    /// configs) and row-tile (16, vs the fixed 128 `gemm_wmma_cfg` bakes
+    /// into its grid.y/shared-mem formula) both differ, and there is only
+    /// one micro config to dispatch to (unlike default-vs-narrow's genuine
+    /// two-way `m`-based choice), so a dedicated function reads more
+    /// directly than threading two more parameters through the shared one.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_wmma_micro_cfg(
+        &self,
+        function: &Function,
+        x: DevPtr,
+        w: DevPtr,
+        out: DevPtr,
+        rows: u32,
+        m: u32,
+        n: u32,
+    ) -> Result<(), RocmlError> {
+        let shared_mem_bytes = 2
+            * (GEMM_WMMA_MICRO_TILE_ROWS + GEMM_WMMA_MICRO_TILE_M)
+            * (GEMM_WMMA_K_STAGE + GEMM_WMMA_LDS_PAD)
+            * size_of::<u16>() as u32;
+        let cfg = LaunchConfig {
+            grid: (
+                m.div_ceil(GEMM_WMMA_MICRO_TILE_M),
+                rows.div_ceil(GEMM_WMMA_MICRO_TILE_ROWS),
+                1,
+            ),
+            block: (32, GEMM_WMMA_MICRO_WARPS_PER_BLOCK, 1),
+            shared_mem_bytes,
+        };
+        let mut params = kernel_params!(x, w, out, rows, m, n);
+        // SAFETY: params matches every gemm_xwt_wmma_<quant>_micro's
+        // signature (const float*, const void*, float*, unsigned x3);
+        // block/grid/shared_mem_bytes match the micro kernels' compiled-in
+        // TR=16/TM=64/WM=1/WN=4 tiling.
         unsafe { function.launch(&cfg, &mut params, None) }.map_err(Into::into)
     }
 }

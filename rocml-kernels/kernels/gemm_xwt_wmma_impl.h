@@ -107,6 +107,26 @@
 // tile are refused by the dispatch layer, not handled here — see
 // `rocml/src/forward/kernels_quant.rs`.
 //
+// Small-`rows`-tile follow-up (qwen35moe M4, lever 1): `TILE_ROWS` (128,
+// below) was a namespace-scope constant until this round because every
+// caller processed a whole `PREFILL_CHUNK_SIZE` chunk (or the model's own
+// dense/attention layers) at once. qwen35moe's grouped-by-expert batched
+// GEMM (`moe_chunk.rs`) is a fundamentally different shape: a 512-token
+// chunk's `chunk_len * top_k` (token, expert) assignments spread over up to
+// 256 experts average only ~2-16 rows per expert group — far short of even
+// one 128-row tile, so every such call fell through to the scalar
+// `gemm_xwt_q*` kernel regardless of this file's WMMA path existing at all.
+// `TILE_ROWS` is now a template parameter (`TR`) like `TM`/`WM`/`WN`, and
+// `gemm_xwt_quant_wmma_micro.hip` instantiates it at `TR=16` (WMMA's
+// minimum row-tile — one 16x16 fragment row, the floor below which the
+// matrix unit can't be fed at all) specifically for this small-group shape.
+// `WM` must divide `TR/16` exactly and `WN` must divide `TM/16` exactly (a
+// real correctness requirement — unlike the `stage_k_tile` load-balance
+// static_assert below, these two ratios size the accumulator array and an
+// inexact division would leave part of the block's own output tile
+// uncomputed), which forces `WM=1` at `TR=16` (`TR/16==1` has no other
+// integer divisor) — see that file for the micro tile's exact `TM`/`WN`.
+//
 // Software pipelining (WMMA-pipeline round, issue #6 follow-up): the
 // straight-line version above staged the K-tile into one LDS buffer, then
 // paid *two* `__syncthreads()` per outer iteration — one so every thread's
@@ -134,16 +154,18 @@ typedef _Float16 half4 __attribute__((ext_vector_type(4)));
 typedef float float8 __attribute__((ext_vector_type(8)));
 typedef float float4_t __attribute__((ext_vector_type(4)));
 
-// `TILE_ROWS`/`K_STAGE` are fixed across every tile config (`TILE_M`/
-// `WARPS_M`/`WARPS_N` are template parameters instead — see this header's
-// module doc's "shape-aware dispatch round"). `TILE_ROWS` = 128 exactly
-// matches `PREFILL_CHUNK_SIZE`, so a full prefill chunk fills one row-tile
-// exactly (`grid.y` = 1) — also why the dispatch layer's WMMA/scalar
-// threshold is `rows >= 128`. `K_STAGE` = 16 (WMMA's minimum) beat every
-// larger value tried (32/64/256): a bigger `K_STAGE` raises LDS-per-block
-// enough to cut how many blocks fit resident per WGP, costing more
-// occupancy than the extra `__syncthreads`/staging overhead saves.
-constexpr unsigned TILE_ROWS = 128;
+// `K_STAGE` is fixed across every tile config (`TILE_ROWS`/`TILE_M`/
+// `WARPS_M`/`WARPS_N` are all template parameters — see this header's module
+// doc's "shape-aware dispatch round" and "small-rows-tile follow-up"). The
+// default/narrow configs' `TILE_ROWS`=128 exactly matches
+// `PREFILL_CHUNK_SIZE`, so a full prefill chunk fills one row-tile exactly
+// (`grid.y` = 1) for those two — also why the dispatch layer's WMMA/scalar
+// threshold is `rows >= 128` for them; the micro config's `TR`=16 has no
+// such correspondence (it targets MoE's per-expert row groups, not a whole
+// chunk). `K_STAGE` = 16 (WMMA's minimum) beat every larger value tried
+// (32/64/256): a bigger `K_STAGE` raises LDS-per-block enough to cut how
+// many blocks fit resident per WGP, costing more occupancy than the extra
+// `__syncthreads`/staging overhead saves.
 constexpr unsigned K_STAGE = 16;
 
 // LDS row stride, padded past `K_STAGE` (per-wave-efficiency round, lever
@@ -183,10 +205,12 @@ __device__ __forceinline__ half16 load_row_frag(
 // Dequant-and-stage one K-tile (`x_tile`/`w_tile`, whichever buffer the
 // caller passes) starting at reduction offset `k0`. Pulled out of
 // `gemm_xwt_wmma_impl` so the pipelined loop below can call it identically
-// for the prologue fill and every steady-state next-buffer fill. `TM`/`WM`/
-// `WN` are this instantiation's tile config (see the two `.hip` files that
+// for the prologue fill and every steady-state next-buffer fill. `TR`/`TM`/
+// `WM`/`WN` are this instantiation's tile config (see the `.hip` files that
 // include this header).
-template <unsigned QK, unsigned BLOCK_BYTES, unsigned TM, unsigned WM, unsigned WN, typename DequantFn>
+template <
+    unsigned QK, unsigned BLOCK_BYTES, unsigned TR, unsigned TM, unsigned WM, unsigned WN,
+    typename DequantFn>
 __device__ __forceinline__ void stage_k_tile(
     _Float16* x_tile, _Float16* w_tile, const float* x, const unsigned char* w, unsigned row_base,
     unsigned col_base, unsigned rows, unsigned m, unsigned n, unsigned blocks_per_row,
@@ -197,9 +221,17 @@ __device__ __forceinline__ void stage_k_tile(
     // X tile: one float4 read + packed half4 LDS store per thread (see the
     // "dequant off the critical path" round's doc above). `elems_here ==
     // K_STAGE` always holds here (same `n % 16 == 0` guarantee the W-tile
-    // tail comment below relies on).
-    static_assert((TILE_ROWS * K_STAGE) % (WPB * 32 * 4) == 0, "bad X-tile vec width");
-    for (unsigned idx4 = tid; idx4 < TILE_ROWS * K_STAGE / 4; idx4 += WPB * 32) {
+    // tail comment below relies on). Unlike the `WM`/`WN` divisibility
+    // requirements above, this grid-stride loop (`idx4 += WPB * 32`) is
+    // correct for *any* `TR`/`WPB` combination — a thread simply stops once
+    // `idx4` passes the element count, whether or not that count is an
+    // exact multiple of the block's thread count. `TR`=128 (the
+    // default/narrow configs) happens to divide evenly and was asserted as
+    // a load-balance sanity check; `TR`=16 (the micro config) does not, and
+    // is simply less thread-balanced for this one small staging step —
+    // never a correctness concern, so the assert was dropped rather than
+    // special-cased per `TR`.
+    for (unsigned idx4 = tid; idx4 < TR * K_STAGE / 4; idx4 += WPB * 32) {
         unsigned xg_row = idx4 / (K_STAGE / 4), xg_off = (idx4 % (K_STAGE / 4)) * 4;
         unsigned row_c = min(row_base + xg_row, rows - 1);
         float4_t v4;
@@ -224,15 +256,19 @@ __device__ __forceinline__ void stage_k_tile(
     }
 }
 
-template <unsigned QK, unsigned BLOCK_BYTES, unsigned TM, unsigned WM, unsigned WN, typename DequantFn>
+template <
+    unsigned QK, unsigned BLOCK_BYTES, unsigned TR, unsigned TM, unsigned WM, unsigned WN,
+    typename DequantFn>
 __device__ __forceinline__ void gemm_xwt_wmma_impl(
     const float* x, const unsigned char* w, float* out, unsigned rows, unsigned m, unsigned n,
     DequantFn dequant_elem) {
-    constexpr unsigned SUBROWS_PER_WARP = (TILE_ROWS / 16) / WM;
+    static_assert(TR % (16 * WM) == 0, "WM must divide TR/16 exactly (see module doc)");
+    static_assert(TM % (16 * WN) == 0, "WN must divide TM/16 exactly (see module doc)");
+    constexpr unsigned SUBROWS_PER_WARP = (TR / 16) / WM;
     constexpr unsigned SUBCOLS_PER_WARP = (TM / 16) / WN;
 
     unsigned col_base = blockIdx.x * TM;
-    unsigned row_base = blockIdx.y * TILE_ROWS;
+    unsigned row_base = blockIdx.y * TR;
     unsigned warp = threadIdx.y;
     unsigned lane = threadIdx.x;
     unsigned tid = warp * 32 + lane;
@@ -240,7 +276,7 @@ __device__ __forceinline__ void gemm_xwt_wmma_impl(
     unsigned wn = warp % WN;
     unsigned blocks_per_row = n / QK;
 
-    constexpr unsigned X_TILE_ELEMS = TILE_ROWS * ROW_STRIDE;
+    constexpr unsigned X_TILE_ELEMS = TR * ROW_STRIDE;
     constexpr unsigned W_TILE_ELEMS = TM * ROW_STRIDE;
     extern __shared__ _Float16 smem[];
     // Double-buffered: buffer 0 then buffer 1, X tile then W tile within
@@ -263,7 +299,7 @@ __device__ __forceinline__ void gemm_xwt_wmma_impl(
     }
 
     // Prologue: fill buffer 0 with the first K-stage before the loop starts.
-    stage_k_tile<QK, BLOCK_BYTES, TM, WM, WN>(
+    stage_k_tile<QK, BLOCK_BYTES, TR, TM, WM, WN>(
         x_base, w_base, x, w, row_base, col_base, rows, m, n, blocks_per_row, 0, tid,
         dequant_elem);
     __syncthreads();
@@ -277,7 +313,7 @@ __device__ __forceinline__ void gemm_xwt_wmma_impl(
         // stage's WMMA math with the load/dequant latency instead of
         // stalling on it every iteration.
         if (next_k0 < n) {
-            stage_k_tile<QK, BLOCK_BYTES, TM, WM, WN>(
+            stage_k_tile<QK, BLOCK_BYTES, TR, TM, WM, WN>(
                 x_base + next * X_TILE_ELEMS, w_base + next * W_TILE_ELEMS, x, w, row_base,
                 col_base, rows, m, n, blocks_per_row, next_k0, tid, dequant_elem);
         }

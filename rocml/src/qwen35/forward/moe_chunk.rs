@@ -260,6 +260,11 @@ pub(crate) fn moe_ffn_chunk_step(
             mmq_scratch,
             false,
             splitk_scratch,
+            // qwen35moe M4 lever 1: expert groups average ~2-16 rows, far
+            // below the default WMMA dispatch floor (128) but the micro
+            // tile (16) can still feed the matrix unit — opt in here, the
+            // one call site this lever targets.
+            true,
         )?;
         kernels.gemm_quant(
             moe.up.dtype,
@@ -272,6 +277,7 @@ pub(crate) fn moe_ffn_chunk_step(
             mmq_scratch,
             false,
             splitk_scratch,
+            true, // gate/up/down all opt into the micro WMMA tile (see the comment above)
         )?;
         kernels.silu_mul(
             offset(&moe_chunk_scratch.group_gate, 0),
@@ -290,6 +296,7 @@ pub(crate) fn moe_ffn_chunk_step(
             mmq_scratch,
             false,
             splitk_scratch,
+            true, // gate/up/down all opt into the micro WMMA tile (see the comment above)
         )?;
         moe_chunk_kernels.scatter_weighted_accum(
             offset(&moe_chunk_scratch.group_down, 0),

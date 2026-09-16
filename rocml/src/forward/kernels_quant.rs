@@ -72,6 +72,16 @@ pub(crate) struct QuantKernels {
     pub(super) gemm_wmma_q5_k_narrow_fn: rocml_hip::Function,
     pub(super) _mod_gemm_wmma_q6_k_narrow: Module,
     pub(super) gemm_wmma_q6_k_narrow_fn: rocml_hip::Function,
+    // Micro (TILE_ROWS=16/TILE_M=64) WMMA variants — qwen35moe M4 lever 1,
+    // opt-in only (see `kernels_quant_dispatch.rs`'s `allow_micro`).
+    pub(super) _mod_gemm_wmma_q8_0_micro: Module,
+    pub(super) gemm_wmma_q8_0_micro_fn: rocml_hip::Function,
+    pub(super) _mod_gemm_wmma_q4_k_micro: Module,
+    pub(super) gemm_wmma_q4_k_micro_fn: rocml_hip::Function,
+    pub(super) _mod_gemm_wmma_q5_k_micro: Module,
+    pub(super) gemm_wmma_q5_k_micro_fn: rocml_hip::Function,
+    pub(super) _mod_gemm_wmma_q6_k_micro: Module,
+    pub(super) gemm_wmma_q6_k_micro_fn: rocml_hip::Function,
     pub(super) mmq: MmqKernels,
     /// Load-time policy (`LoadOptions::with_mmq`, threaded down through
     /// `Kernels::load_all`): whether `gemm` may route an MMQ-eligible call
@@ -151,6 +161,22 @@ impl QuantKernels {
             rocml_kernels::GEMM_XWT_WMMA_Q6_K_NARROW_HSACO,
             rocml_kernels::GEMM_XWT_WMMA_Q6_K_NARROW_KERNEL,
         )?;
+        let (_mod_gemm_wmma_q8_0_micro, gemm_wmma_q8_0_micro_fn) = load(
+            rocml_kernels::GEMM_XWT_WMMA_Q8_0_MICRO_HSACO,
+            rocml_kernels::GEMM_XWT_WMMA_Q8_0_MICRO_KERNEL,
+        )?;
+        let (_mod_gemm_wmma_q4_k_micro, gemm_wmma_q4_k_micro_fn) = load(
+            rocml_kernels::GEMM_XWT_WMMA_Q4_K_MICRO_HSACO,
+            rocml_kernels::GEMM_XWT_WMMA_Q4_K_MICRO_KERNEL,
+        )?;
+        let (_mod_gemm_wmma_q5_k_micro, gemm_wmma_q5_k_micro_fn) = load(
+            rocml_kernels::GEMM_XWT_WMMA_Q5_K_MICRO_HSACO,
+            rocml_kernels::GEMM_XWT_WMMA_Q5_K_MICRO_KERNEL,
+        )?;
+        let (_mod_gemm_wmma_q6_k_micro, gemm_wmma_q6_k_micro_fn) = load(
+            rocml_kernels::GEMM_XWT_WMMA_Q6_K_MICRO_HSACO,
+            rocml_kernels::GEMM_XWT_WMMA_Q6_K_MICRO_KERNEL,
+        )?;
         let mmq = MmqKernels::load_all()?;
         let splitk = SplitKKernels::load_all()?;
 
@@ -187,6 +213,14 @@ impl QuantKernels {
             gemm_wmma_q5_k_narrow_fn,
             _mod_gemm_wmma_q6_k_narrow,
             gemm_wmma_q6_k_narrow_fn,
+            _mod_gemm_wmma_q8_0_micro,
+            gemm_wmma_q8_0_micro_fn,
+            _mod_gemm_wmma_q4_k_micro,
+            gemm_wmma_q4_k_micro_fn,
+            _mod_gemm_wmma_q5_k_micro,
+            gemm_wmma_q5_k_micro_fn,
+            _mod_gemm_wmma_q6_k_micro,
+            gemm_wmma_q6_k_micro_fn,
             mmq,
             mmq_enabled,
             splitk,
