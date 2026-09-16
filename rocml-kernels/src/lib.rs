@@ -369,3 +369,15 @@ pub const GEMM_XWT_MMQ_Q5_K_KERNEL: &str = "gemm_xwt_mmq_q5_k";
 pub const GEMM_XWT_MMQ_Q6_K_HSACO: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_xwt_quant_mmq_q6_k.hsaco"));
 pub const GEMM_XWT_MMQ_Q6_K_KERNEL: &str = "gemm_xwt_mmq_q6_k";
+
+/// `kernels/moe.hip`: mixture-of-experts routing (softmax + top-k +
+/// renormalize, one block per row) plus the small elementwise ops the
+/// host-side per-expert loop uses to build the FFN output accumulator
+/// (`qwen35::weights::moe`'s M1 expert-offload path — see that kernel
+/// source's module doc). All three share one code object.
+pub const MOE_ROUTE_TOPK_F32_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe.hsaco"));
+pub const MOE_ROUTE_TOPK_F32_KERNEL: &str = "moe_route_topk_f32";
+pub const MOE_SHARED_GATE_WRITE_F32_HSACO: &[u8] = MOE_ROUTE_TOPK_F32_HSACO;
+pub const MOE_SHARED_GATE_WRITE_F32_KERNEL: &str = "moe_shared_gate_write_f32";
+pub const MOE_WEIGHTED_ACCUM_F32_HSACO: &[u8] = MOE_ROUTE_TOPK_F32_HSACO;
+pub const MOE_WEIGHTED_ACCUM_F32_KERNEL: &str = "moe_weighted_accum_f32";
