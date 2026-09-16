@@ -7,7 +7,7 @@ ROCML_CHECKPOINT_DIR ?= $(HOME)/checkpoints
 # Dev/test model (fast); override to point at a different checkpoint.
 QWEN_MODEL ?= $(ROCML_CHECKPOINT_DIR)/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf
 
-.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench bench-profile bench-profile-json eval mmq-layer-diff mmq-endtoend-measure mmq-calibrate mmq-smoothquant-measure kv-head-error-measure gdn-wmma-lds-perf gdn-uvvnew-perf rotational-kv-calibrate rotational-kv-measure rotational-kv-sim-parity eval-rotational-v3 llama-layer-diff
+.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench bench-profile bench-profile-json eval eval-moe mmq-layer-diff mmq-endtoend-measure mmq-calibrate mmq-smoothquant-measure kv-head-error-measure gdn-wmma-lds-perf gdn-uvvnew-perf rotational-kv-calibrate rotational-kv-measure rotational-kv-sim-parity eval-rotational-v3 llama-layer-diff
 
 build:
 	cargo build --workspace
@@ -35,6 +35,8 @@ test:
 		--skip dense_fp16_kv_matches_f32_kv_logits_and_greedy_decode \
 		--skip dense_q8_mixed_kv_vs_fp16_logits_and_greedy_stability \
 		--skip dense_q4_mixed_kv_vs_fp16_logits_and_greedy_stability \
+		--skip overlap_on_and_off_produce_bit_identical_output_tiny_cache \
+		--skip overlap_on_and_off_produce_bit_identical_output_production_cache \
 		--skip chat_completions_end_to_end \
 		--skip two_turn_conversation_matches_output_with_snapshots_disabled \
 		--skip qwen35_snapshot_equivalence \
@@ -62,7 +64,11 @@ test-integration:
 # mixed_kv_chunked_prefill_parity's three tests each load two full
 # Qwen3.5-2B models (serial + chunked) — --test-threads=1 avoids up to six
 # concurrent model loads exceeding a 16GB card's VRAM under cargo's default
-# parallel test harness.
+# parallel test harness. moe_decode_overlap_parity's two tests each load two
+# full Ornith-1.5-35B-A3B models sequentially within the test itself, but
+# cargo would still run the two #[test] fns concurrently without
+# --test-threads=1 — four ~35B models competing for one card's VRAM/HIP
+# context segfaults instead of erroring cleanly (measured: SIGSEGV).
 test-model:
 	cargo test --release -p rocml --test greedy_parity
 	cargo test --release -p rocml --test qwen35_cpu_reference
@@ -73,6 +79,9 @@ test-model:
 	cargo test --release -p rocml --test mixed_kv_chunked_prefill_parity -- --test-threads=1
 	cargo test --release -p rocml --test dense_mixed_kv_parity
 	cargo test --release -p rocml --test dense_chunked_prefill_parity
+	cargo test --release -p rocml --test moe_expert_cache_parity
+	cargo test --release -p rocml --test moe_decode_overlap_parity -- --test-threads=1
+	cargo test --release -p rocml --test qwen35moe_chunked_prefill_parity
 	cargo test --release -p rocml --test snapshot_equivalence
 	cargo test --release -p rocml --test snapshot_rewind
 	cargo test --release -p rocml --test snapshot_rewind_turns
@@ -146,6 +155,18 @@ eval:
 		--model ornith-1.5-9b --ctx 16384 \
 		--label ornith15-q4km-fp16kv \
 		--out bench/eval/results/ornith15-q4km-fp16kv.json \
+		--resume
+
+# M3's quality gate: the same issue-15 agentic eval against
+# Ornith-1.5-35B-A3B (qwen35moe), at the same ctx 16384 every other `eval`
+# row uses. Separate target (not folded into `eval` above) since this
+# checkpoint needs the MoE expert cache/offload path and is a much larger
+# download/VRAM footprint than the 9B rows.
+eval-moe:
+	cargo run --release -p rocml-cli -- eval \
+		--model ornith-1.5-35b --ctx 16384 \
+		--label ornith15-35b-q4km \
+		--out bench/eval/results/ornith15-35b-q4km.json \
 		--resume
 
 # Issue #10's per-layer diff harness (`rocml/tests/mmq_layer_diff.rs`):

@@ -12,6 +12,10 @@ use crate::sample::SamplingParams;
 pub enum ModelFamily {
     Qwen3Dense,
     Qwen35Hybrid,
+    /// `general.architecture = "qwen35moe"` (Ornith-1.5-35B-A3B): the same
+    /// hybrid GDN/full-attention body as [`Self::Qwen35Hybrid`], with every
+    /// layer's FFN a mixture of experts (`crate::qwen35::weights::moe`).
+    Qwen35Moe,
 }
 
 /// One known checkpoint: where it lives on Hugging Face, where it's expected
@@ -160,6 +164,25 @@ pub const REGISTRY: &[ModelSpec] = &[
     ModelSpec {
         name: "ornith-9b",
         ..ORNITH_1_5_9B_Q6
+    },
+    ModelSpec {
+        name: "ornith-1.5-35b",
+        family: ModelFamily::Qwen35Moe,
+        // Verified live against the Hugging Face API
+        // (api/models/ornith-ai/Ornith-1.5-35B-A3B-GGUF): repo exists,
+        // sibling file list includes exactly this name alongside
+        // BF16/Q5_K_M/Q6_K/Q8_0 siblings and an mmproj (vision) file this
+        // engine doesn't load.
+        gguf_rel: "Ornith-1.5-35B-A3B-GGUF/Ornith-1.5-35B-Q4_K_M.gguf",
+        hf_repo: "ornith-ai/Ornith-1.5-35B-A3B-GGUF",
+        hf_file: "Ornith-1.5-35B-Q4_K_M.gguf",
+        // 40 forward-pass layers (block_count 41 minus 1 MTP block), same
+        // hybrid GDN/full-attention body as Ornith-1.5-9B — mirrors that
+        // entry's ctx/sampling/thinking defaults rather than guessing new
+        // ones for a checkpoint this engine has no eval data for yet.
+        default_ctx: 8192,
+        sampling: QWEN_THINKING_SAMPLING,
+        thinking_default: true,
     },
     ModelSpec {
         name: "qwen3.5-2b",

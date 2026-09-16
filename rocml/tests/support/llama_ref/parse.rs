@@ -90,7 +90,19 @@ pub fn parse(text: &str) -> Result<RawDump, String> {
                 ));
             }
         }
-        out.insert(canonicalize(&name).to_string(), RawTensor { ne, values });
+        // A ggml auto-suffixed record (e.g. Ornith-1.5-35B's MoE dump:
+        // `attn_post_norm`/`linear_attn_out` each get one "(reshaped)"
+        // duplicate per layer) is skipped rather than stored — its payload
+        // is byte-identical to its un-suffixed sibling (confirmed against
+        // the real dump: same flattened row-major values, just a different
+        // ne1/ne2 factorization of the same row count), so storing it would
+        // only ever waste memory or, on the wrong file ordering, let it
+        // silently clobber the canonical entry `canonicalize` groups it
+        // under. Rows are still parsed and width-validated above (a
+        // malformed suffixed record is still a real error), just not kept.
+        if name == canonicalize(&name) {
+            out.insert(name, RawTensor { ne, values });
+        }
     }
     Ok(out)
 }
@@ -109,12 +121,27 @@ mod tests {
     }
 
     #[test]
-    fn strips_ggml_auto_suffixes_and_keeps_the_last_write() {
+    fn skips_a_reshaped_duplicate_and_keeps_the_canonical_record() {
+        // The canonical record is `ne=[2,1,1,1]` (1 row of 2 cols); its
+        // reshaped duplicate reflows the same 2 elements as `ne=[1,2,1,1]`
+        // (2 rows of 1 col) — a real example of the shape-changes-but-
+        // data-doesn't pattern `attn_post_norm`'s own reshaped duplicate
+        // shows in the real dump.
         let text = "#TENSOR linear_attn_out-0 2 1 1 1\n1 2\n\
-                     #TENSOR linear_attn_out-0 (reshaped) 2 1 1 1\n3 4\n";
+                     #TENSOR linear_attn_out-0 (reshaped) 1 2 1 1\n3\n4\n";
         let dump = parse(text).expect("parse failed");
         assert_eq!(dump.len(), 1);
-        assert_eq!(dump["linear_attn_out-0"].values, vec![3.0, 4.0]);
+        assert_eq!(dump["linear_attn_out-0"].values, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn a_reshaped_only_duplicate_with_bad_data_still_errors() {
+        // The suffixed record is skipped from the *output*, but its rows
+        // are still parsed/width-validated — a malformed suffixed record
+        // must not be silently ignored.
+        let text = "#TENSOR linear_attn_out-0 2 1 1 1\n1 2\n\
+                     #TENSOR linear_attn_out-0 (reshaped) 2 1 1 1\nnot-a-float 4\n";
+        assert!(parse(text).is_err());
     }
 
     #[test]

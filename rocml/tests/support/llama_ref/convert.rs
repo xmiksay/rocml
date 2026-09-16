@@ -35,6 +35,33 @@ pub const NODE_MAP: &[(&str, &str)] = &[
     // the full layer's output (post both residual adds); "l_out" is
     // "post_ffn" run through `build_cvec`, a no-op without control vectors.
     ("resid_post", "l_out"),
+    // qwen35moe-only (M2): a plain-dense-FFN layer's raw dump never has an
+    // "ffn_moe_out"/"ffn_shexp"/etc. node, so these lookups just miss
+    // harmlessly for `qwen35`'s own checkpoints (Qwen3.5-2B, Ornith-1.0-9B)
+    // — see `docs/llama-diff.md` for the numeric identity these rely on:
+    // llama's "ffn_out" = "ffn_moe_out" (routed-experts-only sum) +
+    // "ffn_shexp_gated" (shared expert's gated contribution), confirmed
+    // against the real Ornith-1.5-35B dump layer-by-layer.
+    //
+    // The shared expert's own SiLU(gate)*up — the *only* "ffn_swiglu" a
+    // MoE layer has (the 8 routed experts' own gate/up never combine into
+    // one dumpable tensor). Distinct rocml key from dense's "ffn_gate_silu"
+    // above since the two represent different things for different
+    // architectures.
+    ("moe_shexp_swiglu", "ffn_swiglu"),
+    // The shared expert's raw down-projection output, before gating.
+    ("moe_shexp_down", "ffn_shexp"),
+    // The shared-expert gate's raw logit and its sigmoid.
+    ("moe_shared_gate", "shared_expert_gate"),
+    ("moe_shared_gate_sigmoid", "shared_expert_gate_sigmoid"),
+    // The shared expert's output * sigmoid(gate) — the FFN accumulator's
+    // first write, before any routed expert accumulates on top of it.
+    ("moe_shexp_gated", "ffn_shexp_gated"),
+    // The routed experts' weighted sum alone (no shared-expert term) —
+    // `MoeScratch::routed_sum`, a dedicated accumulator that exists only to
+    // make this comparable (see that field's own doc comment for why
+    // `accum`'s own write order can't be changed to expose this directly).
+    ("moe_routed_sum", "ffn_moe_out"),
 ];
 
 /// GDN-layer-only mappings (`LayerKind::LinearAttention`,

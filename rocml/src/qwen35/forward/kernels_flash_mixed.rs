@@ -15,7 +15,7 @@ use rocml_hip::{kernel_params, LaunchConfig, Module};
 use crate::error::RocmlError;
 use crate::forward::kernels::{load, DevPtr};
 use crate::forward::kernels_flash::{
-    attn_prefill_flash_splits, ATTN_PREFILL_FLASH_BC, ATTN_PREFILL_FLASH_BR,
+    attn_prefill_flash_br, attn_prefill_flash_splits, ATTN_PREFILL_FLASH_BC, ATTN_PREFILL_FLASH_BR,
 };
 
 pub(crate) struct FlashPrefillMixedKernels {
@@ -23,6 +23,14 @@ pub(crate) struct FlashPrefillMixedKernels {
     partial_q8_fn: rocml_hip::Function,
     _mod_partial_q4: Module,
     partial_q4_fn: rocml_hip::Function,
+    /// `BR=4` siblings (`attn_prefill_flash_mixed_narrow.hip`) — see
+    /// `crate::forward::kernels_flash::attn_prefill_flash_br`'s doc comment
+    /// for when these run instead (this path has no shallow-depth,
+    /// non-flash fallback to fall back to, unlike the dense path).
+    _mod_partial_q8_br4: Module,
+    partial_q8_br4_fn: rocml_hip::Function,
+    _mod_partial_q4_br4: Module,
+    partial_q4_br4_fn: rocml_hip::Function,
     _mod_reduce: Module,
     reduce_fn: rocml_hip::Function,
 }
@@ -36,6 +44,14 @@ impl FlashPrefillMixedKernels {
         let (_mod_partial_q4, partial_q4_fn) = load(
             rocml_kernels::ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q4_HSACO,
             rocml_kernels::ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q4_KERNEL,
+        )?;
+        let (_mod_partial_q8_br4, partial_q8_br4_fn) = load(
+            rocml_kernels::ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q8_BR4_HSACO,
+            rocml_kernels::ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q8_BR4_KERNEL,
+        )?;
+        let (_mod_partial_q4_br4, partial_q4_br4_fn) = load(
+            rocml_kernels::ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q4_BR4_HSACO,
+            rocml_kernels::ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q4_BR4_KERNEL,
         )?;
         // Same code object/entry point `crate::forward::kernels_flash`
         // already loads for the dense path — loaded again here as an
@@ -51,6 +67,10 @@ impl FlashPrefillMixedKernels {
             partial_q8_fn,
             _mod_partial_q4,
             partial_q4_fn,
+            _mod_partial_q8_br4,
+            partial_q8_br4_fn,
+            _mod_partial_q4_br4,
+            partial_q4_br4_fn,
             _mod_reduce,
             reduce_fn,
         })
@@ -95,13 +115,16 @@ impl FlashPrefillMixedKernels {
         scale: f32,
     ) -> Result<(), RocmlError> {
         let group = n_heads / n_kv_heads;
+        // See `attn_prefill_flash_br`'s doc comment — a wide-GQA checkpoint
+        // (Ornith-1.5-35B-A3B's `group=8`) needs the narrower `BR=4` kernel.
+        let br = attn_prefill_flash_br(group)?;
         let (n_splits, split_len) =
-            attn_prefill_flash_splits(n_kv_heads, chunk_len, pos_base + chunk_len);
-        let num_row_tiles = chunk_len.div_ceil(ATTN_PREFILL_FLASH_BR);
+            attn_prefill_flash_splits(n_kv_heads, chunk_len, pos_base + chunk_len, br);
+        let num_row_tiles = chunk_len.div_ceil(br);
 
         let partial_cfg = LaunchConfig {
             grid: (n_kv_heads, num_row_tiles, n_splits),
-            block: (32, group, ATTN_PREFILL_FLASH_BR),
+            block: (32, group, br),
             shared_mem_bytes: 2 * ATTN_PREFILL_FLASH_BC * head_dim * size_of::<f32>() as u32,
         };
         let mut partial_params = kernel_params!(
@@ -131,14 +154,15 @@ impl FlashPrefillMixedKernels {
             n_splits,
             scale
         );
-        let partial_fn = if v_bits == 8 {
-            &self.partial_q8_fn
-        } else {
-            &self.partial_q4_fn
+        let partial_fn = match (v_bits, br == ATTN_PREFILL_FLASH_BR) {
+            (8, true) => &self.partial_q8_fn,
+            (8, false) => &self.partial_q8_br4_fn,
+            (_, true) => &self.partial_q4_fn,
+            (_, false) => &self.partial_q4_br4_fn,
         };
-        // SAFETY: params matches attn_prefill_flash_partial_mixed_{q8,q4}'s
-        // signature exactly (see that kernel's own doc comment); block =
-        // (32, group, ATTN_PREFILL_FLASH_BR) matches its row-tiled design;
+        // SAFETY: params matches attn_prefill_flash_partial_mixed_{q8,q4}
+        // [_br4]'s signature exactly (see that kernel's own doc comment);
+        // block = (32, group, br) matches whichever kernel `br` selected;
         // grid.z = n_splits.
         unsafe { partial_fn.launch(&partial_cfg, &mut partial_params, None) }?;
 

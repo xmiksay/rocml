@@ -16,3 +16,4 @@ serde = { version = "1", features = ["derive"] }
 # arguments) must reproduce the caller's JSON key order byte-for-byte to
 # match the official Jinja template's rendering.
 serde_json = { version = "1", features = ["preserve_order"] }
+lru = "0.18.4"

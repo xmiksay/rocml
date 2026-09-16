@@ -35,15 +35,17 @@
 
 namespace {
 
-template <unsigned QK, unsigned BLOCK_BYTES, unsigned TM, unsigned WM, unsigned WN, typename DequantFn>
+template <
+    unsigned QK, unsigned BLOCK_BYTES, unsigned TR, unsigned TM, unsigned WM, unsigned WN,
+    typename DequantFn>
 __device__ __forceinline__ void gemm_xwt_wmma_splitk_impl(
     const float* x, const unsigned char* w, float* partial_out, unsigned rows, unsigned m,
     unsigned n, unsigned num_splits, DequantFn dequant_elem) {
-    constexpr unsigned SUBROWS_PER_WARP = (TILE_ROWS / 16) / WM;
+    constexpr unsigned SUBROWS_PER_WARP = (TR / 16) / WM;
     constexpr unsigned SUBCOLS_PER_WARP = (TM / 16) / WN;
 
     unsigned col_base = blockIdx.x * TM;
-    unsigned row_base = blockIdx.y * TILE_ROWS;
+    unsigned row_base = blockIdx.y * TR;
     unsigned split = blockIdx.z;
     unsigned warp = threadIdx.y;
     unsigned lane = threadIdx.x;
@@ -56,7 +58,7 @@ __device__ __forceinline__ void gemm_xwt_wmma_splitk_impl(
     unsigned k_start = split * split_size;
     unsigned k_end = k_start + split_size;
 
-    constexpr unsigned X_TILE_ELEMS = TILE_ROWS * ROW_STRIDE;
+    constexpr unsigned X_TILE_ELEMS = TR * ROW_STRIDE;
     constexpr unsigned W_TILE_ELEMS = TM * ROW_STRIDE;
     extern __shared__ _Float16 smem[];
     _Float16* x_base = smem;
@@ -72,7 +74,7 @@ __device__ __forceinline__ void gemm_xwt_wmma_splitk_impl(
     }
 
     // Prologue: fill buffer 0 with this split's first K-stage.
-    stage_k_tile<QK, BLOCK_BYTES, TM, WM, WN>(
+    stage_k_tile<QK, BLOCK_BYTES, TR, TM, WM, WN>(
         x_base, w_base, x, w, row_base, col_base, rows, m, n, blocks_per_row, k_start, tid,
         dequant_elem);
     __syncthreads();
@@ -82,7 +84,7 @@ __device__ __forceinline__ void gemm_xwt_wmma_splitk_impl(
         unsigned next_k0 = k0 + K_STAGE;
         unsigned next = cur ^ 1;
         if (next_k0 < k_end) {
-            stage_k_tile<QK, BLOCK_BYTES, TM, WM, WN>(
+            stage_k_tile<QK, BLOCK_BYTES, TR, TM, WM, WN>(
                 x_base + next * X_TILE_ELEMS, w_base + next * W_TILE_ELEMS, x, w, row_base,
                 col_base, rows, m, n, blocks_per_row, next_k0, tid, dequant_elem);
         }

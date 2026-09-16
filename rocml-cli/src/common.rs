@@ -93,6 +93,23 @@ pub struct ModelArgs {
     /// effect unless `--kv-rot-sim` is set.
     #[arg(long)]
     pub kv_rot_sim_k: bool,
+    /// M2's qwen35moe VRAM-resident expert cache slot count override — see
+    /// `rocml::LoadOptions::moe_cache_slots`'s doc comment. Unset (default):
+    /// auto-derive the largest capacity that fits in whatever VRAM is left
+    /// after every other allocation. `0` disables the cache entirely
+    /// (M1's always-copy-from-mmap path). No effect on a non-MoE
+    /// checkpoint.
+    #[arg(long)]
+    pub moe_cache_slots: Option<usize>,
+    /// M4 lever 2's qwen35moe decode-overlap flag — see
+    /// `rocml::LoadOptions::moe_decode_overlap`'s doc comment. Off by
+    /// default: overlaps a decode-step cache miss's H2D copy with the
+    /// previous expert's compute via a non-blocking stream. This
+    /// codebase's own stream/event correctness guard keeps it off by
+    /// default even here — only `moe_decode_overlap_parity`'s bit-identical
+    /// gate decides whether that default should ever change.
+    #[arg(long)]
+    pub moe_decode_overlap: bool,
 }
 
 impl ModelArgs {

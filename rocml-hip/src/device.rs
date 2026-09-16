@@ -3,6 +3,7 @@ use std::ffi::{c_char, CStr};
 use std::ptr;
 
 use crate::error::{check, HipError};
+use crate::event::Event;
 use crate::ffi;
 
 /// Free/total device memory in bytes, as reported by `hipMemGetInfo`.
@@ -84,9 +85,34 @@ impl Stream {
         Ok(Self { handle })
     }
 
+    /// A stream created with `hipStreamNonBlocking`: unlike [`Self::new`]'s
+    /// stream, this one does *not* implicitly synchronize with the legacy
+    /// default (null) stream — every other kernel launch in this codebase
+    /// runs on that default stream, so ordering against it must be
+    /// established explicitly (`Event`/`wait_event`). Used by the
+    /// qwen35moe decode-overlap lever (M4) to copy an expert's weight
+    /// bytes concurrently with unrelated default-stream compute.
+    pub fn new_non_blocking() -> Result<Self, HipError> {
+        let mut handle: ffi::hipStream_t = ptr::null_mut();
+        // SAFETY: `handle` is a valid out-param location for the new stream handle.
+        check(unsafe { ffi::hipStreamCreateWithFlags(&mut handle, ffi::hip_stream_non_blocking) })?;
+        Ok(Self { handle })
+    }
+
     pub fn synchronize(&self) -> Result<(), HipError> {
         // SAFETY: self.handle was created by hipStreamCreate and not yet destroyed.
         check(unsafe { ffi::hipStreamSynchronize(self.handle) })
+    }
+
+    /// Makes every operation enqueued on this stream *after* this call wait
+    /// (on the GPU, not the host) until `event` has fired — the ordering
+    /// primitive a [`Self::new_non_blocking`] stream needs in place of the
+    /// legacy default stream's implicit synchronization.
+    pub fn wait_event(&self, event: &Event) -> Result<(), HipError> {
+        // SAFETY: self.handle and event.handle were both created by their
+        // respective `hip*Create*` calls and not yet destroyed; `flags` is
+        // always 0 per HIP's own contract (no other value is defined).
+        check(unsafe { ffi::hipStreamWaitEvent(self.handle, event.handle(), 0) })
     }
 
     /// Raw handle for crate-internal use (kernel launches).

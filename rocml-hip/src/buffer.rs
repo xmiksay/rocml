@@ -196,6 +196,55 @@ impl<T: Copy> DeviceBuffer<T> {
         })
     }
 
+    /// Async counterpart of [`Self::copy_range_from_host`], enqueued on
+    /// `stream` instead of the default stream — returns to the caller as
+    /// soon as the copy is queued, before it necessarily completes on the
+    /// GPU. Used by the qwen35moe decode-overlap lever (M4) to run an
+    /// expert-weight H2D copy concurrently with unrelated default-stream
+    /// compute. Same bounds-checking contract as the sync version.
+    ///
+    /// # Safety
+    /// The caller must keep `data` alive and the destination range
+    /// unread/unwritten by anything else until the copy actually completes
+    /// on `stream` (via an event the caller waits on, or
+    /// `stream.synchronize()`) — unlike the sync version, this function
+    /// returning does not mean the copy is done.
+    pub unsafe fn copy_range_from_host_async(
+        &mut self,
+        offset: usize,
+        data: &[T],
+        stream: &crate::device::Stream,
+    ) -> Result<(), HipError> {
+        let end = offset
+            .checked_add(data.len())
+            .ok_or(HipError::LengthMismatch {
+                expected: self.len,
+                actual: usize::MAX,
+            })?;
+        if end > self.len {
+            return Err(HipError::LengthMismatch {
+                expected: self.len,
+                actual: end,
+            });
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let elem_size = mem::size_of::<T>();
+        // SAFETY: bounds checked above like the sync version; `data` and the
+        // destination range's lifetime/exclusivity past this call is the
+        // caller's own contract per this function's doc comment.
+        check(unsafe {
+            ffi::hipMemcpyAsync(
+                (self.ptr as *mut u8).add(offset * elem_size) as *mut c_void,
+                data.as_ptr() as *const c_void,
+                mem::size_of_val(data),
+                ffi::hip_memcpy_host_to_device,
+                stream.handle(),
+            )
+        })
+    }
+
     /// Raw device pointer, valid for use as a kernel launch argument (via
     /// [`crate::kernel_params!`]) as long as `self` is not dropped and no
     /// concurrent host access races the kernel's device-side access.

@@ -10,8 +10,10 @@ mod chunk_forward;
 pub(crate) mod chunk_kernels;
 mod chunk_scratch;
 mod decode_forward;
+mod expert_lru;
 mod ffn;
 mod ffn_chunk;
+mod ffn_chunk_dispatch;
 mod gdn;
 mod gdn_chunk;
 mod gdn_chunkwise;
@@ -20,7 +22,15 @@ mod gdn_chunkwise_kernels_wmma;
 mod kernels;
 pub(crate) mod kernels_flash_mixed;
 pub(crate) mod kernels_mixed;
+mod kernels_moe;
+mod kernels_moe_chunk;
 pub mod layer_capture;
+mod moe;
+mod moe_cache;
+mod moe_chunk;
+mod moe_chunk_scratch;
+mod moe_decode_overlap;
+mod moe_scratch;
 mod rewind;
 mod scratch;
 mod snapshot;
@@ -34,6 +44,12 @@ use gdn_chunkwise_kernels_wmma::GdnChunkwiseWmmaKernels;
 use kernels::HybridKernels;
 use kernels_flash_mixed::FlashPrefillMixedKernels;
 use kernels_mixed::MixedKernels;
+use kernels_moe::MoeKernels;
+use kernels_moe_chunk::MoeChunkKernels;
+use moe_cache::ExpertCache;
+use moe_chunk::MoeChunkHost;
+use moe_chunk_scratch::MoeChunkScratch;
+use moe_scratch::MoeScratch;
 use rocml_core::gguf::GgufFile;
 use rocml_hip::{Device, MemoryInfo};
 use scratch::Scratch;
@@ -86,6 +102,43 @@ pub struct Model {
     /// GPU-resident rewind points, the snapshot layer's hot tier — see
     /// `rewind.rs`. Allocated lazily on first save, never on load.
     rewind: rewind::RewindPoints,
+    /// qwen35moe's mixture-of-experts router + accumulate kernels — loaded
+    /// unconditionally like every other kernel set (cheap; keeps `Model`'s
+    /// shape independent of whether this checkpoint is MoE).
+    moe_kernels: MoeKernels,
+    /// `Some` only for a `general.architecture = "qwen35moe"` checkpoint —
+    /// the routed-expert tensors are never uploaded to the GPU (see
+    /// `crate::qwen35::weights::moe`'s module doc), so every MoE FFN step
+    /// needs the GGUF's mmap kept alive for the model's whole lifetime to
+    /// read an expert's raw bytes on demand. `None` for a plain `"qwen35"`
+    /// checkpoint, which drops its `GgufFile` at the end of `Self::load`
+    /// like every architecture did before this milestone.
+    gguf: Option<GgufFile>,
+    /// `Some` exactly when `gguf`/`config.moe` are `Some` — see
+    /// `moe_scratch::MoeScratch`.
+    moe_scratch: Option<MoeScratch>,
+    /// M2's VRAM-resident LRU expert cache (`moe_cache::ExpertCache`) —
+    /// `Some` for a MoE checkpoint whenever any VRAM was left to cache
+    /// experts in after every other allocation (see its construction at the
+    /// end of `Self::load`, sized from real free VRAM at that point, not an
+    /// upfront estimate); `None` for a non-MoE checkpoint, or a MoE one with
+    /// an explicit `--moe-cache-slots 0` override, or (rare) a card with no
+    /// headroom left — either way `moe::moe_ffn_step` falls back to
+    /// `MoeScratch`'s single-slot staging buffers (M1's always-copy path).
+    expert_cache: Option<ExpertCache>,
+    /// M3's grouped-by-expert batched-GEMM kernels for chunked prefill — see
+    /// `moe_chunk.rs`'s module doc. Loaded unconditionally like every other
+    /// kernel set; `moe_chunk_scratch`/`moe_chunk_host` are the ones gated
+    /// on `config.moe.is_some()`.
+    moe_chunk_kernels: MoeChunkKernels,
+    /// `Some` exactly when `moe_scratch` is — the chunk-batched scratch
+    /// `moe_chunk::moe_ffn_chunk_step` needs alongside the still-present
+    /// per-row `MoeScratch` (used by decode and by the `LayerCapture`
+    /// diagnostic fallback — see `ffn_chunk_dispatch.rs`).
+    moe_chunk_scratch: Option<MoeChunkScratch>,
+    /// Host-side expert-bucketing scratch for the grouped chunked-prefill
+    /// path — `Some` alongside `moe_chunk_scratch`.
+    moe_chunk_host: Option<MoeChunkHost>,
     pos: u32,
 }
 
@@ -104,6 +157,29 @@ impl Model {
         let gguf = GgufFile::open(gguf_path)?;
         let config = Qwen35Config::from_gguf(&gguf)?;
         let weights = ModelWeights::load(&gguf, &config)?;
+        let moe_kernels = MoeKernels::load_all()?;
+        let moe_chunk_kernels = MoeChunkKernels::load_all()?;
+        let moe_scratch = config
+            .moe
+            .as_ref()
+            .map(|moe_cfg| MoeScratch::new(&config, moe_cfg, &weights))
+            .transpose()?;
+        let moe_chunk_scratch = config
+            .moe
+            .as_ref()
+            .map(|moe_cfg| MoeChunkScratch::new(&config, moe_cfg))
+            .transpose()?;
+        let moe_chunk_host = config
+            .moe
+            .as_ref()
+            .map(|moe_cfg| MoeChunkHost::new(moe_cfg, chunk_scratch::CHUNK_CAP));
+        // Only a qwen35moe checkpoint needs its GGUF's mmap kept alive past
+        // this point — see the `gguf` field's doc comment.
+        let gguf = if config.moe.is_some() {
+            Some(gguf)
+        } else {
+            None
+        };
 
         let n_attn_layers = config
             .layer_kinds
@@ -205,6 +281,49 @@ impl Model {
         let gdn_cw_wmma_kernels = GdnChunkwiseWmmaKernels::load_all()?;
         let chunk_scratch = ChunkScratch::new(&config)?;
 
+        // M2's expert cache is sized last, from the *actual* free VRAM left
+        // after every other allocation above (weights, KV cache, every
+        // kernel/scratch buffer, the rewind reservation) — deliberately not
+        // part of the pre-KV `Budget` check above, since caching more or
+        // fewer experts only changes decode throughput, never correctness
+        // (a miss falls back to M1's copy-every-time path). See
+        // `moe_cache::ExpertCache`'s doc comment for the slot-stride layout.
+        let expert_cache = match config.moe.as_ref() {
+            Some(moe_cfg) => {
+                let (gate_stride, up_stride, down_stride) =
+                    moe_scratch::per_tensor_max_bytes(&weights);
+                let bytes_per_slot = gate_stride + up_stride + down_stride;
+                let total_experts =
+                    moe_scratch::total_distinct_experts(&weights, moe_cfg.expert_count);
+                let capacity = if bytes_per_slot == 0 || total_experts == 0 {
+                    0
+                } else {
+                    let mem_now = device.memory_info()?;
+                    let usable = mem_now
+                        .free
+                        .saturating_sub(moe_cache::EXPERT_CACHE_SAFETY_MARGIN_BYTES);
+                    let by_vram = usable / bytes_per_slot;
+                    opts.moe_cache_slots
+                        .unwrap_or(usize::MAX)
+                        .min(by_vram)
+                        .min(total_experts)
+                };
+                eprintln!(
+                    "moe expert cache: {capacity}/{total_experts} slots ({:.0} MiB, {:.1} MiB/slot)",
+                    (capacity * bytes_per_slot) as f64 / (1024.0 * 1024.0),
+                    bytes_per_slot as f64 / (1024.0 * 1024.0),
+                );
+                ExpertCache::new(
+                    capacity,
+                    gate_stride,
+                    up_stride,
+                    down_stride,
+                    opts.moe_decode_overlap,
+                )?
+            }
+            None => None,
+        };
+
         Ok(Self {
             _device: device,
             config,
@@ -220,6 +339,13 @@ impl Model {
             gdn_cw_wmma_kernels,
             chunk_scratch,
             rewind: rewind::RewindPoints::default(),
+            moe_kernels,
+            gguf,
+            moe_scratch,
+            expert_cache,
+            moe_chunk_kernels,
+            moe_chunk_scratch,
+            moe_chunk_host,
             pos: 0,
         })
     }
@@ -234,6 +360,17 @@ impl Model {
 
     pub fn position(&self) -> u32 {
         self.pos
+    }
+
+    /// `(hits, misses, occupancy, capacity)` since load for M2's expert
+    /// cache — `None` for a non-MoE checkpoint or a MoE one that ended up
+    /// with no cache at all (see `expert_cache`'s doc comment). `bench`/
+    /// tests use this to report the measured cache hit rate.
+    pub fn moe_cache_stats(&self) -> Option<(u64, u64, usize, usize)> {
+        self.expert_cache.as_ref().map(|c| {
+            let (hits, misses) = c.stats();
+            (hits, misses, c.occupancy(), c.capacity())
+        })
     }
 
     /// Resets decode position and zeroes every GDN layer's conv/recurrence

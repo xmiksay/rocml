@@ -284,6 +284,27 @@ pub fn run_gemm_wmma_kernel(
     n: u32,
     tile_m: u32,
 ) -> Vec<f32> {
+    run_gemm_wmma_kernel_cfg(hsaco, kernel_name, w_bytes, x, rows, m, n, 128, tile_m, 16)
+}
+
+/// Same contract as [`run_gemm_wmma_kernel`], generalized over `tile_rows`
+/// (the kernel's `TR`) and `warps_per_block` (`WM*WN`) — the micro tile
+/// config (qwen35moe M4 lever 1: `TR`=16/`TM`=64/`WM`=1/`WN`=4, so
+/// `warps_per_block`=4) doesn't share the default/narrow configs' fixed
+/// `TILE_ROWS`=128/`WARPS_PER_BLOCK`=16.
+#[allow(clippy::too_many_arguments)]
+pub fn run_gemm_wmma_kernel_cfg(
+    hsaco: &[u8],
+    kernel_name: &str,
+    w_bytes: &[u8],
+    x: &[f32],
+    rows: u32,
+    m: u32,
+    n: u32,
+    tile_rows: u32,
+    tile_m: u32,
+    warps_per_block: u32,
+) -> Vec<f32> {
     let _device = Device::new(0).expect("failed to select device 0");
     let module = Module::load_from_bytes(hsaco).expect("module load failed");
     let function = module
@@ -301,17 +322,15 @@ pub fn run_gemm_wmma_kernel(
     let out_ptr: *mut c_void = buf_out.device_ptr();
     let mut params = kernel_params!(x_ptr, w_ptr, out_ptr, rows, m, n);
 
-    const TILE_ROWS: u32 = 128;
     const K_STAGE: u32 = 16;
     // LDS row-stride padding (lever 2) — must match the kernel's `LDS_PAD`.
     const LDS_PAD: u32 = 8;
-    const WARPS_PER_BLOCK: u32 = 16;
     let cfg = LaunchConfig {
-        grid: (m.div_ceil(tile_m), rows.div_ceil(TILE_ROWS), 1),
-        block: (32, WARPS_PER_BLOCK, 1),
+        grid: (m.div_ceil(tile_m), rows.div_ceil(tile_rows), 1),
+        block: (32, warps_per_block, 1),
         // x2: double-buffered LDS K-stage tiles (WMMA pipelining round).
         shared_mem_bytes: 2
-            * (TILE_ROWS + tile_m)
+            * (tile_rows + tile_m)
             * (K_STAGE + LDS_PAD)
             * std::mem::size_of::<u16>() as u32,
     };

@@ -197,6 +197,11 @@ impl LinearWeight {
                 mmq_scratch,
                 *mmq_eligible,
                 splitk_scratch,
+                // Micro-tile WMMA (qwen35moe M4 lever 1) is opt-in per call
+                // site, not per shape — every non-MoE caller reaches this
+                // `matmul`, so it stays off here; only qwen35moe's grouped
+                // GEMM (`moe_chunk.rs`) requests it directly.
+                false,
             ),
         }
     }

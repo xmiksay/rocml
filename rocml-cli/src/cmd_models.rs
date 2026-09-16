@@ -33,5 +33,6 @@ fn family_label(family: ModelFamily) -> &'static str {
     match family {
         ModelFamily::Qwen3Dense => "qwen3-dense",
         ModelFamily::Qwen35Hybrid => "qwen3.5-hybrid",
+        ModelFamily::Qwen35Moe => "qwen3.5-moe",
     }
 }

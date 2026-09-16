@@ -21,10 +21,44 @@ use crate::error::RocmlError;
 /// the same mechanism `attn_prefill.hip`'s `ROW_TILE` uses — a
 /// register-resident-loop first draft of this measured worse, see the
 /// kernel source's module doc). Must match `BR` in
-/// `kernels/attn_prefill_flash.hip`.
+/// `kernels/attn_prefill_flash.hip`. This is the *default*; see
+/// [`attn_prefill_flash_br`] for when the narrower [`ATTN_PREFILL_FLASH_BR_NARROW`]
+/// is used instead.
 pub(crate) const ATTN_PREFILL_FLASH_BR: u32 = 8;
+/// `BR` for a wide-GQA checkpoint (`group > 4`) where `32 * group *
+/// ATTN_PREFILL_FLASH_BR` would exceed gfx1101's per-workgroup thread
+/// limit — must match `BR` in `kernels/attn_prefill_flash_narrow.hip`. See
+/// [`attn_prefill_flash_br`].
+pub(crate) const ATTN_PREFILL_FLASH_BR_NARROW: u32 = 4;
+/// gfx1101's (and every RDNA GPU's) hard per-workgroup thread cap —
+/// `hipModuleLaunchKernel` fails with `hipErrorInvalidValue` ("invalid
+/// argument") past this, discovered via Ornith-1.5-35B-A3B's `group=8`
+/// full-attention heads (M2): `32 * 8 * ATTN_PREFILL_FLASH_BR(8) = 2048`.
+const MAX_THREADS_PER_BLOCK: u32 = 1024;
 /// KV tile rows staged into LDS per outer iteration — must match `BC`.
 pub(crate) const ATTN_PREFILL_FLASH_BC: u32 = 16;
+
+/// Picks the largest `BR` (`{ATTN_PREFILL_FLASH_BR, ATTN_PREFILL_FLASH_BR_NARROW}`)
+/// whose block (`32 * group * BR`) still fits gfx1101's
+/// [`MAX_THREADS_PER_BLOCK`] — every previously-tested qwen35/qwen35moe
+/// checkpoint has `group <= 4` and gets the default `BR=8` unchanged;
+/// Ornith-1.5-35B-A3B's `group=8` is the first to need the narrower one.
+/// Errors (rather than silently launching an oversized block) for a
+/// hypothetical `group > 8`, which neither `BR` fits — not reachable by any
+/// checkpoint this codebase has seen, but a real error is far better than a
+/// silent `hipErrorInvalidValue` two calls later.
+pub(crate) fn attn_prefill_flash_br(group: u32) -> Result<u32, RocmlError> {
+    if 32 * group * ATTN_PREFILL_FLASH_BR <= MAX_THREADS_PER_BLOCK {
+        Ok(ATTN_PREFILL_FLASH_BR)
+    } else if 32 * group * ATTN_PREFILL_FLASH_BR_NARROW <= MAX_THREADS_PER_BLOCK {
+        Ok(ATTN_PREFILL_FLASH_BR_NARROW)
+    } else {
+        Err(RocmlError::Config(format!(
+            "flash-prefill attention: GQA group {group} needs a narrower BR than this build \
+             supports (32 * {group} * {ATTN_PREFILL_FLASH_BR_NARROW} > {MAX_THREADS_PER_BLOCK})"
+        )))
+    }
+}
 /// Hard cap on split count, bounding `ChunkScratch`'s partial-buffer sizes
 /// (`chunk_scratch.rs` allocates for this many splits up front, times
 /// `CHUNK_CAP` rows times `n_heads` — see that file for the byte-budget
@@ -53,8 +87,9 @@ pub(crate) fn attn_prefill_flash_splits(
     n_kv_heads: u32,
     chunk_len: u32,
     deepest_end: u32,
+    br: u32,
 ) -> (u32, u32) {
-    let num_row_tiles = chunk_len.div_ceil(ATTN_PREFILL_FLASH_BR).max(1);
+    let num_row_tiles = chunk_len.div_ceil(br).max(1);
     let by_occupancy = TARGET_WORKGROUPS.div_ceil((n_kv_heads * num_row_tiles).max(1));
     let by_min_len = deepest_end.div_ceil(MIN_SPLIT_LEN);
     let n_splits = by_occupancy.min(by_min_len).clamp(1, MAX_SPLITS);
@@ -71,6 +106,12 @@ pub(crate) struct FlashPrefillKernels {
     partial_f32_fn: rocml_hip::Function,
     _mod_partial_f16: Module,
     partial_f16_fn: rocml_hip::Function,
+    /// `BR=4` siblings (`attn_prefill_flash_narrow.hip`) — see
+    /// `attn_prefill_flash_br`'s doc comment for when these run instead.
+    _mod_partial_f32_br4: Module,
+    partial_f32_br4_fn: rocml_hip::Function,
+    _mod_partial_f16_br4: Module,
+    partial_f16_br4_fn: rocml_hip::Function,
     _mod_reduce: Module,
     reduce_fn: rocml_hip::Function,
 }
@@ -85,6 +126,14 @@ impl FlashPrefillKernels {
             rocml_kernels::ATTN_PREFILL_FLASH_PARTIAL_F16_HSACO,
             rocml_kernels::ATTN_PREFILL_FLASH_PARTIAL_F16_KERNEL,
         )?;
+        let (_mod_partial_f32_br4, partial_f32_br4_fn) = load(
+            rocml_kernels::ATTN_PREFILL_FLASH_PARTIAL_F32_BR4_HSACO,
+            rocml_kernels::ATTN_PREFILL_FLASH_PARTIAL_F32_BR4_KERNEL,
+        )?;
+        let (_mod_partial_f16_br4, partial_f16_br4_fn) = load(
+            rocml_kernels::ATTN_PREFILL_FLASH_PARTIAL_F16_BR4_HSACO,
+            rocml_kernels::ATTN_PREFILL_FLASH_PARTIAL_F16_BR4_KERNEL,
+        )?;
         let (_mod_reduce, reduce_fn) = load(
             rocml_kernels::ATTN_PREFILL_FLASH_REDUCE_F32_HSACO,
             rocml_kernels::ATTN_PREFILL_FLASH_REDUCE_F32_KERNEL,
@@ -94,6 +143,10 @@ impl FlashPrefillKernels {
             partial_f32_fn,
             _mod_partial_f16,
             partial_f16_fn,
+            _mod_partial_f32_br4,
+            partial_f32_br4_fn,
+            _mod_partial_f16_br4,
+            partial_f16_br4_fn,
             _mod_reduce,
             reduce_fn,
         })
@@ -125,6 +178,7 @@ impl FlashPrefillKernels {
     ) -> Result<(), RocmlError> {
         self.run(
             &self.partial_f32_fn,
+            &self.partial_f32_br4_fn,
             q,
             k_layer,
             v_layer,
@@ -163,6 +217,7 @@ impl FlashPrefillKernels {
     ) -> Result<(), RocmlError> {
         self.run(
             &self.partial_f16_fn,
+            &self.partial_f16_br4_fn,
             q,
             k_layer,
             v_layer,
@@ -184,6 +239,7 @@ impl FlashPrefillKernels {
     fn run(
         &self,
         partial_fn: &rocml_hip::Function,
+        partial_fn_br4: &rocml_hip::Function,
         q: DevPtr,
         k_layer: DevPtr,
         v_layer: DevPtr,
@@ -200,13 +256,22 @@ impl FlashPrefillKernels {
         scale: f32,
     ) -> Result<(), RocmlError> {
         let group = n_heads / n_kv_heads;
+        // `attn_prefill_flash_br` picks `BR` from `group` alone — see its
+        // doc comment for why a wide-GQA checkpoint (Ornith-1.5-35B-A3B's
+        // `group=8`) needs the narrower kernel below.
+        let br = attn_prefill_flash_br(group)?;
+        let (partial_fn, br) = if br == ATTN_PREFILL_FLASH_BR {
+            (partial_fn, br)
+        } else {
+            (partial_fn_br4, br)
+        };
         let (n_splits, split_len) =
-            attn_prefill_flash_splits(n_kv_heads, chunk_len, pos_base + chunk_len);
-        let num_row_tiles = chunk_len.div_ceil(ATTN_PREFILL_FLASH_BR);
+            attn_prefill_flash_splits(n_kv_heads, chunk_len, pos_base + chunk_len, br);
+        let num_row_tiles = chunk_len.div_ceil(br);
 
         let partial_cfg = LaunchConfig {
             grid: (n_kv_heads, num_row_tiles, n_splits),
-            block: (32, group, ATTN_PREFILL_FLASH_BR),
+            block: (32, group, br),
             shared_mem_bytes: 2 * ATTN_PREFILL_FLASH_BC * head_dim * size_of::<f32>() as u32,
         };
         let mut partial_params = kernel_params!(
@@ -226,10 +291,10 @@ impl FlashPrefillKernels {
             n_splits,
             scale
         );
-        // SAFETY: params matches attn_prefill_flash_partial_{f32,f16}'s
+        // SAFETY: params matches attn_prefill_flash_partial_{f32,f16}[_br4]'s
         // signature (three const pointers, three float*, seven unsigned,
-        // float); block = (32, group, ATTN_PREFILL_FLASH_BR) matches the
-        // kernel's row-tiled design; grid.z = n_splits.
+        // float); block = (32, group, br) matches whichever kernel `br`
+        // selected; grid.z = n_splits.
         unsafe { partial_fn.launch(&partial_cfg, &mut partial_params, None) }?;
 
         let reduce_cfg = LaunchConfig {
