@@ -12,10 +12,12 @@ pub mod device;
 pub mod error;
 pub mod event;
 pub mod ffi;
+pub mod host_register;
 pub mod module;
 
 pub use buffer::DeviceBuffer;
 pub use device::{Device, MemoryInfo, Stream};
 pub use error::HipError;
 pub use event::{elapsed_ms, Event};
+pub use host_register::{host_register_readonly, host_unregister};
 pub use module::{Function, LaunchConfig, Module};

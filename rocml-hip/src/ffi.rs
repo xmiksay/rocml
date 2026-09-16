@@ -11,6 +11,11 @@ pub type hipError_t = c_int;
 
 pub const hipSuccess: hipError_t = 0;
 
+/// Flags for `hipHostRegister` (`hip_runtime_api.h`'s `hipHostRegisterReadOnly`
+/// — the flag `hostRegisterReadOnlySupported` gates, appropriate for the
+/// read-only mmap'd GGUF expert weights this is registering).
+pub const hip_host_register_read_only: u32 = 0x08;
+
 /// Opaque handles — HIP only ever hands these back and forth as pointers.
 pub type hipStream_t = *mut c_void;
 pub type hipModule_t = *mut c_void;
@@ -41,6 +46,15 @@ extern "C" {
     // -- memory --
     pub fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> hipError_t;
     pub fn hipFree(ptr: *mut c_void) -> hipError_t;
+    /// Pins (page-locks) an existing host allocation for faster `hipMemcpy`
+    /// H2D/D2H (DMA instead of a staged bounce-buffer copy) — used by the
+    /// MoE expert-offload path to register slices of the mmap'd GGUF file in
+    /// place. Purely a performance hint: `hipMemcpy` against an
+    /// unregistered pointer still works correctly, just slower, so callers
+    /// must treat a non-success return as "proceed anyway", never propagate
+    /// it as a hard error.
+    pub fn hipHostRegister(host_ptr: *mut c_void, size_bytes: usize, flags: u32) -> hipError_t;
+    pub fn hipHostUnregister(host_ptr: *mut c_void) -> hipError_t;
     pub fn hipMemcpy(
         dst: *mut c_void,
         src: *const c_void,
