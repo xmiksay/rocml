@@ -12,11 +12,16 @@
 //! by GGUF tensor-name suffix, not by hardcoded layer indices or shapes,
 //! and the GDN-specific rules only apply when the caller says this file is
 //! [`ArchFamily::Qwen35Hybrid`] — a future architecture family adds its own
-//! rule table alongside [`COMMON_RULES`]/[`GDN_RULES`] rather than touching
-//! either.
+//! rule table alongside [`COMMON_RULES`]/`rules::GDN_RULES` rather than
+//! touching either. The qwen35-family-specific rule tables
+//! (`GDN_RULES`/`MOE_RULES`) live in the sibling `rules` module purely for
+//! the 400-line file cap.
+
+mod rules;
 
 use rocml_core::gguf::GgufFile;
 use rocml_core::quant::GgmlDType;
+use rules::{GDN_RULES, MOE_RULES};
 
 /// Which architecture's tensor-name conventions apply. Mirrors
 /// `general.architecture` (`"qwen3"`/`"qwen35"`), not `registry::ModelFamily`
@@ -26,6 +31,11 @@ use rocml_core::quant::GgmlDType;
 pub enum ArchFamily {
     Qwen3Dense,
     Qwen35Hybrid,
+    /// `general.architecture = "qwen35moe"` — the identical hybrid GDN/
+    /// full-attention body as [`Self::Qwen35Hybrid`] (so [`GDN_RULES`] also
+    /// applies), but every layer's FFN is a mixture of experts instead of
+    /// one dense SwiGLU MLP — see [`MOE_RULES`].
+    Qwen35Moe,
 }
 
 /// Minimum acceptable precision for a tensor-name pattern. Compared against
@@ -162,68 +172,14 @@ const COMMON_RULES: &[Rule] = &[
     },
 ];
 
-/// Qwen3.5 hybrid-only rules for the Gated Delta Net layers. `ssm_a`
-/// (`A_log`) and `ssm_dt.bias` (`dt_bias`) are the actual scan-recurrence
-/// scalars the issue's "must stay fp16/fp32" language means; `ssm_alpha`/
-/// `ssm_beta` in the GGUF are the 2D *in-projections* that produce per-token
-/// alpha/beta logits feeding that recurrence, not the recurrence state
-/// itself — see `docs/quant-policy.md` for why this naming overlap with the
-/// issue text is worth calling out explicitly rather than silently
-/// resolving one way or the other.
-const GDN_RULES: &[Rule] = &[
-    Rule {
-        pattern: "ssm_a",
-        kind: MatchKind::Suffix,
-        class: PrecisionClass::FloatOnly,
-        label: "GDN scan parameter A_log",
-    },
-    Rule {
-        pattern: "ssm_dt.bias",
-        kind: MatchKind::Suffix,
-        class: PrecisionClass::FloatOnly,
-        label: "GDN scan parameter dt_bias",
-    },
-    Rule {
-        pattern: "ssm_conv1d.weight",
-        kind: MatchKind::Suffix,
-        class: PrecisionClass::FloatOnly,
-        label: "GDN short-conv (causal conv1d) weight",
-    },
-    Rule {
-        pattern: "ssm_alpha.weight",
-        kind: MatchKind::Suffix,
-        class: PrecisionClass::Q6OrBetter,
-        label: "GDN alpha in-projection (2D, feeds decay logit)",
-    },
-    Rule {
-        pattern: "ssm_beta.weight",
-        kind: MatchKind::Suffix,
-        class: PrecisionClass::Q6OrBetter,
-        label: "GDN beta in-projection (2D, feeds write-strength logit)",
-    },
-    Rule {
-        pattern: "attn_qkv.weight",
-        kind: MatchKind::Suffix,
-        class: PrecisionClass::Q6OrBetter,
-        label: "GDN fused QKV in-projection (2D, feeds conv1d + recurrence)",
-    },
-    Rule {
-        pattern: "attn_gate.weight",
-        kind: MatchKind::Suffix,
-        class: PrecisionClass::Q6OrBetter,
-        label: "GDN output-gate (Z) in-projection (2D)",
-    },
-    Rule {
-        pattern: "ssm_out.weight",
-        kind: MatchKind::Suffix,
-        class: PrecisionClass::Q5OrBetter,
-        label: "ssm_out (GDN's down_proj analog, shapes residual stream)",
-    },
-];
-
 fn classify(name: &str, family: ArchFamily) -> Option<&'static Rule> {
-    if family == ArchFamily::Qwen35Hybrid {
+    if matches!(family, ArchFamily::Qwen35Hybrid | ArchFamily::Qwen35Moe) {
         if let Some(rule) = GDN_RULES.iter().find(|r| r.matches(name)) {
+            return Some(rule);
+        }
+    }
+    if family == ArchFamily::Qwen35Moe {
+        if let Some(rule) = MOE_RULES.iter().find(|r| r.matches(name)) {
             return Some(rule);
         }
     }
