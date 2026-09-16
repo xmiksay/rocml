@@ -178,6 +178,7 @@ impl Model {
                     ffn_chunk_dispatch(
                         &self.kernels,
                         &self.moe_kernels,
+                        &self.moe_chunk_kernels,
                         self.gguf.as_ref(),
                         self.config.moe.as_ref(),
                         &gdn_weights.ffn,
@@ -187,6 +188,8 @@ impl Model {
                         self.config.rms_eps,
                         &mut self.chunk_scratch,
                         self.moe_scratch.as_mut(),
+                        self.moe_chunk_scratch.as_mut(),
+                        self.moe_chunk_host.as_mut(),
                         self.expert_cache.as_mut(),
                         chunk_len,
                         prof,
@@ -236,6 +239,7 @@ impl Model {
                     ffn_chunk_dispatch(
                         &self.kernels,
                         &self.moe_kernels,
+                        &self.moe_chunk_kernels,
                         self.gguf.as_ref(),
                         self.config.moe.as_ref(),
                         &attn_weights.ffn,
@@ -245,6 +249,8 @@ impl Model {
                         self.config.rms_eps,
                         &mut self.chunk_scratch,
                         self.moe_scratch.as_mut(),
+                        self.moe_chunk_scratch.as_mut(),
+                        self.moe_chunk_host.as_mut(),
                         self.expert_cache.as_mut(),
                         chunk_len,
                         prof,

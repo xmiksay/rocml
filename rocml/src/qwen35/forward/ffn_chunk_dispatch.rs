@@ -5,9 +5,12 @@
 use super::chunk_scratch::ChunkScratch;
 use super::ffn_chunk::ffn_chunk_step;
 use super::kernels_moe::MoeKernels;
+use super::kernels_moe_chunk::MoeChunkKernels;
 use super::layer_capture::LayerCapture;
 use super::moe::{self, MoeRowCapture};
 use super::moe_cache::ExpertCache;
+use super::moe_chunk::{self, MoeChunkHost};
+use super::moe_chunk_scratch::MoeChunkScratch;
 use super::moe_scratch::MoeScratch;
 use crate::error::RocmlError;
 use crate::forward::kernels::{offset, Kernels};
@@ -28,6 +31,7 @@ use rocml_hip::DeviceBuffer;
 pub(crate) fn ffn_chunk_dispatch(
     kernels: &Kernels,
     moe_kernels: &MoeKernels,
+    moe_chunk_kernels: &MoeChunkKernels,
     gguf: Option<&GgufFile>,
     moe_cfg: Option<&MoeConfig>,
     ffn_weights: &Ffn,
@@ -37,6 +41,8 @@ pub(crate) fn ffn_chunk_dispatch(
     rms_eps: f32,
     scratch: &mut ChunkScratch,
     moe_scratch: Option<&mut MoeScratch>,
+    moe_chunk_scratch: Option<&mut MoeChunkScratch>,
+    moe_chunk_host: Option<&mut MoeChunkHost>,
     mut expert_cache: Option<&mut ExpertCache>,
     chunk_len: u32,
     prof: Option<&Profiler>,
@@ -67,40 +73,73 @@ pub(crate) fn ffn_chunk_dispatch(
             let layer_idx = layer_idx.ok_or_else(|| {
                 RocmlError::Config("moe ffn layer with no layer_idx (internal bug)".into())
             })?;
-            // "resid_pre_ffn" (llama.cpp's "attn_residual") is the whole
-            // chunk's residual stream before this layer's FFN — unlike
-            // every other MoE capture point below (computed per-row inside
-            // `moe_ffn_step`, since that step has no chunk-wide buffer of
-            // its own), `scratch.x` already holds every row contiguously,
-            // exactly like the dense path's own one-shot capture in
-            // `ffn_chunk_step`.
-            if let Some(cap) = capture.as_mut() {
-                cap.record(layer_idx, "resid_pre_ffn", &scratch.x, chunk_len, hidden)?;
+
+            // The `LayerCapture` diagnostic path (issue #10's per-layer diff
+            // harness, `make llama-layer-diff`) stays on the M1/M2 per-row
+            // loop: it's never on a hot path, and duplicating its per-row
+            // instrumentation into the M3 grouped-by-expert batched design
+            // below would be real complexity for zero throughput benefit —
+            // see `moe_chunk.rs`'s module doc.
+            if capture.is_some() {
+                // "resid_pre_ffn" (llama.cpp's "attn_residual") is the whole
+                // chunk's residual stream before this layer's FFN — unlike
+                // every other MoE capture point below (computed per-row
+                // inside `moe_ffn_step`, since that step has no chunk-wide
+                // buffer of its own), `scratch.x` already holds every row
+                // contiguously, exactly like the dense path's own one-shot
+                // capture in `ffn_chunk_step`.
+                if let Some(cap) = capture.as_mut() {
+                    cap.record(layer_idx, "resid_pre_ffn", &scratch.x, chunk_len, hidden)?;
+                }
+                for row in 0..chunk_len as usize {
+                    let x_row = offset(&scratch.x, row * hidden as usize);
+                    let row_capture = capture.as_deref_mut().map(|cap| MoeRowCapture {
+                        capture: cap,
+                        row: row as u32,
+                        total_rows: chunk_len,
+                    });
+                    moe::moe_ffn_step(
+                        kernels,
+                        moe_kernels,
+                        gguf,
+                        w,
+                        moe_cfg,
+                        post_attention_norm,
+                        hidden,
+                        rms_eps,
+                        x_row,
+                        moe_scratch,
+                        layer_idx,
+                        expert_cache.as_deref_mut(),
+                        row_capture,
+                    )?;
+                }
+                return Ok(());
             }
-            for row in 0..chunk_len as usize {
-                let x_row = offset(&scratch.x, row * hidden as usize);
-                let row_capture = capture.as_deref_mut().map(|cap| MoeRowCapture {
-                    capture: cap,
-                    row: row as u32,
-                    total_rows: chunk_len,
-                });
-                moe::moe_ffn_step(
-                    kernels,
-                    moe_kernels,
-                    gguf,
-                    w,
-                    moe_cfg,
-                    post_attention_norm,
-                    hidden,
-                    rms_eps,
-                    x_row,
-                    moe_scratch,
-                    layer_idx,
-                    expert_cache.as_deref_mut(),
-                    row_capture,
-                )?;
-            }
-            Ok(())
+
+            let moe_chunk_scratch = moe_chunk_scratch.ok_or_else(|| {
+                RocmlError::Config("moe ffn layer with no moe chunk scratch".into())
+            })?;
+            let moe_chunk_host = moe_chunk_host
+                .ok_or_else(|| RocmlError::Config("moe ffn layer with no moe chunk host".into()))?;
+            moe_chunk::moe_ffn_chunk_step(
+                kernels,
+                moe_kernels,
+                moe_chunk_kernels,
+                gguf,
+                w,
+                moe_cfg,
+                post_attention_norm,
+                hidden,
+                rms_eps,
+                scratch,
+                moe_scratch,
+                moe_chunk_scratch,
+                moe_chunk_host,
+                layer_idx,
+                expert_cache,
+                chunk_len,
+            )
         }
     }
 }

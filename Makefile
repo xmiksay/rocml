@@ -7,7 +7,7 @@ ROCML_CHECKPOINT_DIR ?= $(HOME)/checkpoints
 # Dev/test model (fast); override to point at a different checkpoint.
 QWEN_MODEL ?= $(ROCML_CHECKPOINT_DIR)/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf
 
-.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench bench-profile bench-profile-json eval mmq-layer-diff mmq-endtoend-measure mmq-calibrate mmq-smoothquant-measure kv-head-error-measure gdn-wmma-lds-perf gdn-uvvnew-perf rotational-kv-calibrate rotational-kv-measure rotational-kv-sim-parity eval-rotational-v3 llama-layer-diff
+.PHONY: build test test-unit test-integration test-model lint fmt clean serve bench bench-profile bench-profile-json eval eval-moe mmq-layer-diff mmq-endtoend-measure mmq-calibrate mmq-smoothquant-measure kv-head-error-measure gdn-wmma-lds-perf gdn-uvvnew-perf rotational-kv-calibrate rotational-kv-measure rotational-kv-sim-parity eval-rotational-v3 llama-layer-diff
 
 build:
 	cargo build --workspace
@@ -74,6 +74,7 @@ test-model:
 	cargo test --release -p rocml --test dense_mixed_kv_parity
 	cargo test --release -p rocml --test dense_chunked_prefill_parity
 	cargo test --release -p rocml --test moe_expert_cache_parity
+	cargo test --release -p rocml --test qwen35moe_chunked_prefill_parity
 	cargo test --release -p rocml --test snapshot_equivalence
 	cargo test --release -p rocml --test snapshot_rewind
 	cargo test --release -p rocml --test snapshot_rewind_turns
@@ -147,6 +148,18 @@ eval:
 		--model ornith-1.5-9b --ctx 16384 \
 		--label ornith15-q4km-fp16kv \
 		--out bench/eval/results/ornith15-q4km-fp16kv.json \
+		--resume
+
+# M3's quality gate: the same issue-15 agentic eval against
+# Ornith-1.5-35B-A3B (qwen35moe), at the same ctx 16384 every other `eval`
+# row uses. Separate target (not folded into `eval` above) since this
+# checkpoint needs the MoE expert cache/offload path and is a much larger
+# download/VRAM footprint than the 9B rows.
+eval-moe:
+	cargo run --release -p rocml-cli -- eval \
+		--model ornith-1.5-35b --ctx 16384 \
+		--label ornith15-35b-q4km \
+		--out bench/eval/results/ornith15-35b-q4km.json \
 		--resume
 
 # Issue #10's per-layer diff harness (`rocml/tests/mmq_layer_diff.rs`):

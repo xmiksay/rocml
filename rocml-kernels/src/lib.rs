@@ -410,3 +410,16 @@ pub const MOE_SHARED_GATE_WRITE_F32_HSACO: &[u8] = MOE_ROUTE_TOPK_F32_HSACO;
 pub const MOE_SHARED_GATE_WRITE_F32_KERNEL: &str = "moe_shared_gate_write_f32";
 pub const MOE_WEIGHTED_ACCUM_F32_HSACO: &[u8] = MOE_ROUTE_TOPK_F32_HSACO;
 pub const MOE_WEIGHTED_ACCUM_F32_KERNEL: &str = "moe_weighted_accum_f32";
+
+/// `kernels/moe_chunk.hip` (M3): grouped-by-expert batched-GEMM support for
+/// chunked prefill — see that source file's module doc. All four share one
+/// code object.
+pub const MOE_GEMM_XWT_F32_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/moe_chunk.hsaco"));
+pub const MOE_GEMM_XWT_F32_KERNEL: &str = "gemm_xwt_f32";
+pub const MOE_GATHER_ROWS_F32_HSACO: &[u8] = MOE_GEMM_XWT_F32_HSACO;
+pub const MOE_GATHER_ROWS_F32_KERNEL: &str = "moe_gather_rows_f32";
+pub const MOE_SCATTER_WEIGHTED_ACCUM_F32_HSACO: &[u8] = MOE_GEMM_XWT_F32_HSACO;
+pub const MOE_SCATTER_WEIGHTED_ACCUM_F32_KERNEL: &str = "moe_scatter_weighted_accum_f32";
+pub const MOE_SHARED_GATE_WRITE_CHUNK_F32_HSACO: &[u8] = MOE_GEMM_XWT_F32_HSACO;
+pub const MOE_SHARED_GATE_WRITE_CHUNK_F32_KERNEL: &str = "moe_shared_gate_write_chunk_f32";

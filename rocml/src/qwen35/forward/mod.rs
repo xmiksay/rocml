@@ -23,9 +23,12 @@ mod kernels;
 pub(crate) mod kernels_flash_mixed;
 pub(crate) mod kernels_mixed;
 mod kernels_moe;
+mod kernels_moe_chunk;
 pub mod layer_capture;
 mod moe;
 mod moe_cache;
+mod moe_chunk;
+mod moe_chunk_scratch;
 mod moe_scratch;
 mod rewind;
 mod scratch;
@@ -41,7 +44,10 @@ use kernels::HybridKernels;
 use kernels_flash_mixed::FlashPrefillMixedKernels;
 use kernels_mixed::MixedKernels;
 use kernels_moe::MoeKernels;
+use kernels_moe_chunk::MoeChunkKernels;
 use moe_cache::ExpertCache;
+use moe_chunk::MoeChunkHost;
+use moe_chunk_scratch::MoeChunkScratch;
 use moe_scratch::MoeScratch;
 use rocml_core::gguf::GgufFile;
 use rocml_hip::{Device, MemoryInfo};
@@ -119,6 +125,19 @@ pub struct Model {
     /// headroom left — either way `moe::moe_ffn_step` falls back to
     /// `MoeScratch`'s single-slot staging buffers (M1's always-copy path).
     expert_cache: Option<ExpertCache>,
+    /// M3's grouped-by-expert batched-GEMM kernels for chunked prefill — see
+    /// `moe_chunk.rs`'s module doc. Loaded unconditionally like every other
+    /// kernel set; `moe_chunk_scratch`/`moe_chunk_host` are the ones gated
+    /// on `config.moe.is_some()`.
+    moe_chunk_kernels: MoeChunkKernels,
+    /// `Some` exactly when `moe_scratch` is — the chunk-batched scratch
+    /// `moe_chunk::moe_ffn_chunk_step` needs alongside the still-present
+    /// per-row `MoeScratch` (used by decode and by the `LayerCapture`
+    /// diagnostic fallback — see `ffn_chunk_dispatch.rs`).
+    moe_chunk_scratch: Option<MoeChunkScratch>,
+    /// Host-side expert-bucketing scratch for the grouped chunked-prefill
+    /// path — `Some` alongside `moe_chunk_scratch`.
+    moe_chunk_host: Option<MoeChunkHost>,
     pos: u32,
 }
 
@@ -138,11 +157,21 @@ impl Model {
         let config = Qwen35Config::from_gguf(&gguf)?;
         let weights = ModelWeights::load(&gguf, &config)?;
         let moe_kernels = MoeKernels::load_all()?;
+        let moe_chunk_kernels = MoeChunkKernels::load_all()?;
         let moe_scratch = config
             .moe
             .as_ref()
             .map(|moe_cfg| MoeScratch::new(&config, moe_cfg, &weights))
             .transpose()?;
+        let moe_chunk_scratch = config
+            .moe
+            .as_ref()
+            .map(|moe_cfg| MoeChunkScratch::new(&config, moe_cfg))
+            .transpose()?;
+        let moe_chunk_host = config
+            .moe
+            .as_ref()
+            .map(|moe_cfg| MoeChunkHost::new(moe_cfg, chunk_scratch::CHUNK_CAP));
         // Only a qwen35moe checkpoint needs its GGUF's mmap kept alive past
         // this point — see the `gguf` field's doc comment.
         let gguf = if config.moe.is_some() {
@@ -307,6 +336,9 @@ impl Model {
             gguf,
             moe_scratch,
             expert_cache,
+            moe_chunk_kernels,
+            moe_chunk_scratch,
+            moe_chunk_host,
             pos: 0,
         })
     }
