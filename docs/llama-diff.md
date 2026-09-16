@@ -21,6 +21,17 @@ verified against. `git log -1` in your scratch clone should match, or be
 close enough that `src/models/qwen35.cpp`'s `cb(...)` call sites (Section 3)
 haven't moved.
 
+**qwen35moe update (M2)**: the `Ornith-1.5-35B-A3B-GGUF` reference dump
+(`bench/eval/llama_ref/ornith-1.5-35b-ref.txt`) was produced from a newer
+checkout, commit `0bec16e3880a148a7fc3887cdf71f81c547aff7a`, needed for that
+build's qwen35moe (`build_moe_ffn`) graph support — later than the pinned
+commit above, which predates qwen35moe entirely. The dense/hybrid mapping
+table (Section 3) was unaffected (verified against this dump's own
+GDN/full-attention node names, unchanged); Section 3's table gained six
+MoE-only rows (`moe_shexp_swiglu`/`moe_shexp_down`/`moe_shared_gate`/
+`moe_shared_gate_sigmoid`/`moe_shexp_gated`/`moe_routed_sum`), documented
+inline in `convert.rs`'s `NODE_MAP`.
+
 llama.cpp's own `llama-eval-callback` example (`examples/eval-callback`,
 `common/debug.cpp`'s `common_debug_cb_eval`) prints per-node tensor stats,
 but truncates every tensor to 3 elements per edge for human review
