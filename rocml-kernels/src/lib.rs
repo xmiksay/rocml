@@ -214,6 +214,20 @@ pub const ATTN_PREFILL_FLASH_REDUCE_F32_KERNEL: &str = "attn_prefill_flash_reduc
 pub const ATTN_PREFILL_FLASH_PARTIAL_F16_HSACO: &[u8] = ATTN_PREFILL_FLASH_PARTIAL_F32_HSACO;
 pub const ATTN_PREFILL_FLASH_PARTIAL_F16_KERNEL: &str = "attn_prefill_flash_partial_f16";
 
+/// `kernels/attn_prefill_flash_narrow.hip`: `BR=4` sibling of the above
+/// (same algebra, shared via `attn_prefill_flash_impl.h`) for a wide-GQA
+/// checkpoint where `32 * group * BR` would exceed gfx1101's
+/// 1024-thread/block limit at the default `BR=8` — see that file's module
+/// doc for the Ornith-1.5-35B-A3B discovery this fixes (M2). Shares
+/// `ATTN_PREFILL_FLASH_REDUCE_F32` (BR/BC-independent, see that kernel's
+/// own doc comment).
+pub const ATTN_PREFILL_FLASH_PARTIAL_F32_BR4_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill_flash_narrow.hsaco"));
+pub const ATTN_PREFILL_FLASH_PARTIAL_F32_BR4_KERNEL: &str = "attn_prefill_flash_partial_f32_br4";
+pub const ATTN_PREFILL_FLASH_PARTIAL_F16_BR4_HSACO: &[u8] =
+    ATTN_PREFILL_FLASH_PARTIAL_F32_BR4_HSACO;
+pub const ATTN_PREFILL_FLASH_PARTIAL_F16_BR4_KERNEL: &str = "attn_prefill_flash_partial_f16_br4";
+
 /// `kernels/kv_quant.hip`: quantize-on-evict for the KIVI-style mixed KV
 /// cache (issue #2) — one batch launch per evicted `WINDOW_LEN`-position
 /// block. K is per-channel Q8 (`quantize_evict_k_f16_to_q8`, block =
@@ -254,6 +268,21 @@ pub const ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q8_KERNEL: &str = "attn_prefill_flash
 pub const ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q4_HSACO: &[u8] =
     ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q8_HSACO;
 pub const ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q4_KERNEL: &str = "attn_prefill_flash_partial_mixed_q4";
+
+/// `kernels/attn_prefill_flash_mixed_narrow.hip`: `BR=4` sibling of the
+/// above (mirrors `ATTN_PREFILL_FLASH_PARTIAL_F32_BR4` for the mixed-KV
+/// path, which has no shallow-depth fallback to fall back to instead — see
+/// that file's module doc, M2).
+pub const ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q8_BR4_HSACO: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/attn_prefill_flash_mixed_narrow.hsaco"
+));
+pub const ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q8_BR4_KERNEL: &str =
+    "attn_prefill_flash_partial_mixed_q8_br4";
+pub const ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q4_BR4_HSACO: &[u8] =
+    ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q8_BR4_HSACO;
+pub const ATTN_PREFILL_FLASH_PARTIAL_MIXED_Q4_BR4_KERNEL: &str =
+    "attn_prefill_flash_partial_mixed_q4_br4";
 
 /// `kernels/gdn_chunkwise.hip` (stages B-G) + `kernels/gdn_chunkwise_prep.hip`
 /// (stage A, split into its own file for the 400-line cap by the
