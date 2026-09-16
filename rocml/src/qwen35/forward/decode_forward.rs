@@ -5,6 +5,7 @@
 //! prefill path.
 
 use super::kernels_moe::MoeKernels;
+use super::moe_cache::ExpertCache;
 use super::moe_scratch::MoeScratch;
 use super::scratch::Scratch;
 use super::{attention, ffn, gdn, moe};
@@ -38,6 +39,7 @@ pub(crate) fn ffn_dispatch(
     rms_eps: f32,
     scratch: &mut Scratch,
     moe_scratch: Option<&mut MoeScratch>,
+    expert_cache: Option<&mut ExpertCache>,
     prof: Option<&Profiler>,
     layer_idx: Option<u32>,
 ) -> Result<(), RocmlError> {
@@ -60,6 +62,15 @@ pub(crate) fn ffn_dispatch(
                 .ok_or_else(|| RocmlError::Config("moe ffn layer with no moe config".into()))?;
             let moe_scratch = moe_scratch
                 .ok_or_else(|| RocmlError::Config("moe ffn layer with no moe scratch".into()))?;
+            // Decode never captures (only `forward_prompt_chunked_captured`
+            // does) — `layer_idx` is still required here (it's the expert
+            // cache's key axis, not just a profiler label), unlike the
+            // coarse-prefill profiling path below which passes `None` and
+            // is otherwise unreachable in this codebase (see that call
+            // site's own comment).
+            let layer_idx = layer_idx.ok_or_else(|| {
+                RocmlError::Config("moe ffn layer with no layer_idx (internal bug)".into())
+            })?;
             let x_row = offset(&scratch.x, 0);
             moe::moe_ffn_step(
                 kernels,
@@ -72,6 +83,9 @@ pub(crate) fn ffn_dispatch(
                 rms_eps,
                 x_row,
                 moe_scratch,
+                layer_idx,
+                expert_cache,
+                None,
             )
         }
     }
@@ -179,8 +193,9 @@ impl Model {
                                     self.config.rms_eps,
                                     &mut self.scratch,
                                     self.moe_scratch.as_mut(),
+                                    self.expert_cache.as_mut(),
                                     None,
-                                    None,
+                                    Some(layer_idx_u32),
                                 )
                             },
                         )?;
@@ -207,6 +222,7 @@ impl Model {
                             self.config.rms_eps,
                             &mut self.scratch,
                             self.moe_scratch.as_mut(),
+                            self.expert_cache.as_mut(),
                             prof,
                             Some(layer_idx_u32),
                         )?;
@@ -255,8 +271,9 @@ impl Model {
                                     self.config.rms_eps,
                                     &mut self.scratch,
                                     self.moe_scratch.as_mut(),
+                                    self.expert_cache.as_mut(),
                                     None,
-                                    None,
+                                    Some(layer_idx_u32),
                                 )
                             },
                         )?;
@@ -286,6 +303,7 @@ impl Model {
                             self.config.rms_eps,
                             &mut self.scratch,
                             self.moe_scratch.as_mut(),
+                            self.expert_cache.as_mut(),
                             prof,
                             Some(layer_idx_u32),
                         )?;

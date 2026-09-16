@@ -79,6 +79,12 @@ struct Args {
     /// `rocml::LoadOptions::use_mmq`'s doc comment. Off by default.
     #[arg(long)]
     mmq: bool,
+    /// M2's qwen35moe VRAM-resident expert cache slot count override — see
+    /// `rocml::LoadOptions::moe_cache_slots`'s doc comment. Unset (default):
+    /// auto-derive from free VRAM. `0` disables the cache. No effect on a
+    /// non-MoE checkpoint.
+    #[arg(long)]
+    moe_cache_slots: Option<usize>,
     #[arg(long = "max-tokens-default", default_value_t = 512)]
     max_tokens_default: usize,
     /// Pre-close the `<think>` block on every request (reasoning off).
@@ -159,6 +165,7 @@ async fn run(args: Args) -> Result<(), String> {
         use_mmq: args.mmq,
         kv_sink: args.kv_sink,
         kv_window: args.kv_window,
+        moe_cache_slots: args.moe_cache_slots,
         max_tokens_default: args.max_tokens_default,
         no_think,
         default_sampling,

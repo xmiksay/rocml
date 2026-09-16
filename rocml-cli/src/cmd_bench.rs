@@ -109,6 +109,7 @@ pub fn run(args: &BenchArgs) -> Result<(), RocmlError> {
             kv_window: args.model_args.kv_window,
             kv_rot_sim: args.model_args.kv_rot_sim,
             kv_rot_sim_k: args.model_args.kv_rot_sim_k,
+            moe_cache_slots: args.model_args.moe_cache_slots,
         },
     )?;
     let prompt_len = args.depth.unwrap_or(args.prompt_tokens);
@@ -163,6 +164,20 @@ pub fn run(args: &BenchArgs) -> Result<(), RocmlError> {
     let prompt_median = median(&mut prompt_tps);
     let decode_median = median(&mut decode_tps);
 
+    // M2's expert-cache hit rate — informational visibility into the LRU
+    // cache's steady-state behavior over this run (see
+    // `rocml::qwen35::forward::Model::moe_cache_stats`'s doc comment).
+    // `None` for a non-MoE checkpoint or one with the cache disabled.
+    let moe_cache_stats = loaded.model.as_hybrid().and_then(|m| m.moe_cache_stats());
+    if let Some((hits, misses, occupancy, capacity)) = moe_cache_stats {
+        let total = hits + misses;
+        eprintln!(
+            "moe expert cache: {hits} hits, {misses} misses ({:.1}% hit rate), \
+             {occupancy}/{capacity} slots occupied",
+            100.0 * hits as f64 / total.max(1) as f64
+        );
+    }
+
     if let Some(path) = &args.profile_json {
         let report = report.as_ref().ok_or_else(|| {
             RocmlError::Config(
@@ -196,6 +211,14 @@ pub fn run(args: &BenchArgs) -> Result<(), RocmlError> {
             "prompt_tokens_per_sec_median": prompt_median,
             "decode_tokens_per_sec_median": decode_median,
         });
+        if let Some((hits, misses, occupancy, capacity)) = moe_cache_stats {
+            out["moe_cache"] = json!({
+                "hits": hits,
+                "misses": misses,
+                "occupancy": occupancy,
+                "capacity": capacity,
+            });
+        }
         if let Some(report) = &report {
             out["profile"] =
                 serde_json::to_value(report).unwrap_or_else(|e| json!({"error": e.to_string()}));

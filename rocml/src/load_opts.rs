@@ -119,6 +119,18 @@ pub struct LoadOptions {
     /// flag is the issue's own documented "if V passes, optionally 3 bpw
     /// both" follow-up run.
     pub kv_rot_sim_k: bool,
+    /// M2's qwen35moe VRAM-resident expert cache slot count override — see
+    /// `crate::qwen35::forward::Model::load`'s construction of the cache
+    /// (its doc comment on the `expert_cache` field). `None` (default):
+    /// derive the largest capacity that fits in whatever VRAM is left after
+    /// every other allocation. `Some(0)`: disable the cache entirely,
+    /// falling back to the M1 always-copy path — used by tests to compare
+    /// cached vs. uncached runs bit-for-bit. `Some(n)` for `n > 0`: still
+    /// capped at both the VRAM-derived capacity and the model's total
+    /// distinct-expert count (a request larger than either is silently
+    /// clamped, never an error — this is a performance knob, not a
+    /// correctness one). No effect on a non-MoE checkpoint.
+    pub moe_cache_slots: Option<usize>,
 }
 
 impl LoadOptions {
@@ -131,7 +143,13 @@ impl LoadOptions {
             kv_window: WINDOW_LEN,
             kv_rot_sim: None,
             kv_rot_sim_k: false,
+            moe_cache_slots: None,
         }
+    }
+
+    pub fn with_moe_cache_slots(mut self, slots: Option<usize>) -> Self {
+        self.moe_cache_slots = slots;
+        self
     }
 
     pub fn with_kv_cache(mut self, mode: KvCacheMode) -> Self {

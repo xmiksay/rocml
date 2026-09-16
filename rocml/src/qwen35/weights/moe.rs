@@ -50,7 +50,11 @@ pub struct ExpertTensorMeta {
 }
 
 impl ExpertTensorMeta {
-    fn load(
+    /// `pub(crate)` (not private) so `forward::moe_cache`'s tests can build
+    /// metas for a second layer without going through a full
+    /// `MoeFfnWeights::load` (which also uploads the shared expert's dense
+    /// weights to the GPU — unnecessary work for a cache-bookkeeping test).
+    pub(crate) fn load(
         gguf: &GgufFile,
         name: &str,
         expected_m: u32,

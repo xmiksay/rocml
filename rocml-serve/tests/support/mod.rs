@@ -125,6 +125,7 @@ pub async fn spawn_test_server_full(
         use_mmq: false,
         kv_sink: rocml::kv_quant::SINK_LEN,
         kv_window: rocml::kv_quant::WINDOW_LEN,
+        moe_cache_slots: None,
         max_tokens_default: 128,
         no_think,
         default_sampling: rocml::SamplingParams::default(),

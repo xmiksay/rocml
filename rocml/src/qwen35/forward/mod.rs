@@ -10,6 +10,7 @@ mod chunk_forward;
 pub(crate) mod chunk_kernels;
 mod chunk_scratch;
 mod decode_forward;
+mod expert_lru;
 mod ffn;
 mod ffn_chunk;
 mod ffn_chunk_dispatch;
@@ -24,6 +25,7 @@ pub(crate) mod kernels_mixed;
 mod kernels_moe;
 pub mod layer_capture;
 mod moe;
+mod moe_cache;
 mod moe_scratch;
 mod rewind;
 mod scratch;
@@ -39,6 +41,7 @@ use kernels::HybridKernels;
 use kernels_flash_mixed::FlashPrefillMixedKernels;
 use kernels_mixed::MixedKernels;
 use kernels_moe::MoeKernels;
+use moe_cache::ExpertCache;
 use moe_scratch::MoeScratch;
 use rocml_core::gguf::GgufFile;
 use rocml_hip::{Device, MemoryInfo};
@@ -107,6 +110,15 @@ pub struct Model {
     /// `Some` exactly when `gguf`/`config.moe` are `Some` — see
     /// `moe_scratch::MoeScratch`.
     moe_scratch: Option<MoeScratch>,
+    /// M2's VRAM-resident LRU expert cache (`moe_cache::ExpertCache`) —
+    /// `Some` for a MoE checkpoint whenever any VRAM was left to cache
+    /// experts in after every other allocation (see its construction at the
+    /// end of `Self::load`, sized from real free VRAM at that point, not an
+    /// upfront estimate); `None` for a non-MoE checkpoint, or a MoE one with
+    /// an explicit `--moe-cache-slots 0` override, or (rare) a card with no
+    /// headroom left — either way `moe::moe_ffn_step` falls back to
+    /// `MoeScratch`'s single-slot staging buffers (M1's always-copy path).
+    expert_cache: Option<ExpertCache>,
     pos: u32,
 }
 
@@ -239,6 +251,43 @@ impl Model {
         let gdn_cw_wmma_kernels = GdnChunkwiseWmmaKernels::load_all()?;
         let chunk_scratch = ChunkScratch::new(&config)?;
 
+        // M2's expert cache is sized last, from the *actual* free VRAM left
+        // after every other allocation above (weights, KV cache, every
+        // kernel/scratch buffer, the rewind reservation) — deliberately not
+        // part of the pre-KV `Budget` check above, since caching more or
+        // fewer experts only changes decode throughput, never correctness
+        // (a miss falls back to M1's copy-every-time path). See
+        // `moe_cache::ExpertCache`'s doc comment for the slot-stride layout.
+        let expert_cache = match config.moe.as_ref() {
+            Some(moe_cfg) => {
+                let (gate_stride, up_stride, down_stride) =
+                    moe_scratch::per_tensor_max_bytes(&weights);
+                let bytes_per_slot = gate_stride + up_stride + down_stride;
+                let total_experts =
+                    moe_scratch::total_distinct_experts(&weights, moe_cfg.expert_count);
+                let capacity = if bytes_per_slot == 0 || total_experts == 0 {
+                    0
+                } else {
+                    let mem_now = device.memory_info()?;
+                    let usable = mem_now
+                        .free
+                        .saturating_sub(moe_cache::EXPERT_CACHE_SAFETY_MARGIN_BYTES);
+                    let by_vram = usable / bytes_per_slot;
+                    opts.moe_cache_slots
+                        .unwrap_or(usize::MAX)
+                        .min(by_vram)
+                        .min(total_experts)
+                };
+                eprintln!(
+                    "moe expert cache: {capacity}/{total_experts} slots ({:.0} MiB, {:.1} MiB/slot)",
+                    (capacity * bytes_per_slot) as f64 / (1024.0 * 1024.0),
+                    bytes_per_slot as f64 / (1024.0 * 1024.0),
+                );
+                ExpertCache::new(capacity, gate_stride, up_stride, down_stride)?
+            }
+            None => None,
+        };
+
         Ok(Self {
             _device: device,
             config,
@@ -257,6 +306,7 @@ impl Model {
             moe_kernels,
             gguf,
             moe_scratch,
+            expert_cache,
             pos: 0,
         })
     }
@@ -271,6 +321,17 @@ impl Model {
 
     pub fn position(&self) -> u32 {
         self.pos
+    }
+
+    /// `(hits, misses, occupancy, capacity)` since load for M2's expert
+    /// cache — `None` for a non-MoE checkpoint or a MoE one that ended up
+    /// with no cache at all (see `expert_cache`'s doc comment). `bench`/
+    /// tests use this to report the measured cache hit rate.
+    pub fn moe_cache_stats(&self) -> Option<(u64, u64, usize, usize)> {
+        self.expert_cache.as_ref().map(|c| {
+            let (hits, misses) = c.stats();
+            (hits, misses, c.occupancy(), c.capacity())
+        })
     }
 
     /// Resets decode position and zeroes every GDN layer's conv/recurrence

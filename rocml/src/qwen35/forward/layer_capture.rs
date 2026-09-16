@@ -197,6 +197,68 @@ impl LayerCapture {
         Ok(())
     }
 
+    /// Writes one row of a `[total_rows, cols]` tensor assembled
+    /// incrementally across repeated calls — qwen35moe's per-token MoE FFN
+    /// step (`super::moe::moe_ffn_step`) processes one row of a prefill
+    /// chunk at a time (see that module's doc comment), so its per-row
+    /// intermediates (e.g. the post-attention-norm input feeding the
+    /// router) have no single chunk-wide buffer the way the dense FFN's
+    /// batched path does — unlike [`Self::record`], which always captures
+    /// a tensor whole from one buffer already holding every row
+    /// contiguously. The tensor is created (zero-filled) on `row == 0`;
+    /// callers must invoke this for every row `0..total_rows` in order (an
+    /// early return mid-assembly is a caller bug, not something this
+    /// method can detect).
+    pub fn record_row(
+        &mut self,
+        layer_idx: u32,
+        tensor: &str,
+        row: u32,
+        total_rows: u32,
+        buf: &DeviceBuffer<f32>,
+        cols: u32,
+    ) -> Result<(), RocmlError> {
+        let key = format!("{layer_idx}:{tensor}");
+        let entry = self
+            .dump
+            .tensors
+            .entry(key)
+            .or_insert_with(|| CapturedTensor {
+                rows: total_rows,
+                cols,
+                values: vec![0f32; (total_rows * cols) as usize],
+            });
+        let start = row as usize * cols as usize;
+        let end = start + cols as usize;
+        buf.copy_range_to_host(0, &mut entry.values[start..end])?;
+        Ok(())
+    }
+
+    /// Scalar sibling of [`Self::record_row`] for a single already-on-host
+    /// value (e.g. a sigmoid computed on the host from a one-element device
+    /// readback — see `moe::moe_ffn_step`'s shared-expert gate capture,
+    /// which has no device buffer of its own to read from).
+    pub fn record_row_scalar(
+        &mut self,
+        layer_idx: u32,
+        tensor: &str,
+        row: u32,
+        total_rows: u32,
+        value: f32,
+    ) {
+        let key = format!("{layer_idx}:{tensor}");
+        let entry = self
+            .dump
+            .tensors
+            .entry(key)
+            .or_insert_with(|| CapturedTensor {
+                rows: total_rows,
+                cols: 1,
+                values: vec![0f32; total_rows as usize],
+            });
+        entry.values[row as usize] = value;
+    }
+
     pub fn dump(&self) -> &LayerDump {
         &self.dump
     }

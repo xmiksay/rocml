@@ -11,7 +11,7 @@
 use rocml_hip::DeviceBuffer;
 
 use super::super::config::{MoeConfig, Qwen35Config};
-use super::super::weights::{LayerWeights, ModelWeights};
+use super::super::weights::{LayerWeights, ModelWeights, MoeFfnWeights};
 use crate::error::RocmlError;
 
 pub struct MoeScratch {
@@ -30,11 +30,26 @@ pub struct MoeScratch {
     /// gated contribution is always the first write, each selected routed
     /// expert's weighted contribution accumulates on top.
     pub accum: DeviceBuffer<f32>,
-    /// Reused across every expert this token selects, sized to the largest
-    /// per-expert byte size across every MoE layer in the model (an
-    /// oversized buffer is harmless — `gemv_quant` only ever reads the
-    /// `m*n`-element prefix its own shape needs, per `LinearWeight`'s own
-    /// design).
+    /// Sum of only the *routed* experts' weighted contributions (excludes
+    /// the shared expert) — exists purely for `layer_capture`'s
+    /// `"moe_routed_sum"` key (see `super::moe`'s capture code), which maps
+    /// onto llama.cpp's `ffn_moe_out` node (the routed-only sum, computed
+    /// before that reference adds its own shared-expert term). `accum`
+    /// itself already equals llama's `ffn_out` (shared + routed combined),
+    /// since rocml writes the shared contribution into `accum` first and
+    /// accumulates routed experts on top of it — this second buffer is the
+    /// only way to observe the routed-only partial sum without changing
+    /// `accum`'s own write order (which every other correctness gate
+    /// depends on staying exactly as it is). Zeroed and (when capturing)
+    /// accumulated into per routed expert; unused when not capturing.
+    pub routed_sum: DeviceBuffer<f32>,
+    /// Reused across every expert this token selects when the LRU cache
+    /// (`super::moe_cache::ExpertCache`) is disabled (capacity 0 — see
+    /// `Model::load`'s doc comment) or the cache reports a miss's staging
+    /// went through here instead. Sized to the largest per-expert byte size
+    /// across every MoE layer in the model (an oversized buffer is
+    /// harmless — `gemv_quant` only ever reads the `m*n`-element prefix its
+    /// own shape needs, per `LinearWeight`'s own design).
     pub stage_gate: DeviceBuffer<u8>,
     pub stage_up: DeviceBuffer<u8>,
     pub stage_down: DeviceBuffer<u8>,
@@ -62,6 +77,7 @@ impl MoeScratch {
             ffn_b: DeviceBuffer::new(ffn_dim)?,
             expert_out: DeviceBuffer::new(hidden)?,
             accum: DeviceBuffer::new(hidden)?,
+            routed_sum: DeviceBuffer::new(hidden)?,
             stage_gate: DeviceBuffer::new(max_expert_bytes)?,
             stage_up: DeviceBuffer::new(max_expert_bytes)?,
             stage_down: DeviceBuffer::new(max_expert_bytes)?,
@@ -88,4 +104,42 @@ fn max_expert_bytes(weights: &ModelWeights) -> usize {
         })
         .max()
         .unwrap_or(0)
+}
+
+/// Every MoE layer's `MoeFfnWeights`, in layer order — the iterator
+/// `super::moe_cache::ExpertCache`'s sizing (in `Model::load`) and
+/// `max_expert_bytes` above both need, factored out so there's one place
+/// that knows how to find a `Ffn::Moe` inside either layer-weight variant.
+pub(crate) fn moe_layers(weights: &ModelWeights) -> impl Iterator<Item = &MoeFfnWeights> {
+    weights.layers.iter().filter_map(|l| match l {
+        LayerWeights::Gdn(g) => match &g.ffn {
+            super::super::weights::Ffn::Moe(m) => Some(m.as_ref()),
+            super::super::weights::Ffn::Dense(_) => None,
+        },
+        LayerWeights::Attention(a) => match &a.ffn {
+            super::super::weights::Ffn::Moe(m) => Some(m.as_ref()),
+            super::super::weights::Ffn::Dense(_) => None,
+        },
+    })
+}
+
+/// Model-wide max per-expert byte size for each of gate/up/down separately
+/// (unlike `max_expert_bytes`, which takes the max across all three
+/// combined for a single shared staging buffer) — the three VRAM pools'
+/// per-slot strides in `super::moe_cache::ExpertCache`.
+pub(crate) fn per_tensor_max_bytes(weights: &ModelWeights) -> (usize, usize, usize) {
+    moe_layers(weights).fold((0, 0, 0), |(g, u, d), m| {
+        (
+            g.max(m.gate.per_expert_bytes),
+            u.max(m.up.per_expert_bytes),
+            d.max(m.down.per_expert_bytes),
+        )
+    })
+}
+
+/// Total distinct `(layer, expert)` keys across the whole model — the
+/// natural ceiling on `ExpertCache` capacity (caching more slots than there
+/// are experts can never help).
+pub(crate) fn total_distinct_experts(weights: &ModelWeights, expert_count: u32) -> usize {
+    moe_layers(weights).count() * expert_count as usize
 }

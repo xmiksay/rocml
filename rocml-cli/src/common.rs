@@ -93,6 +93,14 @@ pub struct ModelArgs {
     /// effect unless `--kv-rot-sim` is set.
     #[arg(long)]
     pub kv_rot_sim_k: bool,
+    /// M2's qwen35moe VRAM-resident expert cache slot count override — see
+    /// `rocml::LoadOptions::moe_cache_slots`'s doc comment. Unset (default):
+    /// auto-derive the largest capacity that fits in whatever VRAM is left
+    /// after every other allocation. `0` disables the cache entirely
+    /// (M1's always-copy-from-mmap path). No effect on a non-MoE
+    /// checkpoint.
+    #[arg(long)]
+    pub moe_cache_slots: Option<usize>,
 }
 
 impl ModelArgs {
