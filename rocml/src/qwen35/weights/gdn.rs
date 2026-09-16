@@ -3,7 +3,7 @@
 use rocml_core::gguf::GgufFile;
 use rocml_hip::DeviceBuffer;
 
-use super::ffn::FfnWeights;
+use super::Ffn;
 use crate::error::RocmlError;
 use crate::qwen35::config::{GdnConfig, Qwen35Config};
 use crate::weights::{load_matrix_f32, load_vector_f32, LinearWeight};
@@ -31,7 +31,7 @@ pub struct GdnLayerWeights {
     /// (m=hidden, n=value_dim).
     pub ssm_out: LinearWeight,
     pub post_attention_norm: DeviceBuffer<f32>,
-    pub ffn: FfnWeights,
+    pub ffn: Ffn,
 }
 
 impl GdnLayerWeights {
@@ -90,7 +90,7 @@ impl GdnLayerWeights {
                 &format!("{p}.post_attention_norm.weight"),
                 hidden,
             )?,
-            ffn: FfnWeights::load(gguf, &p, hidden, cfg.feed_forward_length)?,
+            ffn: Ffn::load(gguf, &p, cfg)?,
         })
     }
 }
