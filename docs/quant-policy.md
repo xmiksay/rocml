@@ -292,3 +292,24 @@ outcome-neutral by issue #15's eval, and now visible at every load via
 file. No registry or re-quant change is recommended by this round; that
 decision (if ever revisited) belongs to whoever owns the tradeoff, informed
 by this audit rather than blocked on it.
+
+## qwen35moe addendum (Ornith-1.5-35B-A3B, M1)
+
+`ArchFamily::Qwen35Moe` reuses the identical `GDN_RULES` table (same hybrid
+body) plus a new `MOE_RULES` table for the mixture-of-experts FFN: routed
+experts' `ffn_gate_exps`/`ffn_up_exps` and the shared expert's
+`ffn_{gate,up}_shexp` get `ffn_gate`/`ffn_up`'s "no floor" treatment;
+`ffn_down_exps`/`ffn_down_shexp` get `ffn_down`'s `Q5OrBetter`
+residual-stream-shaping floor; the router (`ffn_gate_inp`) and the shared
+expert's own gate (`ffn_gate_inp_shexp`) get a `FloatOnly` floor — both are
+F32 on the real Q4_K_M checkpoint (llama.cpp's own convention keeps routing
+logits full-precision), so this documents an invariant the file already
+holds rather than a finding. `rocml-cli generate --model ornith-1.5-35b`
+prints the same violation warnings this audit's methodology predicts:
+`token_embd`/GDN in-projections/`ssm_out` below their floors (identical
+pattern to Ornith-1.0/1.5-9B's own Q4_K_M), plus `ffn_down_exps`/
+`ffn_down_shexp` below `Q5OrBetter` on the layers llama.cpp's Q4_K_M
+importance heuristic picked Q4_K over Q6_K for. Not re-audited against the
+full per-model table above (no eval data for this checkpoint yet to
+reconcile against, unlike the 9B entries) — see `.claude/CLAUDE.md`'s
+"qwen35moe mixture-of-experts (M1)" section for the fuller writeup.
