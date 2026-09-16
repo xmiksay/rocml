@@ -4,11 +4,93 @@
 //! mirroring `chunk_forward.rs`'s own `impl Model` split for the batched
 //! prefill path.
 
-use super::{attention, ffn, gdn};
+use super::kernels_moe::MoeKernels;
+use super::moe_scratch::MoeScratch;
+use super::scratch::Scratch;
+use super::{attention, ffn, gdn, moe};
 use super::{LayerKind, LayerWeights, Model};
 use crate::error::RocmlError;
-use crate::forward::kernels::offset;
+use crate::forward::kernels::{offset, Kernels};
 use crate::profile::{self, OpKind, Phase, Profiler};
+use crate::qwen35::config::MoeConfig;
+use crate::qwen35::weights::Ffn;
+use rocml_core::gguf::GgufFile;
+use rocml_hip::DeviceBuffer;
+
+/// Dispatches one layer's FFN step to the dense SwiGLU path or the
+/// qwen35moe mixture-of-experts path — see `moe::moe_ffn_step`'s module doc
+/// for why the MoE case processes only `x_row` (this decode-style forward
+/// pass's single token) regardless of `Ffn` variant. `gguf`/`moe_cfg`/
+/// `moe_scratch` are `None` only when every layer's `Ffn` is `Dense`, an
+/// invariant `Model::load` maintains (see its `gguf`/`moe_scratch` fields'
+/// doc comments) — an `Ffn::Moe` layer without them is an internal bug, not
+/// a reachable user-facing error.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ffn_dispatch(
+    kernels: &Kernels,
+    moe_kernels: &MoeKernels,
+    gguf: Option<&GgufFile>,
+    moe_cfg: Option<&MoeConfig>,
+    ffn_weights: &Ffn,
+    post_attention_norm: &DeviceBuffer<f32>,
+    hidden: u32,
+    dense_ffn_dim: u32,
+    rms_eps: f32,
+    scratch: &mut Scratch,
+    moe_scratch: Option<&mut MoeScratch>,
+    prof: Option<&Profiler>,
+    layer_idx: Option<u32>,
+) -> Result<(), RocmlError> {
+    match ffn_weights {
+        Ffn::Dense(w) => ffn::ffn_step(
+            kernels,
+            w,
+            post_attention_norm,
+            hidden,
+            dense_ffn_dim,
+            rms_eps,
+            scratch,
+            prof,
+            layer_idx,
+        ),
+        Ffn::Moe(w) => {
+            let gguf =
+                gguf.ok_or_else(|| RocmlError::Config("moe ffn layer with no gguf handle".into()))?;
+            let moe_cfg = moe_cfg
+                .ok_or_else(|| RocmlError::Config("moe ffn layer with no moe config".into()))?;
+            let moe_scratch = moe_scratch
+                .ok_or_else(|| RocmlError::Config("moe ffn layer with no moe scratch".into()))?;
+            let x_row = offset(&scratch.x, 0);
+            moe::moe_ffn_step(
+                kernels,
+                moe_kernels,
+                gguf,
+                w,
+                moe_cfg,
+                post_attention_norm,
+                hidden,
+                rms_eps,
+                x_row,
+                moe_scratch,
+            )
+        }
+    }
+}
+
+pub(crate) fn ffn_cost_dispatch(
+    ffn_weights: &Ffn,
+    moe_cfg: Option<&MoeConfig>,
+    hidden: u32,
+    dense_ffn_dim: u32,
+) -> (u64, u64) {
+    match ffn_weights {
+        Ffn::Dense(w) => ffn::ffn_step_cost(w, hidden, dense_ffn_dim),
+        Ffn::Moe(w) => match moe_cfg {
+            Some(cfg) => moe::moe_ffn_step_cost(w, cfg, hidden),
+            None => (0, 0),
+        },
+    }
+}
 
 impl Model {
     pub fn forward_token(&mut self, token_id: u32) -> Result<Vec<f32>, RocmlError> {
@@ -62,8 +144,9 @@ impl Model {
                     if coarse_prefill {
                         let (gdn_bytes, gdn_flops) =
                             gdn::gdn_layer_step_cost(&self.config, gdn_weights);
-                        let (ffn_bytes, ffn_flops) = ffn::ffn_step_cost(
+                        let (ffn_bytes, ffn_flops) = ffn_cost_dispatch(
                             &gdn_weights.ffn,
+                            self.config.moe.as_ref(),
                             hidden,
                             self.config.feed_forward_length,
                         );
@@ -84,14 +167,18 @@ impl Model {
                                     None,
                                     None,
                                 )?;
-                                ffn::ffn_step(
+                                ffn_dispatch(
                                     &self.kernels,
+                                    &self.moe_kernels,
+                                    self.gguf.as_ref(),
+                                    self.config.moe.as_ref(),
                                     &gdn_weights.ffn,
                                     &gdn_weights.post_attention_norm,
                                     hidden,
                                     self.config.feed_forward_length,
                                     self.config.rms_eps,
                                     &mut self.scratch,
+                                    self.moe_scratch.as_mut(),
                                     None,
                                     None,
                                 )
@@ -108,14 +195,18 @@ impl Model {
                             prof,
                             Some(layer_idx_u32),
                         )?;
-                        ffn::ffn_step(
+                        ffn_dispatch(
                             &self.kernels,
+                            &self.moe_kernels,
+                            self.gguf.as_ref(),
+                            self.config.moe.as_ref(),
                             &gdn_weights.ffn,
                             &gdn_weights.post_attention_norm,
                             hidden,
                             self.config.feed_forward_length,
                             self.config.rms_eps,
                             &mut self.scratch,
+                            self.moe_scratch.as_mut(),
                             prof,
                             Some(layer_idx_u32),
                         )?;
@@ -126,8 +217,9 @@ impl Model {
                     if coarse_prefill {
                         let (attn_bytes, attn_flops) =
                             attention::attention_step_cost(&self.config, attn_weights, cur_len);
-                        let (ffn_bytes, ffn_flops) = ffn::ffn_step_cost(
+                        let (ffn_bytes, ffn_flops) = ffn_cost_dispatch(
                             &attn_weights.ffn,
+                            self.config.moe.as_ref(),
                             hidden,
                             self.config.feed_forward_length,
                         );
@@ -151,14 +243,18 @@ impl Model {
                                     None,
                                     None,
                                 )?;
-                                ffn::ffn_step(
+                                ffn_dispatch(
                                     &self.kernels,
+                                    &self.moe_kernels,
+                                    self.gguf.as_ref(),
+                                    self.config.moe.as_ref(),
                                     &attn_weights.ffn,
                                     &attn_weights.post_attention_norm,
                                     hidden,
                                     self.config.feed_forward_length,
                                     self.config.rms_eps,
                                     &mut self.scratch,
+                                    self.moe_scratch.as_mut(),
                                     None,
                                     None,
                                 )
@@ -178,14 +274,18 @@ impl Model {
                             prof,
                             Some(layer_idx_u32),
                         )?;
-                        ffn::ffn_step(
+                        ffn_dispatch(
                             &self.kernels,
+                            &self.moe_kernels,
+                            self.gguf.as_ref(),
+                            self.config.moe.as_ref(),
                             &attn_weights.ffn,
                             &attn_weights.post_attention_norm,
                             hidden,
                             self.config.feed_forward_length,
                             self.config.rms_eps,
                             &mut self.scratch,
+                            self.moe_scratch.as_mut(),
                             prof,
                             Some(layer_idx_u32),
                         )?;

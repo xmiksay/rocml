@@ -7,7 +7,7 @@
 use super::attention_chunk::attention_chunk_step;
 use super::attention_chunk_mixed::attention_chunk_step_mixed;
 use super::chunk_scratch::CHUNK_CAP;
-use super::ffn_chunk::ffn_chunk_step;
+use super::ffn_chunk_dispatch::ffn_chunk_dispatch;
 use super::gdn_chunk::gdn_chunk_step;
 use super::layer_capture::LayerCapture;
 use super::Model;
@@ -175,14 +175,18 @@ impl Model {
                         Some(layer_idx_u32),
                         capture.as_deref_mut(),
                     )?;
-                    ffn_chunk_step(
+                    ffn_chunk_dispatch(
                         &self.kernels,
+                        &self.moe_kernels,
+                        self.gguf.as_ref(),
+                        self.config.moe.as_ref(),
                         &gdn_weights.ffn,
                         &gdn_weights.post_attention_norm,
                         hidden,
                         self.config.feed_forward_length,
                         self.config.rms_eps,
                         &mut self.chunk_scratch,
+                        self.moe_scratch.as_mut(),
                         chunk_len,
                         prof,
                         Some(layer_idx_u32),
@@ -228,14 +232,18 @@ impl Model {
                             Some(layer_idx_u32),
                         )?,
                     }
-                    ffn_chunk_step(
+                    ffn_chunk_dispatch(
                         &self.kernels,
+                        &self.moe_kernels,
+                        self.gguf.as_ref(),
+                        self.config.moe.as_ref(),
                         &attn_weights.ffn,
                         &attn_weights.post_attention_norm,
                         hidden,
                         self.config.feed_forward_length,
                         self.config.rms_eps,
                         &mut self.chunk_scratch,
+                        self.moe_scratch.as_mut(),
                         chunk_len,
                         prof,
                         Some(layer_idx_u32),

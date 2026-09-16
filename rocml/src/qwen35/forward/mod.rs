@@ -12,6 +12,7 @@ mod chunk_scratch;
 mod decode_forward;
 mod ffn;
 mod ffn_chunk;
+mod ffn_chunk_dispatch;
 mod gdn;
 mod gdn_chunk;
 mod gdn_chunkwise;
@@ -20,7 +21,10 @@ mod gdn_chunkwise_kernels_wmma;
 mod kernels;
 pub(crate) mod kernels_flash_mixed;
 pub(crate) mod kernels_mixed;
+mod kernels_moe;
 pub mod layer_capture;
+mod moe;
+mod moe_scratch;
 mod rewind;
 mod scratch;
 mod snapshot;
@@ -34,6 +38,8 @@ use gdn_chunkwise_kernels_wmma::GdnChunkwiseWmmaKernels;
 use kernels::HybridKernels;
 use kernels_flash_mixed::FlashPrefillMixedKernels;
 use kernels_mixed::MixedKernels;
+use kernels_moe::MoeKernels;
+use moe_scratch::MoeScratch;
 use rocml_core::gguf::GgufFile;
 use rocml_hip::{Device, MemoryInfo};
 use scratch::Scratch;
@@ -86,6 +92,21 @@ pub struct Model {
     /// GPU-resident rewind points, the snapshot layer's hot tier — see
     /// `rewind.rs`. Allocated lazily on first save, never on load.
     rewind: rewind::RewindPoints,
+    /// qwen35moe's mixture-of-experts router + accumulate kernels — loaded
+    /// unconditionally like every other kernel set (cheap; keeps `Model`'s
+    /// shape independent of whether this checkpoint is MoE).
+    moe_kernels: MoeKernels,
+    /// `Some` only for a `general.architecture = "qwen35moe"` checkpoint —
+    /// the routed-expert tensors are never uploaded to the GPU (see
+    /// `crate::qwen35::weights::moe`'s module doc), so every MoE FFN step
+    /// needs the GGUF's mmap kept alive for the model's whole lifetime to
+    /// read an expert's raw bytes on demand. `None` for a plain `"qwen35"`
+    /// checkpoint, which drops its `GgufFile` at the end of `Self::load`
+    /// like every architecture did before this milestone.
+    gguf: Option<GgufFile>,
+    /// `Some` exactly when `gguf`/`config.moe` are `Some` — see
+    /// `moe_scratch::MoeScratch`.
+    moe_scratch: Option<MoeScratch>,
     pos: u32,
 }
 
@@ -104,6 +125,19 @@ impl Model {
         let gguf = GgufFile::open(gguf_path)?;
         let config = Qwen35Config::from_gguf(&gguf)?;
         let weights = ModelWeights::load(&gguf, &config)?;
+        let moe_kernels = MoeKernels::load_all()?;
+        let moe_scratch = config
+            .moe
+            .as_ref()
+            .map(|moe_cfg| MoeScratch::new(&config, moe_cfg, &weights))
+            .transpose()?;
+        // Only a qwen35moe checkpoint needs its GGUF's mmap kept alive past
+        // this point — see the `gguf` field's doc comment.
+        let gguf = if config.moe.is_some() {
+            Some(gguf)
+        } else {
+            None
+        };
 
         let n_attn_layers = config
             .layer_kinds
@@ -220,6 +254,9 @@ impl Model {
             gdn_cw_wmma_kernels,
             chunk_scratch,
             rewind: rewind::RewindPoints::default(),
+            moe_kernels,
+            gguf,
+            moe_scratch,
             pos: 0,
         })
     }
