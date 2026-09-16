@@ -73,6 +73,7 @@ test-model:
 	cargo test --release -p rocml --test mixed_kv_chunked_prefill_parity -- --test-threads=1
 	cargo test --release -p rocml --test dense_mixed_kv_parity
 	cargo test --release -p rocml --test dense_chunked_prefill_parity
+	cargo test --release -p rocml --test moe_expert_cache_parity
 	cargo test --release -p rocml --test snapshot_equivalence
 	cargo test --release -p rocml --test snapshot_rewind
 	cargo test --release -p rocml --test snapshot_rewind_turns
